@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 profiles=(
@@ -19,32 +20,254 @@ for profile in "${profiles[@]}"; do
   test -f "${base}/bootstrap/memories/USER.md"
   test "$(find "${base}/skills" -name SKILL.md -type f | wc -l | tr -d ' ')" -eq 1
   grep -qx '_config_version: 33' "${base}/config.yaml"
-  grep -qx 'hermes_requires: ">=0.18.2"' "${base}/distribution.yaml"
+  grep -qx 'hermes_requires: ">=0.19.0"' "${base}/distribution.yaml"
+  grep -qx 'version: 0.2.0' "${base}/distribution.yaml"
+  grep -qx "HERMES_PROFILE=${profile}" "${base}/.env.template"
+  grep -qx 'GITLAB_HOST=' "${base}/.env.template"
+  grep -qx 'GITLAB_ALLOWED_GROUPS=' "${base}/.env.template"
+  grep -qx 'GITLAB_TOKEN=' "${base}/.env.template"
 done
 
 for script in "${repo_root}"/scripts/*.sh; do
   test -x "${script}"
   bash -n "${script}"
 done
+test -x "${repo_root}/scripts/validate-profile-envs.py"
+python3 -m py_compile "${repo_root}/scripts/validate-profile-envs.py"
+
+git apply --numstat "${repo_root}/patches/hermes-0.19.0-dispatcher-kanban-guard.patch" >/dev/null
 
 python3 - "${repo_root}" <<'PY'
 import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-for path in root.rglob("*.json"):
-    json.loads(path.read_text(encoding="utf-8"))
-print("bundle structure and JSON: ok")
-PY
-
-python3 - "${repo_root}" <<'PY'
 import pathlib
 import re
 import sys
 import urllib.parse
 
 root = pathlib.Path(sys.argv[1])
+profiles = [
+    "dispatcher", "prd-writer", "fde", "spec-writer", "spec-reviewer",
+    "planner", "plan-reviewer", "tasker", "task-reviewer", "coder",
+    "tester", "code-reviewer",
+]
+gateway_profiles = {"dispatcher", "prd-writer", "fde"}
+
+for path in root.rglob("*.json"):
+    json.loads(path.read_text(encoding="utf-8"))
+
+lock = (root / "config/skills-lock.yaml").read_text(encoding="utf-8")
+for value in [
+    "image_mode: official-mounted",
+    "tooling_volume_schema: 1",
+    "release_tag: v2026.7.20",
+    "revision: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a",
+    "docker_image: nousresearch/hermes-agent:v2026.7.20",
+    "minimum_version: 0.19.0",
+    "config_version: 33",
+]:
+    assert value in lock, f"missing Hermes 0.19 lock: {value}"
+
+assert not (root / "Dockerfile").exists(), "custom Dockerfile must not exist"
+assert not (root / ".dockerignore").exists(), "build-only .dockerignore must not exist"
+
+patch = (root / "patches/hermes-0.19.0-dispatcher-kanban-guard.patch").read_text(encoding="utf-8")
+for value in [
+    "HERMES_PROFILE", 'profile != "dispatcher"',
+    '_require_dispatcher_profile("kanban_create")',
+    '_require_dispatcher_profile("kanban_link")',
+    "AND created_by = 'dispatcher'", "status = 'ready'", "status = 'review'",
+]:
+    assert value in patch, f"worker Kanban handler guard incomplete: {value}"
+
+compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+assert 'command: ["sleep", "infinity"]' in compose
+assert "build:" not in compose
+assert compose.count("image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}") == 2
+assert compose.count("pull_policy: never") == 2
+assert "tooling-sync:" in compose
+assert "condition: service_completed_successfully" in compose
+assert "tooling:/opt/fleet/vendor\n" in compose
+assert "tooling:/opt/fleet/vendor:ro" in compose
+assert "./profiles:/opt/fleet/profiles:ro" in compose
+assert "./templates:/opt/fleet/templates:ro" in compose
+assert "./schemas:/opt/fleet/schemas:ro" in compose
+assert "./scripts:/opt/fleet/scripts:ro" in compose
+assert "./patches:/opt/fleet/patches:ro" in compose
+assert "./config:/opt/fleet/config:ro" in compose
+assert "/opt/fleet/vendor/current/bin:" in compose
+for value in [
+    "017-hermes-runtime-patch", "018-hermes-sdd-fleet",
+    "021-hermes-sdd-gateways",
+]:
+    assert value in compose
+assert "@sha256:" not in compose
+assert "gateway run" not in compose
+assert "env_file:" not in compose, "root .env must not be injected wholesale"
+for forbidden in ["GITLAB_TOKEN", "GITLAB_HOST", "FEISHU_", "LARKSUITE_CLI_"]:
+    assert forbidden not in compose, f"profile credential leaked into Compose: {forbidden}"
+
+tooling_sync = (root / "scripts/sync-tooling.sh").read_text(encoding="utf-8")
+for value in [
+    "config/skills-lock.yaml", "releases/${release_name}", "sha256sum -c",
+    "@larksuite/cli@${lark_cli_version}", "gitlab_skills_rev",
+    "lark_skills_rev", "mv -Tf", ".tooling-lock",
+]:
+    assert value in tooling_sync, f"tooling volume sync contract missing: {value}"
+
+runtime_patch = (root / "scripts/runtime-patch-hermes.sh").read_text(encoding="utf-8")
+for value in [
+    'version}" != "0.19.0"', "git -C \"${install_root}\" apply --check",
+    "git -C \"${install_root}\" apply --reverse --check",
+    "hermes-0.19.0-dispatcher-kanban-guard.patch", "dispatcher_required",
+]:
+    assert value in runtime_patch, f"runtime patch contract missing: {value}"
+
+start_gateways = (root / "scripts/start-profile-gateways.sh").read_text(encoding="utf-8")
+assert "for profile in dispatcher prd-writer fde" in start_gateways
+assert "gateway start" in start_gateways
+
+bootstrap = (root / "scripts/container-bootstrap.sh").read_text(encoding="utf-8")
+for value in [
+    "gateway_profiles=(dispatcher prd-writer fde)",
+    "validate-profile-envs.py", "--profiles-root", "--owner hermes",
+    ".lark-cli", "LARKSUITE_CLI_CONFIG_DIR", "LARKSUITE_CLI_DATA_DIR",
+    "lark-cli config bind --source hermes --identity bot-only",
+    "git config --global credential.helper '!glab auth git-credential'",
+]:
+    assert value in bootstrap, f"bootstrap isolation contract missing: {value}"
+for forbidden in [
+    "write_profile_env", "validate_profile_env_file", "FLEET_SYNC_SECRETS",
+    "lark-cli config init", "glab auth login", "GITLAB_TOKEN_DISPATCHER",
+    "FEISHU_APP_ID_PRD_WRITER", "FEISHU_APP_ID_FDE", "GATEWAY_API_PORT_DISPATCHER",
+]:
+    assert forbidden not in bootstrap, f"bootstrap must not persist or overwrite credentials: {forbidden}"
+identity_loop = re.search(r"for profile in ([^;]+); do\n\s+key=.*?GIT_COMMIT_NAME", bootstrap, re.S)
+assert identity_loop and "fde" not in identity_loop.group(1), "FDE must not require Git identity"
+
+initializer = (root / "scripts/init-profile-envs.sh").read_text(encoding="utf-8")
+for value in [
+    "HERMES_DATA_DIR", ".env.template", "chmod 0600", "install -d -m 0700",
+    "appeared concurrently; nothing was overwritten",
+]:
+    assert value in initializer, f"profile env initializer contract missing: {value}"
+
+validator = (root / "scripts/validate-profile-envs.py").read_text(encoding="utf-8")
+for value in [
+    "must be unique:", "FEISHU_APP_ID", "FEISHU_APP_SECRET",
+    "not a symbolic link", "mode must be 0600", "profile directory mode must be 0700",
+    "Feishu/Lark variables are not allowed", "hashlib.sha256",
+]:
+    assert value in validator, f"profile env validator contract missing: {value}"
+
+env_example = (root / ".env.example").read_text(encoding="utf-8")
+for value in [
+    "HERMES_IMAGE=nousresearch/hermes-agent:v2026.7.20",
+    "TOOLING_VOLUME_NAME=hermes-sdd-tooling",
+    "FLEET_MODEL=", "OPENAI_API_KEY=", "FLEET_FORCE_CONFIG=0",
+]:
+    assert value in env_example
+assert "HERMES_BASE_IMAGE" not in env_example
+assert "GIT_COMMIT_NAME_FDE" not in env_example
+for forbidden in ["GITLAB_", "FEISHU_", "LARKSUITE_CLI_", "GATEWAY_API_PORT_", "FLEET_SYNC_SECRETS"]:
+    assert forbidden not in env_example, f"root .env.example contains profile credential: {forbidden}"
+
+for profile in profiles:
+    config = (root / f"profiles/{profile}/config.yaml").read_text(encoding="utf-8")
+    env_template = (root / f"profiles/{profile}/.env.template").read_text(encoding="utf-8")
+    has_feishu = "platform_toolsets:\n  feishu:" in config
+    assert has_feishu == (profile in gateway_profiles), f"unexpected Feishu gateway config: {profile}"
+    assert "/opt/fleet/vendor/current/gitlab/skills" in config
+    if profile in gateway_profiles:
+        assert "/opt/fleet/vendor/current/lark/skills" in config
+        for value in [
+            "API_SERVER_PORT=", "FEISHU_APP_ID=", "FEISHU_APP_SECRET=",
+            f"LARKSUITE_CLI_CONFIG_DIR=/opt/data/profiles/{profile}/.lark-cli/config",
+            f"LARKSUITE_CLI_DATA_DIR=/opt/data/profiles/{profile}/.lark-cli/data",
+        ]:
+            assert value in env_template, f"gateway env template incomplete: {profile}: {value}"
+    else:
+        for forbidden in ["API_SERVER_PORT", "FEISHU_", "LARKSUITE_CLI_"]:
+            assert forbidden not in env_template, f"worker has Feishu/Lark configuration: {profile}"
+    assert "OPENAI_API_KEY=" not in env_template, "model credentials remain deployment-level"
+    if profile == "dispatcher":
+        assert "dispatch_in_gateway: true" in config
+        assert "auto_decompose: false" in config
+    else:
+        assert "dispatch_in_gateway: true" not in config
+
+schema = json.loads((root / "schemas/card-completion.schema.json").read_text(encoding="utf-8"))
+assert schema["properties"]["schema_version"]["const"] == 2
+required = set(schema["required"])
+for value in [
+    "project_id", "project_path", "project_display_name", "checkout", "worktree",
+    "branch", "target_branch", "prd_path", "prd_commit_sha", "prd_mr_url",
+    "kanban_card_id", "mr_iid", "mr_url", "head_sha", "artifact_paths",
+    "artifact_digest",
+]:
+    assert value in required, f"schema v2 missing required field: {value}"
+stages = set(schema["properties"]["stage"]["enum"])
+for value in [
+    "spec-write", "spec-review", "plan-write", "plan-review", "tasks-write",
+    "tasks-review", "implement", "test", "code-review", "merge", "run-complete",
+]:
+    assert value in stages
+assert "next-spec-or-complete" not in stages
+
+card = (root / "templates/kanban-card.md").read_text(encoding="utf-8")
+for value in [
+    "schema_version: 2", "created_by: dispatcher", "project_display_name:",
+    "checkout:", "worktree:", "prd_mr_url:", "artifact_digest:",
+    "never create a second delivery branch or MR",
+]:
+    assert value in card, f"card v2 contract missing: {value}"
+
+gate = (root / "templates/gate-comment.md").read_text(encoding="utf-8")
+for value in ["SDD-GATE: v=2", "artifact_digest", "review_commit_sha", "head_sha"]:
+    assert value in gate
+
+mr = (root / "templates/mr-description.md").read_text(encoding="utf-8")
+for value in ["schema_version: 2", "source_prd:", "specs:", "plans:", "tasks:", "merge_commit_sha"]:
+    assert value in mr
+assert "artifact_type:" not in mr
+
+feishu = (root / "templates/feishu-messages.md").read_text(encoding="utf-8")
+assert "实现 PRD <精确 PRD blob/raw URL> <已合并 PRD MR URL>" in feishu
+for value in ["原 `chat_id`", "thread_id", "@initiator_open_id", "文件不存在", "已归档"]:
+    assert value in feishu
+
+workflow = (root / "WORKFLOW.md").read_text(encoding="utf-8")
+for value in [
+    "一个共享分支", "一个 Draft MR", "artifact_digest", "sha=<checked_head>",
+    "设计阶段每一阶段最多返工 3 轮", "代码返工合计最多 5 轮",
+    "静态部署包通过", "不能声明“生产自治 E2E”",
+]:
+    assert value in workflow, f"authoritative workflow missing: {value}"
+
+skills = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((root / "profiles").glob("*/skills/*/SKILL.md"))
+)
+for value in [
+    "docs/prds/<prd-basename>/specs/spec-<key>.md",
+    "docs/prds/<prd-basename>/plans/plan-<key>.md",
+    "docs/prds/<prd-basename>/tasks/task-<key>.md",
+    "Draft: [PRD] <prd-basename>.md",
+    "created_by=dispatcher",
+]:
+    assert value in skills, f"profile Skills missing single-MR contract: {value}"
+for stale in [
+    "specs/<feature-key>/spec.md", "artifact_type:",
+    "one approved SPEC task set in one code merge request",
+    "当前 SPEC 的代码 MR合入后才推进下一 SPEC",
+]:
+    assert stale not in skills
+
+for profile in profiles:
+    if profile == "dispatcher":
+        continue
+    skill = next((root / f"profiles/{profile}/skills").glob("*/SKILL.md")).read_text(encoding="utf-8")
+    assert "kanban_create" not in skill and "kanban_link" not in skill, f"worker shapes Kanban DAG: {profile}"
+
 missing = []
 pattern = re.compile(r"\[[^]]*\]\(([^)]+)\)")
 for source in root.rglob("*.md"):
@@ -57,7 +280,8 @@ for source in root.rglob("*.md"):
             missing.append(f"{source.relative_to(root)} -> {target}")
 if missing:
     raise SystemExit("missing local Markdown targets:\n" + "\n".join(missing))
-print("shell syntax and local Markdown links: ok")
+
+print("bundle, Hermes 0.19 lock, profile credentials, gateways, schema v2 and single-MR contracts: ok")
 PY
 
 if python3 -c 'import yaml' >/dev/null 2>&1; then
@@ -75,12 +299,13 @@ elif command -v ruby >/dev/null 2>&1; then
     xargs -0 ruby -e 'require "yaml"; ARGV.each { |path| YAML.safe_load(File.read(path), permitted_classes: [], aliases: false) }'
   echo "YAML: ok (Ruby)"
 else
-  echo "YAML parser unavailable; build-time validation still required" >&2
+  echo "YAML parser unavailable; install a parser before runtime deployment" >&2
 fi
 
+python3 -m unittest discover -s "${repo_root}/tests" -v
+
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  FLEET_ENV_FILE=.env.example docker compose \
-    --env-file "${repo_root}/.env.example" \
+  docker compose --env-file "${repo_root}/.env.example" \
     -f "${repo_root}/docker-compose.yml" config --quiet
   echo "Docker Compose config: ok"
 fi

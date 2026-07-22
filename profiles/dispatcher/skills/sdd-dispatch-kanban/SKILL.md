@@ -1,35 +1,41 @@
 ---
 name: sdd-dispatch-kanban
-description: Start and reconcile a serial PRD-to-code run with Hermes Kanban and GitLab gates
-version: 0.1.0
+description: Start, recover and merge one-PRD one-MR delivery runs across allowlisted GitLab projects
+version: 0.2.0
 ---
 
 # SDD Kanban dispatcher
 
-Use only for formal run start, deterministic stage gates, recovery, checked-head merge, status and notifications.
+Use this Skill only for formal run intake, deterministic stage transitions, recovery, checked-head merge, status and original-channel notification. Never write professional SPEC/PLAN/TASKS/code or their reviews.
 
-## Start
+## Intake
 
-1. Accept `实现 PRD <merged GitLab MR URL>` or explicit project/file/40-char commit.
-2. Verify allowlisted sender and GitLab host/group, merged MR, file existence, target-branch reachability, no blocking PRD question, and no active run for the same project+commit.
-3. Derive `run_key = sdd-<base32(sha256(host|project_id|prd_commit))[0:20]>` and use the Feishu message ID in the card idempotency key.
-4. Create exactly one `RUN-INIT` card on the project board with `assignee=dispatcher`, `tenant=run_key`, explicit worktree workspace and the card template at `/opt/fleet/templates/kanban-card.md`.
-5. Acknowledge with run key and links; future progress must not depend on the chat session.
+1. Accept only `实现 PRD <exact blob/raw URL> <merged PRD MR URL>`. If either URL is missing, their host/project IDs differ, or repository identity is ambiguous, ask only for the missing/correct value in the original Feishu channel and do not create a card.
+2. In order, query GitLab for: allowed host/group; readable project; PRD path; `archived=false`; MR merged to current `default_branch`; PRD included in that merged revision; current default-branch PRD still equals that effective version. Do not call an unreadable project “文件不存在”.
+3. Use `project_id` and `path_with_namespace` as identity. Project description Chinese text is display-only.
+4. Derive `run_key = sdd-<base32(sha256(host|project_id|prd_path|prd_commit_sha))[0:20]>`. Query Kanban and GitLab before creating anything: resume an active run, return a merged result, or start only a new PRD commit.
+5. Read the current `default_branch` HEAD as the run base SHA. Select the repository's branch convention; otherwise use `feature/<prd-basename>-<prd_sha8>`. Run `/opt/fleet/scripts/prepare-run-workspace.sh` with that base and the validated token-free HTTPS URL. Use board `gitlab-p<project_id>` and the returned shared worktree.
+6. Create one `run-init` card with a stable message/run idempotency key, `tenant=run_key`, `created_by=dispatcher`, exact assignee/skills and the v2 card template. Preserve `message_id`, `chat_id`, `thread_id` and initiator for recovery.
 
-## Gate/reconcile
+## Card and gate reconciliation
 
-1. Call `kanban_show()` and validate run, project, spec, stage, iteration, parent and completion metadata against `/opt/fleet/schemas/card-completion.schema.json`.
-2. Query GitLab live state before every write. Reuse an existing branch, MR, comment, merge or notification on replay.
-3. Accept an `SDD-GATE` only from the allowed role identity when run, stage, task and current 40-char head all match. A later fail/scope_gap for the same head wins.
-4. On professional `fail`, complete the gate and create the bounded rework chain. Do not count it as a worker crash.
-5. On `scope_gap`, route to TASKS convergence; never let coder silently change approved intent.
-6. Before merge require non-draft, mergeable current MR, successful required pipeline, resolved blocking discussions and all required gates on the same head.
-7. Merge with GitLab API `sha=<checked_head>`. A mismatch blocks and causes fresh gates; never retry with an unchecked SHA.
-8. Create the next typed card with a stable idempotency key and current gate as parent, then complete the gate card.
+1. Call `kanban_show()`; validate completion metadata against `/opt/fleet/schemas/card-completion.schema.json`. Refuse any next card whose stored or returned `created_by` is not exactly `dispatcher`.
+2. Every card must repeat project ID/path/display name, checkout/worktree, shared branch/target, PRD path/commit/MR, run, delivery MR and expected head. Reconcile GitLab live state before every write.
+3. Create the next typed card only after the preceding whole-stage gate passes. Use stable idempotency keys and the gate card as parent. `kanban_create` and `kanban_link` are dispatcher-only; never delegate graph shaping.
+4. Artifact gates use sorted path/blob-SHA digest plus reviewer identity and `review_commit_sha`. Recompute the stage path set at every transition. A changed approved artifact invalidates that gate and every downstream gate; later PLAN/code additions do not invalidate an unchanged SPEC digest.
+5. `fail` returns to the owning producer. `scope_gap` routes by evidence to TASKS, PLAN or SPEC; never allow coder to expand scope. Design rework is limited to 3 iterations per stage; code rework is limited to 5 total.
+6. Tester and code-reviewer gates must be separate comments by allowed identities and bind the same current MR `head_sha`. Any push invalidates both.
 
-Every created card must set the exact assignee and `skills` list; never rely on semantic auto-selection:
+## Single MR lifecycle and merge
 
-| Assignee | skills |
+1. spec-writer creates exactly one `Draft: [PRD] <prd-basename>.md` MR after the first valid SPEC commit. Every later producer updates that branch/MR; every reviewer/tester comments there. Coder marks it ready after implementation and self-test.
+2. Before merge require ready, mergeable, required pipeline successful, blocking discussions resolved, current artifact digests approved, and tester/code-reviewer pass on one `checked_head`.
+3. Merge through GitLab with `sha=<checked_head>`. On SHA mismatch create fresh test/review work; never retry with an unchecked SHA.
+4. Use returned `merge_commit_sha` to post one idempotent MR comment with permanent PRD/SPEC/PLAN/TASKS blob links. Run `/opt/fleet/scripts/cleanup-run-worktree.sh`, complete the run, and notify the original channel/thread; @ the initiator in group/topic replies.
+
+Every created card sets the exact assignee and Skill list:
+
+| Assignee | Skills |
 | --- | --- |
 | dispatcher | `sdd-dispatch-kanban`, `glab`, `lark-shared`, `lark-im` |
 | spec-writer | `sdd-write-spec`, `glab` |
@@ -42,10 +48,4 @@ Every created card must set the exact assignee and `skills` list; never rely on 
 | tester | `sdd-test`, `glab` |
 | code-reviewer | `sdd-review-code`, `glab` |
 
-## Serial completion
-
-- Do not activate another SPEC before the current code MR is merged.
-- Design rework limit is 3; code rework limit is 5.
-- Finish only after every frozen SPEC has a merged code MR and traceable artifact commits.
-- Send only the events defined in `/opt/fleet/templates/feishu-messages.md`, with stable idempotency keys. Hermes gateway is the only inbound consumer; never run `lark-cli event consume im.message.receive_v1`.
-- Block for needs_input/capability/transient with a concrete human action. Never implement another role's work.
+Block with a concrete human action only for `needs_input`, `capability`, credential/environment failure or exhausted budget. Never create a GitLab Task work item for formal delivery and never run a second Feishu inbound consumer.

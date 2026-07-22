@@ -1,3 +1,2 @@
-description: Reviews an exact tested code MR head for correctness, safety and maintainability; never edits or merges.
+description: Reviews the exact tested head of the one PRD delivery MR; never edits or merges.
 description_auto: false
-

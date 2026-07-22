@@ -1,128 +1,107 @@
 # Hermes Kanban SDD Agent Fleet
 
-本仓库提供一套可部署的 Hermes Agent profiles：人类在飞书中只启动一次，之后由 Hermes Kanban 持久调度 `PRD → SPEC → PLAN → TASKS → code → test → review → merge`。正常路径无需人工逐段唤醒；只有需求冲突、能力/凭据故障或返工预算耗尽才暂停。
+这是一个基于 Hermes Agent 0.19.0 的 12-profile 部署包。正式交付采用“一个已合入 PRD 版本、一个 Kanban run、一个共享分支、一个 Draft MR”；详细规则以 [WORKFLOW.md](WORKFLOW.md) 为准。
 
-## 部署结论
+## 部署形态
 
-采用 Hermes 官方推荐的**一个容器、多 profiles**：
+- 不构建自定义镜像，两个 Compose service 都直接使用宿主机已有的官方 `nousresearch/hermes-agent:v2026.7.20`。
+- profiles、模板、schema、配置、脚本和 Hermes 运行时补丁从本目录只读挂载。
+- `tooling-sync` 将锁定版本的 `glab`、`lark-cli` 和官方 Skills 安装到独立 named volume；Hermes 只读使用该工具卷。
+- 一个 Hermes 容器、12 个隔离 profile、每项目一个持久化 Kanban SQLite board。
+- `dispatcher`、`prd-writer`、`fde` 各有独立飞书 App 和 Gateway；只有 dispatcher 启用 Kanban dispatcher。
+- 其他专业 Agent 仅由 Kanban 唤醒，共享明确的 run worktree，不启动 Gateway。
+- GitLab HTTPS 动态 clone；12 个互不相同的 token 只存在各 profile 的 `.env`，不进入 Compose 环境或 remote URL。
+- 仅 `dispatcher`、`prd-writer`、`fde` 的 `.env` 包含独立飞书 App；lark-cli 加密副本位于各自的持久 `.lark-cli` 目录。
+- 正式交付不创建 GitLab Task；FDE 仍可创建普通 Issue。
 
-- `dispatcher` 是唯一 Feishu gateway、Kanban 编排者和合并身份。
-- 其他 Agent 不启动 gateway；卡片 ready 后由 Kanban 以独立 profile 进程拉起。
-- 全部 profiles 和每项目 Kanban SQLite board 位于同一持久卷；不要让第二个 active 容器共享该卷。
-- 每项目一个 board；每个 PRD run 用 `tenant=run_key` 分组。
-- 同一 run 内 SPEC 严格串行，每个 SPEC 一个代码 MR。
+不要让两个 active 容器共享同一 `HERMES_DATA_DIR`。
 
-只有需要独立网络、资源或合规边界时才拆容器；拆分后必须使用独立数据卷和外部 worker-lane 适配，不能共享 SQLite。
+## Ubuntu AMD64 首次部署
 
-## 内容
-
-```text
-profiles/<agent>/
-├── .gitignore              # 排除凭据、memory、session 和运行状态
-├── distribution.yaml       # Hermes profile distribution manifest
-├── profile.yaml            # Kanban 路由描述
-├── SOUL.md                  # 角色与边界
-├── config.yaml              # toolsets、memory、terminal、Kanban
-├── .env.template            # 安装后生成 .env.EXAMPLE
-├── bootstrap/memories/      # MEMORY.md / USER.md 首装种子
-└── skills/<role>/SKILL.md   # 角色操作合同
-```
-
-包含 `dispatcher`、`prd-writer`、`fde`、SPEC/PLAN/TASKS 的 producer-reviewer 对、`coder`、`tester`、`code-reviewer`。Docker 构建时按 [版本锁](config/skills-lock.yaml) 加入 GitLab 官方 `glab` Skill、Lark 官方 `lark-shared`/`lark-im` Skill，并安装对应 CLI。
-
-Hermes distribution 会硬性排除真实 `memories/`。因此本仓库只提供无用户数据的种子，容器首装时仅在目标文件不存在时写入；升级不会覆盖 Agent 已形成的记忆。
-
-## 首次部署
-
-前置条件：Docker Compose、一个已发布的 Feishu/Lark bot App、已挂载的 GitLab 项目 checkout，以及各 Agent 的最小权限 token。
+前置条件：Docker Compose、已经存在于本机的官方 Hermes 镜像、三个飞书机器人 App、允许群组内各 Agent 的最小权限 GitLab token，以及可用模型凭据。首次工具同步还需要容器能访问 GitLab.com、GitHub.com 和 npm registry。
 
 ```bash
+docker image inspect nousresearch/hermes-agent:v2026.7.20 >/dev/null
 cp .env.example .env
-# 编辑 .env：模型、Feishu、各 Agent GitLab token，以及 producer 的 commit name/email
+# 根 .env 只填写模型配置和 producer commit identity。
 
-mkdir -p .runtime/projects
-git clone <gitlab-project-url> .runtime/projects/<project>
+./scripts/init-profile-envs.sh
+# 编辑 HERMES_DATA_DIR/profiles/<profile>/.env：
+# 12 份分别填写 GitLab host、允许群组和不同 token；
+# dispatcher、prd-writer、fde 另外填写各自的飞书 App 和消息范围。
 
 ./scripts/verify-bundle.sh
-docker compose build
 docker compose up -d
 ```
 
-启动脚本会自动：
+`init-profile-envs.sh` 会读取根 `.env` 中的 `HERMES_DATA_DIR`，仅创建缺失文件并设置 profile 目录 `0700`、`.env` 文件 `0600`；重复执行不会覆盖凭据。Compose 不使用 `env_file`，因此根 `.env` 中即使误留旧 GitLab/飞书变量也不会整体注入容器。
 
-1. 在 `/opt/data/profiles/` 安装 12 个 profiles；
-2. 只在缺失时创建 `memories/MEMORY.md` 与 `USER.md`；
-3. 为每个 profile 生成隔离的 `.env`，只给 dispatcher Feishu 密钥；
-4. 清空 s6 的 fleet-wide 启动环境，防止其他 Agent 继承别人的 token；
-5. 配置 `FLEET_MODEL`，并用同一个 App ID/Secret 初始化 dispatcher 的 `lark-cli` bot 身份；
-6. 启动且只启动 dispatcher gateway。
+请使用与 `.env` 中 `PUID` 相同 UID 的宿主用户运行初始化脚本，不要使用 `sudo`；否则容器会因 `.env` 所有者不是 Hermes 运行用户而拒绝启动。通常可把 `PUID`/`PGID` 设置为 `id -u`/`id -g` 的结果。
+
+Compose 设置了 `pull_policy: never`，不会静默拉取其他镜像，也没有 `build` 配置。首次 `up` 时 `tooling-sync` 先填充 named volume，成功后 Hermes 才启动。s6 启动时按顺序校验 0.19.0、幂等应用 Kanban handler 补丁、安装 12 个 profiles、验证独立凭据、将三个飞书 profile 绑定到各自的持久加密 lark-cli 存储并启动三个 Gateway。项目 checkout、`gitlab-p<project_id>` board 与 run worktree 由 dispatcher 在首次请求时幂等创建。
 
 检查：
 
 ```bash
+docker compose ps
+docker compose logs tooling-sync
+docker compose logs --tail=100 hermes
 docker compose exec hermes hermes version
 docker compose exec hermes hermes profile list
 docker compose exec hermes hermes -p dispatcher gateway status
+docker compose exec hermes hermes -p prd-writer gateway status
+docker compose exec hermes hermes -p fde gateway status
 docker compose exec hermes hermes -p dispatcher kanban boards list
-docker compose logs --tail=100 hermes
 ```
-
-## GitLab 与 board 初始化
-
-默认分支必须设为 protected：Agent 不得直接 push；producer 只能写功能分支/MR；reviewer/tester 只读代码并写评论；只有 dispatcher 可以 merge。每个 profile 的 token 是不同 GitLab 身份，便于归因和撤销。
-
-为项目建立 board，路径必须是容器内绝对 checkout 路径：
-
-```bash
-./scripts/create-board.sh \
-  sdd-cxtc \
-  mes/cxtc \
-  /workspace/projects/cxtc
-```
-
-然后分别验证身份与仓库 remote；任何失败都应作为 `capability` block 处理，不能临时把全部 Agent 提升为 Maintainer。
 
 ## 使用
 
-在 Feishu 允许名单内向 dispatcher 发送：
+向 dispatcher 发送且必须同时提供两个 URL：
 
 ```text
-实现 PRD <已合入的 GitLab PRD MR URL>
+实现 PRD <精确 PRD blob/raw URL> <已合并 PRD MR URL>
+```
+
+缺失或错配时不会创建 run。常用控制命令：
+
+```text
 状态 <run_key>
 暂停 <run_key>
 继续 <run_key>
 取消 <run_key>
 ```
 
-Dispatcher 会验证 PRD 已合入目标分支并创建幂等 `RUN-INIT` 卡。后续 Agent 只从 Kanban parent handoff 与 GitLab live state 恢复，不依赖聊天上下文。
-
-观察与运维：
+观察：
 
 ```bash
-docker compose exec hermes hermes -p dispatcher kanban --board <board> watch
-docker compose exec hermes hermes -p dispatcher kanban --board <board> list
-docker compose exec hermes hermes -p dispatcher kanban --board <board> runs <task-id>
-docker compose exec hermes hermes -p dispatcher kanban --board <board> tail <task-id>
+docker compose exec hermes hermes -p dispatcher kanban --board gitlab-p<project-id> watch
+docker compose exec hermes hermes -p dispatcher kanban --board gitlab-p<project-id> list
 ```
 
-设计返工最多 3 轮，代码返工最多 5 轮。tester 与 code-reviewer 的 pass 必须绑定同一当前 head；dispatcher 最终用 GitLab merge API 的 `sha=<checked_head>` 合并。
+## 权限与更新
 
-## 升级与恢复
+目标默认分支必须 protected。dispatcher 使用可合并该分支的 Maintainer；producer/coder 使用 Developer；reviewer/tester/FDE 使用 Reporter + API。任何权限失败都作为 capability block 处理，不临时共享 Maintainer token。
+
+启动会拒绝空白或重复的 GitLab token、重复的飞书 App ID/Secret、worker 中的飞书变量、错误文件权限和符号链接。验证过程只比较摘要，不打印凭据。轮换时只修改对应的 `${HERMES_DATA_DIR}/profiles/<profile>/.env` 并执行 `docker compose restart hermes`；容器会从该文件重新绑定 lark-cli，加密副本保留在 `/opt/data/profiles/<profile>/.lark-cli/`。由于是单容器，三个 Gateway 会一起重启，但其他 profile 的凭据文件不会被修改。
+
+版本与官方 Skill revision 见 [config/skills-lock.yaml](config/skills-lock.yaml)。更新 CLI 或 Skills 时修改其中的精确版本/revision，然后执行：
 
 ```bash
-docker compose build --pull
-docker compose up -d
+docker compose stop hermes
+docker compose run --rm tooling-sync
+docker compose up -d hermes
 ```
 
-默认保留已部署 `config.yaml`。接受本仓库的新托管配置时，将 `.env` 中 `FLEET_FORCE_CONFIG=1`，重建一次后恢复为 `0`。`SOUL.md`、`profile.yaml` 和本地 Skills 随镜像同步；`.env`、memory、sessions、Kanban DB 和日志位于持久卷。
+工具按锁内容生成不可变 release 目录，并原子切换 `current` 链接；更新不重建镜像。不要在 Hermes 运行期间切换工具版本。
 
-备份时停止 active 容器，再备份整个 `HERMES_DATA_DIR`；恢复后先核对 profiles、官方 Skill revision、项目路径、token 身份和 board 指针，再启动 gateway。不得同时运行两个容器写同一数据目录。
+升级 Hermes 时，先把新官方镜像放到宿主机，再同步修改 `.env` 的 `HERMES_IMAGE`、版本锁和运行时补丁。补丁脚本会在版本不匹配时拒绝启动，不能只换 tag。默认不覆盖持久数据中的 `config.yaml`；接受仓库托管配置时将 `FLEET_FORCE_CONFIG=1` 启动一次，确认后恢复为 `0`。备份前停止 active 容器并备份整个 `HERMES_DATA_DIR`。
 
-## 生产边界
+`docker compose down` 不删除工具卷；`docker compose down -v` 会删除工具卷，下次启动需重新联网同步。
 
-- `kanban.auto_decompose=false`；只有类型化 dispatcher Skill 扩展 SDD DAG。
-- Hermes 0.18.2 的专业 worker 仍能看到 `kanban_create/link`。生产前必须在 tool registration/handler 层仅允许 dispatcher worker 调用，并拒绝非 dispatcher 创建的 ready 卡；SOUL/Skill 不能替代权限控制。
-- Hermes 原生 gateway 是唯一 `im.message.receive_v1` consumer；不得再运行 `lark-cli event consume`。
-- 上线前必须验证：各 Agent 独立身份和最小权限、protected branch、单 SPEC 完整 E2E、重复消息/响应丢失幂等、worker/gateway 崩溃恢复、head 漂移阻断、冷备恢复。未全部通过时不得称为生产自治 E2E。
+## 验证边界
 
-研究基线：[Hermes distributions](https://hermes-agent.nousresearch.com/docs/user-guide/profile-distributions)、[Docker](https://hermes-agent.nousresearch.com/docs/user-guide/docker)、[Kanban](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban)、[worker lanes](https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban-worker-lanes)、[Feishu](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/feishu)、[GitLab glab Skill](https://gitlab.com/gitlab-org/ai/skills/-/tree/main/skills/glab)、[Lark CLI Skills](https://github.com/larksuite/cli/tree/main/skills)。实际 revision 见 [版本锁](config/skills-lock.yaml)。
+```bash
+./scripts/verify-bundle.sh
+```
+
+该命令验证静态部署包。三机器人、真实 GitLab 最小权限、protected branch、MR/pipeline/discussion、checked-head merge、崩溃恢复和故障注入未完成前，不得声明生产自治 E2E。

@@ -1,7 +1,7 @@
 name: tasker
-version: 0.1.0
-description: Compiles approved SPEC and PLAN artifacts into a stable executable task DAG
-hermes_requires: ">=0.18.2"
+version: 0.2.0
+description: Writes one-to-one TASKS files and a stable executable task DAG
+hermes_requires: ">=0.19.0"
 author: Hermes MES Team
 license: Proprietary
 env_requires:
@@ -9,5 +9,5 @@ env_requires:
     description: Private GitLab hostname
     required: true
   - name: GITLAB_TOKEN
-    description: Tasker token with branch and MR permission
+    description: Developer token with shared branch and MR permission
     required: true

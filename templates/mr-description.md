@@ -1,28 +1,36 @@
-# 变更摘要
+# PRD 交付摘要
 
-<由产出者填写对人类可读的摘要>
+<本 PRD 的业务范围、实现摘要和中文项目显示名>
 
 <!-- SDD-RUN:BEGIN -->
 ```yaml
-schema_version: 1
+schema_version: 2
 run_key: <run_key>
-kanban_task_id: <task-id>
+project_id: <gitlab-project-id>
 project_path: <group/project>
-artifact_type: <spec|plan|tasks|code>
-spec_key: <feature-key>
-source_branch: <branch>
-target_branch: <protected-branch>
-upstream:
-  prd_file: <path>
-  prd_commit_sha: <sha>
-  spec_file: <path-or-null>
-  spec_commit_sha: <sha-or-null>
-  plan_file: <path-or-null>
-  plan_commit_sha: <sha-or-null>
-  tasks_file: <path-or-null>
-  tasks_commit_sha: <sha-or-null>
+project_display_name: <display-name>
+source_branch: <shared-run-branch>
+target_branch: <gitlab-default-branch>
+source_prd:
+  path: docs/prds/<prd-basename>.md
+  commit_sha: <merged-prd-commit-sha>
+  mr_url: <merged-prd-mr-url>
+artifacts:
+  specs: [<sorted-spec-paths>]
+  plans: [<sorted-plan-paths>]
+  tasks: [<sorted-task-paths>]
+gates:
+  spec_digest: <sha256-or-null>
+  plan_digest: <sha256-or-null>
+  tasks_digest: <sha256-or-null>
 ```
 <!-- SDD-RUN:END -->
+
+## TASKS 与实现覆盖
+
+| TASK ID | SPEC/需求 | 实现位置 | 测试 |
+| --- | --- | --- | --- |
+| <id> | <source> | <path> | <test> |
 
 ## 验证
 
@@ -33,7 +41,6 @@ upstream:
 - 风险：<risk-or-none>
 - 回滚：<rollback>
 
-## 待确认
+## 合并后永久链接评论
 
-- 无；或列出会阻塞本 MR 的明确事项。
-
+dispatcher 合并成功后，以 GitLab 返回的 `merge_commit_sha` 为 revision，逐项生成 PRD、全部 SPEC、PLAN、TASKS 的 `/-/blob/<merge_commit_sha>/<path>` 链接，并在本 MR 留下一个幂等评论；不得使用分支名或合并前 head 代替 merge SHA。

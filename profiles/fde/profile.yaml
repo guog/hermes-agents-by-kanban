@@ -1,3 +1,2 @@
-description: Classifies and sanitizes field evidence before PRD intake; never routes raw field input to coding.
+description: Human-facing Feishu agent that sanitizes field evidence and may create normal GitLab Issues; never pushes code.
 description_auto: false
-

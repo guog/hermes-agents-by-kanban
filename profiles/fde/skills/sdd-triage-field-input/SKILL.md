@@ -1,14 +1,14 @@
 ---
 name: sdd-triage-field-input
-description: Classify and sanitize field evidence before PRD intake
-version: 0.1.0
+description: Collaborate in Feishu to classify, sanitize and record field evidence as a normal GitLab Issue
+version: 0.2.0
 ---
 
 # Triage field input
 
-1. Read the card and linked evidence; verify project, product version and environment.
-2. Classify as defect, feature request, configuration/environment issue or insufficient evidence.
-3. Record minimum reproduction, expected/actual result, impact, frequency, artifacts and uncertainty. Redact credentials and personal data.
-4. Reconcile any existing intake object before posting. Do not create a code task or formal SDD run.
-5. Complete with the intake URL, classification and precise next action; block when required evidence or authorization is missing.
-
+1. Reply in the original Feishu chat/topic; @ the initiator in group/topic replies. Confirm the allowlisted project, product version and environment; use project ID/path as identity and never guess from a Chinese display name or acronym.
+2. Classify the input as defect, feature request, configuration/environment issue or insufficient evidence.
+3. Record minimum reproduction, expected/actual result, impact, frequency, evidence and uncertainty. Redact credentials, personal data and sensitive raw logs before any upload.
+4. Read repository content only. Reconcile an existing intake Issue before creating a normal GitLab Issue; FDE has no Git commit identity and never pushes.
+5. Reply with the Issue URL, classification and precise next action; ask for missing evidence or authorization when required.
+6. Never create a formal SDD run or a GitLab Task work item and never implement code.

@@ -1,7 +1,7 @@
 name: prd-writer
-version: 0.1.0
-description: Clarifies requirements and prepares reviewable PRD merge requests
-hermes_requires: ">=0.18.2"
+version: 0.2.0
+description: Human-facing Feishu agent that prepares reviewable PRD merge requests
+hermes_requires: ">=0.19.0"
 author: Hermes MES Team
 license: Proprietary
 env_requires:
@@ -9,5 +9,17 @@ env_requires:
     description: Private GitLab hostname
     required: true
   - name: GITLAB_TOKEN
-    description: PRD writer token with feature-branch and MR permission
+    description: Developer token with feature-branch and MR permission
+    required: true
+  - name: GITLAB_ALLOWED_GROUPS
+    description: Comma-separated GitLab group path allowlist
+    required: true
+  - name: FEISHU_APP_ID
+    description: PRD writer bot App ID
+    required: true
+  - name: API_SERVER_PORT
+    description: Gateway-local API port unique inside the container
+    required: true
+  - name: FEISHU_APP_SECRET
+    description: PRD writer bot App Secret
     required: true

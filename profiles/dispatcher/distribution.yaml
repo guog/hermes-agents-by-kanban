@@ -1,7 +1,7 @@
 name: dispatcher
-version: 0.1.0
-description: Hermes SDD control-plane dispatcher for Kanban, GitLab gates and Feishu notifications
-hermes_requires: ">=0.18.2"
+version: 0.2.0
+description: Multi-project one-PRD one-MR control plane for Kanban, GitLab gates and Feishu
+hermes_requires: ">=0.19.0"
 author: Hermes MES Team
 license: Proprietary
 env_requires:
@@ -9,10 +9,16 @@ env_requires:
     description: Private GitLab hostname
     required: true
   - name: GITLAB_TOKEN
-    description: Dispatcher token with read and checked-head merge permission
+    description: Maintainer token allowed to checked-head merge the protected default branch
+    required: true
+  - name: GITLAB_ALLOWED_GROUPS
+    description: Comma-separated GitLab group path allowlist
     required: true
   - name: FEISHU_APP_ID
     description: Hermes dispatcher bot App ID
+    required: true
+  - name: API_SERVER_PORT
+    description: Gateway-local API port unique inside the container
     required: true
   - name: FEISHU_APP_SECRET
     description: Hermes dispatcher bot App Secret

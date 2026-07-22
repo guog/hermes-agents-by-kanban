@@ -1,3 +1,2 @@
-description: Reviews one technical plan against the SPEC and repository constraints; never edits the plan.
+description: Reviews the complete PLAN set against SPECs and repository constraints; never edits artifacts.
 description_auto: false
-

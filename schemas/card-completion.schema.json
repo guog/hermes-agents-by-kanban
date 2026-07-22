@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.invalid/schemas/card-completion.schema.json",
-  "title": "Hermes SDD Kanban Card Completion",
+  "title": "Hermes SDD Kanban Card Completion v2",
   "type": "object",
   "additionalProperties": true,
   "required": [
@@ -9,75 +9,59 @@
     "run_key",
     "stage",
     "outcome",
+    "project_id",
     "project_path",
-    "kanban_task_id",
+    "project_display_name",
+    "checkout",
+    "worktree",
+    "branch",
+    "target_branch",
+    "prd_path",
+    "prd_commit_sha",
+    "prd_mr_url",
+    "kanban_card_id",
+    "mr_iid",
+    "mr_url",
+    "head_sha",
+    "artifact_paths",
+    "artifact_digest",
     "verification",
     "residual_risk"
   ],
   "properties": {
-    "schema_version": {
-      "const": 1
-    },
-    "run_key": {
-      "type": "string",
-      "pattern": "^sdd-[a-z2-7]{20}$"
-    },
+    "schema_version": {"const": 2},
+    "run_key": {"type": "string", "pattern": "^sdd-[a-z2-7]{20}$"},
     "stage": {
       "type": "string",
       "enum": [
-        "run-init",
-        "spec-write",
-        "spec-queue",
-        "spec-review",
-        "spec-gate",
-        "spec-rework",
-        "plan-write",
-        "plan-review",
-        "plan-gate",
-        "plan-rework",
-        "tasks-write",
-        "tasks-analyze",
-        "tasks-gate",
-        "tasks-rework",
-        "implement",
-        "test",
-        "test-gate",
-        "code-review",
-        "code-gate",
-        "code-rework",
-        "converge-tasks",
-        "next-spec-or-complete",
-        "run-complete",
-        "human-decision"
+        "run-init", "spec-write", "spec-review", "spec-gate", "spec-rework",
+        "plan-write", "plan-review", "plan-gate", "plan-rework",
+        "tasks-write", "tasks-review", "tasks-gate", "tasks-rework",
+        "implement", "test", "test-gate", "code-review", "code-gate",
+        "code-rework", "merge", "run-complete", "human-decision"
       ]
     },
     "outcome": {
       "type": "string",
       "enum": ["pass", "fail", "scope_gap", "blocked", "cancelled"]
     },
-    "project_path": {
-      "type": "string",
-      "minLength": 3
-    },
-    "spec_key": {
-      "type": ["string", "null"]
-    },
-    "iteration": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "kanban_task_id": {
-      "type": "string",
-      "pattern": "^t_[A-Za-z0-9_-]+$"
-    },
-    "mr_iid": {
-      "type": ["integer", "null"],
-      "minimum": 1
-    },
-    "head_sha": {
-      "type": ["string", "null"],
-      "pattern": "^[0-9a-f]{40}$"
-    },
+    "project_id": {"type": "integer", "minimum": 1},
+    "project_path": {"type": "string", "pattern": "^[^/]+/.+$"},
+    "project_display_name": {"type": "string", "minLength": 1},
+    "checkout": {"type": "string", "pattern": "^/workspace/projects/p[1-9][0-9]*-"},
+    "worktree": {"type": "string", "pattern": "^/workspace/projects/worktrees/p[1-9][0-9]*/sdd-"},
+    "branch": {"type": "string", "minLength": 3},
+    "target_branch": {"type": "string", "minLength": 1},
+    "prd_path": {"type": "string", "pattern": "^docs/prds/prd-[a-z0-9]+(?:-[a-z0-9]+)*\\.md$"},
+    "prd_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "prd_mr_url": {"type": "string", "format": "uri"},
+    "iteration": {"type": "integer", "minimum": 1},
+    "kanban_card_id": {"type": "string", "pattern": "^t_[A-Za-z0-9_-]+$"},
+    "mr_iid": {"type": ["integer", "null"], "minimum": 1},
+    "mr_url": {"type": ["string", "null"], "format": "uri"},
+    "head_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "review_commit_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "artifact_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
     "artifact_paths": {
       "type": "array",
       "items": {"type": "string"},
@@ -92,18 +76,12 @@
       "items": {"type": "string", "format": "uri"},
       "uniqueItems": true
     },
-    "next_task_ids": {
+    "next_card_ids": {
       "type": "array",
       "items": {"type": "string"},
       "uniqueItems": true
     },
-    "retry_notes": {
-      "type": ["string", "null"]
-    },
-    "residual_risk": {
-      "type": "array",
-      "items": {"type": "string"}
-    }
+    "retry_notes": {"type": ["string", "null"]},
+    "residual_risk": {"type": "array", "items": {"type": "string"}}
   }
 }
-

@@ -1,15 +1,13 @@
 ---
 name: sdd-analyze-tasks
-description: Analyze SPEC, PLAN and TASKS consistency and post a head-bound gate
-version: 0.1.0
+description: Review the complete SPEC PLAN TASKS mapping and post a digest-bound gate
+version: 0.2.0
 ---
 
-# Analyze TASKS
+# Review TASKS set
 
-1. Call `kanban_show()` and confirm the TASKS MR current head equals expected head.
-2. Read exact SPEC, PLAN and TASKS revisions.
-3. Validate stable unique IDs, acyclic dependencies, execution waves, requirement coverage, correct files/modules, objective acceptance and test work.
-4. Classify missing/incorrect tasks as `fail`; classify an upstream requirement/design gap as `scope_gap` only when TASKS cannot safely resolve it.
-5. Post an idempotent `SDD-GATE` for `tasks-analyze`, bound to run/task/head, using the gate template.
-6. Complete pass/fail/scope_gap metadata. Do not edit artifacts, implement or merge.
-
+1. Call `kanban_show()`; require dispatcher origin and verify project/run/worktree/branch/shared MR and still-valid SPEC/PLAN digests.
+2. Verify one-to-one SPEC/PLAN/TASK key sets, stable unique IDs, acyclic dependencies, execution order, requirement coverage, correct modules, objective acceptance and sufficient test work.
+3. Compute the complete sorted TASKS path/blob-SHA digest at the review commit. Post an idempotent v2 `tasks-review` gate with digest and `review_commit_sha`.
+4. Use `fail` for missing/incorrect tasks. Use `scope_gap` only for an evidenced PLAN or SPEC deficiency, and identify the owning upstream stage.
+5. Complete with pass/fail/scope_gap, digest, review commit and findings. Never edit artifacts, implement, push, create another MR or merge.

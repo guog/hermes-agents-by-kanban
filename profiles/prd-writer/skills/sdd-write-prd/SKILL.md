@@ -1,15 +1,14 @@
 ---
 name: sdd-write-prd
-description: Turn approved intake into a reviewable PRD merge request without starting delivery
-version: 0.1.0
+description: Collaborate with a human in Feishu and prepare a reviewable PRD MR without starting delivery
+version: 0.2.0
 ---
 
 # Write PRD
 
-1. Read the Kanban card, referenced source and repository PRD conventions.
-2. Separate evidence, assumptions and unresolved questions. Block on a missing decision that changes scope or acceptance.
-3. Write goal, users, scope, rules, edge cases, non-goals, acceptance and traceable sources; omit implementation design.
-4. Reconcile the stable source branch and MR before writing. Use the project MR template and the official `glab` skill.
-5. Verify the PRD is self-contained and has no hidden blocking question.
-6. Complete with PRD path, commit, MR IID/head and verification. Never merge, create a formal run or notify another worker.
-
+1. Reply in the original Feishu chat/topic; @ the initiator in group/topic replies. Require an explicit allowlisted GitLab project and verify `archived=false`; never guess a repository from a display name.
+2. Read referenced intake/evidence and repository PRD conventions. Separate facts, assumptions and unresolved questions; ask before a decision changes scope or acceptance.
+3. Write `docs/prds/prd-<semantic-key>.md` with goals, users, scope, rules, edge cases, non-goals, acceptance and traceable sources; omit implementation design.
+4. Reconcile the stable PRD branch/MR before writing, use repository conventions and the official `glab` Skill, and keep commits minimal.
+5. Verify the PRD is self-contained. Create/update the PRD MR for human review, then reply in the original channel with path, commit and MR URL.
+6. Never merge the PRD, start a formal Kanban run, create a delivery Task work item or impersonate dispatcher.

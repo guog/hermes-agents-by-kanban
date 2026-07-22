@@ -1,7 +1,7 @@
 name: spec-reviewer
-version: 0.1.0
-description: Reviews a SPEC against the merged PRD and emits a head-bound gate
-hermes_requires: ">=0.18.2"
+version: 0.2.0
+description: Reviews the complete SPEC set and emits a path/blob-digest gate
+hermes_requires: ">=0.19.0"
 author: Hermes MES Team
 license: Proprietary
 env_requires:
@@ -9,5 +9,5 @@ env_requires:
     description: Private GitLab hostname
     required: true
   - name: GITLAB_TOKEN
-    description: Spec reviewer token with MR comment permission
+    description: Reporter token with API permission to clone and comment on MRs
     required: true

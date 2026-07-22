@@ -1,22 +1,62 @@
 services:
+  tooling-sync:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}
+    pull_policy: never
+    user: "0:0"
+    entrypoint: ["/bin/bash", "/opt/fleet/scripts/sync-tooling.sh"]
+    restart: "no"
+    volumes:
+      - tooling:/opt/fleet/vendor
+      - ./scripts:/opt/fleet/scripts:ro
+      - ./config:/opt/fleet/config:ro
+
   hermes:
-    build:
-      context: .
-      args:
-        HERMES_BASE_IMAGE: ${HERMES_BASE_IMAGE:-nousresearch/hermes-agent@sha256:3dcdb7b88092fc18846ba0276a84ccf86cfd9afebc83ed8f98cdd0e78bf46e69}
-    image: hermes-sdd-fleet:0.1.0
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}
+    pull_policy: never
     container_name: hermes-sdd
     restart: unless-stopped
-    command: ["-p", "dispatcher", "gateway", "run"]
-    env_file:
-      - ${FLEET_ENV_FILE:-.env}
+    command: ["sleep", "infinity"]
+    depends_on:
+      tooling-sync:
+        condition: service_completed_successfully
     environment:
       HERMES_DASHBOARD: "1"
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
+      PATH: /opt/fleet/vendor/current/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      FLEET_MODEL: ${FLEET_MODEL:-}
+      FLEET_FORCE_CONFIG: ${FLEET_FORCE_CONFIG:-0}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NOUS_API_KEY: ${NOUS_API_KEY:-}
+      GIT_COMMIT_NAME_PRD_WRITER: ${GIT_COMMIT_NAME_PRD_WRITER:-}
+      GIT_COMMIT_EMAIL_PRD_WRITER: ${GIT_COMMIT_EMAIL_PRD_WRITER:-}
+      GIT_COMMIT_NAME_SPEC_WRITER: ${GIT_COMMIT_NAME_SPEC_WRITER:-}
+      GIT_COMMIT_EMAIL_SPEC_WRITER: ${GIT_COMMIT_EMAIL_SPEC_WRITER:-}
+      GIT_COMMIT_NAME_PLANNER: ${GIT_COMMIT_NAME_PLANNER:-}
+      GIT_COMMIT_EMAIL_PLANNER: ${GIT_COMMIT_EMAIL_PLANNER:-}
+      GIT_COMMIT_NAME_TASKER: ${GIT_COMMIT_NAME_TASKER:-}
+      GIT_COMMIT_EMAIL_TASKER: ${GIT_COMMIT_EMAIL_TASKER:-}
+      GIT_COMMIT_NAME_CODER: ${GIT_COMMIT_NAME_CODER:-}
+      GIT_COMMIT_EMAIL_CODER: ${GIT_COMMIT_EMAIL_CODER:-}
     ports:
       - "127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}:9119"
     volumes:
+      - tooling:/opt/fleet/vendor:ro
+      - ./profiles:/opt/fleet/profiles:ro
+      - ./templates:/opt/fleet/templates:ro
+      - ./schemas:/opt/fleet/schemas:ro
+      - ./scripts:/opt/fleet/scripts:ro
+      - ./patches:/opt/fleet/patches:ro
+      - ./config:/opt/fleet/config:ro
+      - ./scripts/runtime-patch-hermes.sh:/etc/cont-init.d/017-hermes-runtime-patch:ro
+      - ./scripts/container-bootstrap.sh:/etc/cont-init.d/018-hermes-sdd-fleet:ro
+      - ./scripts/start-profile-gateways.sh:/etc/cont-init.d/021-hermes-sdd-gateways:ro
       - ${HERMES_DATA_DIR:-./.runtime/hermes}:/opt/data
       - ${PROJECTS_DIR:-./.runtime/projects}:/workspace/projects
     shm_size: 1gb
+
+volumes:
+  tooling:
+    name: ${TOOLING_VOLUME_NAME:-hermes-sdd-tooling}

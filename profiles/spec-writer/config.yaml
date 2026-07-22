@@ -10,7 +10,7 @@ memory:
   user_profile_enabled: false
   write_approval: false
 skills:
-  external_dirs: [/opt/fleet/vendor/gitlab/skills]
+  external_dirs: [/opt/fleet/vendor/current/gitlab/skills]
   template_vars: true
   inline_shell: false
   guard_agent_created: true

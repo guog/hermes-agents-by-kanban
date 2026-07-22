@@ -1,0 +1,69 @@
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 94d5a00..a4ef56e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -335,6 +335,17 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
+     return None
+ 
+ 
++def _require_dispatcher_profile(tool_name: str) -> Optional[str]:
++    """Fleet hardening: only the named dispatcher may shape the task graph."""
++    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
++    if profile != "dispatcher":
++        return tool_error(
++            f"{tool_name} is restricted to HERMES_PROFILE=dispatcher; "
++            f"caller profile was {profile or '<unset>'}."
++        )
++    return None
++
++
+ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
+     """Compact task shape for board-listing tools."""
+     parents = kb.parent_ids(conn, task.id)
+@@ -1068,6 +1080,9 @@ def _handle_create(args: dict, **kw) -> str:
+     ``parents`` can be a list of task ids; dependency-gated promotion
+     works as usual.
+     """
++    denied = _require_dispatcher_profile("kanban_create")
++    if denied:
++        return denied
+     title = args.get("title")
+     if not title or not str(title).strip():
+         return tool_error("title is required")
+@@ -1311,6 +1326,9 @@ def _handle_link(args: dict, **kw) -> str:
+ 
+ def _handle_link(args: dict, **kw) -> str:
+     """Add a parent→child dependency edge after the fact."""
++    denied = _require_dispatcher_profile("kanban_link")
++    if denied:
++        return denied
+     parent_id = args.get("parent_id")
+     child_id = args.get("child_id")
+     if not parent_id or not child_id:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -7589,8 +7589,11 @@ def _dispatch_once_locked(
+         )
+ 
++    # Fleet hardening: only cards created by the dispatcher profile may be
++    # selected for worker dispatch. Untrusted cards remain visible on board.
+     ready_rows = conn.execute(
+         "SELECT id, assignee FROM tasks "
+-        "WHERE status = 'ready' AND claim_lock IS NULL "
++        "WHERE status = 'ready' AND claim_lock IS NULL "
++        "AND created_by = 'dispatcher' "
+         "ORDER BY priority DESC, created_at ASC"
+     ).fetchall()
+     # Honour kanban.max_in_progress: if the board already has enough running
+@@ -7831,8 +7834,9 @@ def _dispatch_once_locked(
+     # against max_spawn alongside ready tasks, so the total number of
+     # running workers stays bounded.
+     review_rows = conn.execute(
+         "SELECT id, assignee FROM tasks "
+-        "WHERE status = 'review' AND claim_lock IS NULL "
++        "WHERE status = 'review' AND claim_lock IS NULL "
++        "AND created_by = 'dispatcher' "
+         "ORDER BY priority DESC, created_at ASC"
+     ).fetchall()
+     for row in review_rows:

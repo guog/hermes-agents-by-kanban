@@ -1,3 +1,2 @@
-description: Analyzes SPEC, PLAN and TASKS consistency and coverage without modifying artifacts.
+description: Reviews the complete one-to-one SPEC PLAN TASKS mapping with a digest-bound gate.
 description_auto: false
-

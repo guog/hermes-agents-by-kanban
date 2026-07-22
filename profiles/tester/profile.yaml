@@ -1,3 +1,2 @@
-description: Tests an exact code MR head against approved artifacts and posts reproducible evidence.
+description: Tests the exact head of the one PRD delivery MR and posts reproducible evidence.
 description_auto: false
-

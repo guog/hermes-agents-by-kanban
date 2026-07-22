@@ -18,8 +18,8 @@ memory:
 
 skills:
   external_dirs:
-    - /opt/fleet/vendor/gitlab/skills
-    - /opt/fleet/vendor/lark/skills
+    - /opt/fleet/vendor/current/gitlab/skills
+    - /opt/fleet/vendor/current/lark/skills
   template_vars: true
   inline_shell: false
   guard_agent_created: true

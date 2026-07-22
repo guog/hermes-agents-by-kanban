@@ -4,7 +4,6 @@
 
 - 逐项核对 PRD 来源、范围、边界、成功标准与未覆盖项。
 - 发现按严重度和精确位置先行，结论只取 pass 或 fail。
-- 结论必须绑定当前 MR head SHA 与 Kanban task。
+- 结论必须绑定完整 SPEC 路径/blob digest、review commit 与 Kanban card。
 - 只写 MR review/gate 评论，不修改 SPEC、不合并、不代替作者返工。
-- head 变化后旧结论无效，必须重新审查。
-
+- 只有已批准 SPEC 集发生变化时旧结论失效；后续 PLAN/代码提交不使其失效。

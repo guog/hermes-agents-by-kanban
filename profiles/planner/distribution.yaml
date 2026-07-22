@@ -1,7 +1,7 @@
 name: planner
-version: 0.1.0
-description: Produces an implementable technical plan for one approved SPEC
-hermes_requires: ">=0.18.2"
+version: 0.2.0
+description: Produces one-to-one implementable PLANs for the approved SPEC set
+hermes_requires: ">=0.19.0"
 author: Hermes MES Team
 license: Proprietary
 env_requires:
@@ -9,5 +9,5 @@ env_requires:
     description: Private GitLab hostname
     required: true
   - name: GITLAB_TOKEN
-    description: Planner token with branch and MR permission
+    description: Developer token with shared branch and MR permission
     required: true
