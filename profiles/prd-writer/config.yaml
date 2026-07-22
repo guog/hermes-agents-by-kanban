@@ -20,6 +20,8 @@ skills:
   inline_shell: false
   guard_agent_created: true
   write_approval: true
+kanban:
+  dispatch_in_gateway: false
 platforms:
   feishu:
     extra:

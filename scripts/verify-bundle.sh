@@ -207,6 +207,8 @@ for profile in profiles:
     if profile == "dispatcher":
         assert "dispatch_in_gateway: true" in config
         assert "auto_decompose: false" in config
+    elif profile in {"prd-writer", "fde"}:
+        assert "dispatch_in_gateway: false" in config
     else:
         assert "dispatch_in_gateway: true" not in config
 
