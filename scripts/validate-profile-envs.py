@@ -59,10 +59,10 @@ GATEWAY_REQUIRED = (
     "FEISHU_APP_SECRET",
     "FEISHU_DOMAIN",
     "FEISHU_CONNECTION_MODE",
-    "FEISHU_ALLOWED_USERS",
-    "FEISHU_HOME_CHANNEL",
+    "FEISHU_ALLOW_ALL_USERS",
     "FEISHU_GROUP_POLICY",
     "FEISHU_REQUIRE_MENTION",
+    "FEISHU_ALLOW_BOTS",
     "LARKSUITE_CLI_CONFIG_DIR",
     "LARKSUITE_CLI_DATA_DIR",
 )
@@ -232,23 +232,21 @@ def validate_profiles(profiles_root: pathlib.Path, expected_uid: int) -> dict[st
                 errors.append(f"API_SERVER_PORT must be unique: {ports[port]} and {profile} match")
             else:
                 ports[port] = profile
-            for key in ("FEISHU_ALLOWED_USERS", "FEISHU_HOME_CHANNEL"):
-                if "replace_me" in values.get(key, ""):
-                    errors.append(f"{profile}: {key} still contains a placeholder")
             expected_feishu_policy = {
                 "FEISHU_DOMAIN": "feishu",
                 "FEISHU_CONNECTION_MODE": "websocket",
-                "FEISHU_GROUP_POLICY": "allowlist",
+                "FEISHU_ALLOW_ALL_USERS": "true",
+                "FEISHU_GROUP_POLICY": "open",
                 "FEISHU_REQUIRE_MENTION": "true",
+                "FEISHU_ALLOW_BOTS": "mentions",
             }
             for key, expected in expected_feishu_policy.items():
                 if values.get(key, "").strip() != expected:
                     errors.append(f"{profile}: {key} must equal {expected}")
-            allowed_users = [
-                user.strip() for user in values.get("FEISHU_ALLOWED_USERS", "").split(",") if user.strip()
-            ]
-            if not allowed_users or "*" in allowed_users:
-                errors.append(f"{profile}: FEISHU_ALLOWED_USERS must be a non-wildcard allowlist")
+            if values.get("FEISHU_ALLOWED_USERS", "").strip():
+                errors.append(f"{profile}: FEISHU_ALLOWED_USERS must be empty for group-only open access")
+            if values.get("FEISHU_HOME_CHANNEL", "").strip():
+                errors.append(f"{profile}: FEISHU_HOME_CHANNEL must be empty until one group is approved as home")
             expected_config = f"/opt/data/profiles/{profile}/.lark-cli/config"
             expected_data = f"/opt/data/profiles/{profile}/.lark-cli/data"
             if values.get("LARKSUITE_CLI_CONFIG_DIR") != expected_config:
