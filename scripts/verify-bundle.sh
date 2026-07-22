@@ -179,6 +179,11 @@ for value in [
     "HERMES_IMAGE=nousresearch/hermes-agent:v2026.7.20",
     "TOOLING_VOLUME_NAME=hermes-sdd-tooling",
     "FLEET_MODEL=", "OPENAI_API_KEY=", "FLEET_FORCE_CONFIG=0",
+    "GIT_COMMIT_EMAIL_PRD_WRITER=prd-writer-bot@hermes.invalid",
+    "GIT_COMMIT_EMAIL_SPEC_WRITER=spec-writer-bot@hermes.invalid",
+    "GIT_COMMIT_EMAIL_PLANNER=planner-bot@hermes.invalid",
+    "GIT_COMMIT_EMAIL_TASKER=tasker-bot@hermes.invalid",
+    "GIT_COMMIT_EMAIL_CODER=coder-bot@hermes.invalid",
 ]:
     assert value in env_example
 assert "HERMES_BASE_IMAGE" not in env_example
@@ -186,9 +191,23 @@ assert "GIT_COMMIT_NAME_FDE" not in env_example
 for forbidden in ["GITLAB_", "FEISHU_", "LARKSUITE_CLI_", "GATEWAY_API_PORT_", "FLEET_SYNC_SECRETS"]:
     assert forbidden not in env_example, f"root .env.example contains profile credential: {forbidden}"
 
+disabled_skills = {
+    "ascii-video", "comfyui", "manim-video", "touchdesigner-mcp",
+    "hyperframes", "kanban-video-orchestrator", "blender-mcp", "gif-search",
+    "youtube-content", "songwriting-and-ai-music", "heartmula", "songsee",
+    "audiocraft-audio-generation", "openhue", "minecraft-modpack-server",
+    "pokemon-player",
+}
+
 for profile in profiles:
     config = (root / f"profiles/{profile}/config.yaml").read_text(encoding="utf-8")
     env_template = (root / f"profiles/{profile}/.env.template").read_text(encoding="utf-8")
+    disabled_match = re.search(r"(?m)^  disabled: \[([^]]*)\]$", config)
+    assert disabled_match, f"missing skills.disabled: {profile}"
+    actual_disabled = {
+        item.strip() for item in disabled_match.group(1).split(",") if item.strip()
+    }
+    assert actual_disabled == disabled_skills, f"skills.disabled drift: {profile}"
     has_feishu = "platform_toolsets:\n  feishu:" in config
     assert has_feishu == (profile in gateway_profiles), f"unexpected Feishu gateway config: {profile}"
     assert "/opt/fleet/vendor/current/gitlab/skills" in config
@@ -256,6 +275,7 @@ assert not (root / "WORKFLOW.md").exists(), "README must be the only workflow au
 readme = (root / "README.md").read_text(encoding="utf-8")
 for value in [
     "## 1. 总体介绍", "## 2. 流程设计", "## 3. 部署说明",
+    "#### 1.3.1 Hermes 内置 Skill 边界", "skills.disabled",
     "一个共享分支", "一个 Draft MR", "artifact_digest", "sha=<checked_head>",
     "SPEC、PLAN、TASKS 各阶段最多返工 3 轮",
     "代码、测试、代码审查引起的代码返工合计最多 5 轮",
