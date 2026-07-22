@@ -30,10 +30,12 @@ def env_text(profile: str) -> str:
                 f"FEISHU_APP_SECRET='feishu-$#={profile}'",
                 "FEISHU_DOMAIN=feishu",
                 "FEISHU_CONNECTION_MODE=websocket",
-                "FEISHU_ALLOWED_USERS=ou_user",
-                "FEISHU_HOME_CHANNEL=oc_channel",
-                "FEISHU_GROUP_POLICY=allowlist",
+                "FEISHU_ALLOW_ALL_USERS=true",
+                "FEISHU_ALLOWED_USERS=",
+                "FEISHU_HOME_CHANNEL=",
+                "FEISHU_GROUP_POLICY=open",
                 "FEISHU_REQUIRE_MENTION=true",
+                "FEISHU_ALLOW_BOTS=mentions",
                 f"LARKSUITE_CLI_CONFIG_DIR=/opt/data/profiles/{profile}/.lark-cli/config",
                 f"LARKSUITE_CLI_DATA_DIR=/opt/data/profiles/{profile}/.lark-cli/data",
                 "LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1",
@@ -198,7 +200,8 @@ class ProfileEnvValidationTests(unittest.TestCase):
             env_path.write_text(
                 env_text("fde")
                 .replace("FEISHU_CONNECTION_MODE=websocket", "FEISHU_CONNECTION_MODE=webhook")
-                .replace("FEISHU_GROUP_POLICY=allowlist", "FEISHU_GROUP_POLICY=open")
+                .replace("FEISHU_ALLOW_ALL_USERS=true", "FEISHU_ALLOW_ALL_USERS=false")
+                .replace("FEISHU_GROUP_POLICY=open", "FEISHU_GROUP_POLICY=allowlist")
                 .replace("FEISHU_REQUIRE_MENTION=true", "FEISHU_REQUIRE_MENTION=false"),
                 encoding="utf-8",
             )
@@ -207,8 +210,29 @@ class ProfileEnvValidationTests(unittest.TestCase):
                 VALIDATOR.validate_profiles(profiles_root, os.getuid())
             message = str(caught.exception)
             self.assertIn("FEISHU_CONNECTION_MODE must equal websocket", message)
-            self.assertIn("FEISHU_GROUP_POLICY must equal allowlist", message)
+            self.assertIn("FEISHU_ALLOW_ALL_USERS must equal true", message)
+            self.assertIn("FEISHU_GROUP_POLICY must equal open", message)
             self.assertIn("FEISHU_REQUIRE_MENTION must equal true", message)
+
+    def test_gateway_open_group_policy_rejects_bot_and_home_drift(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_root = pathlib.Path(temp_dir) / "profiles"
+            make_valid_tree(profiles_root)
+            env_path = profiles_root / "dispatcher" / ".env"
+            env_path.write_text(
+                env_text("dispatcher")
+                .replace("FEISHU_ALLOW_BOTS=mentions", "FEISHU_ALLOW_BOTS=all")
+                .replace("FEISHU_ALLOWED_USERS=", "FEISHU_ALLOWED_USERS=ou_user")
+                .replace("FEISHU_HOME_CHANNEL=", "FEISHU_HOME_CHANNEL=oc_channel"),
+                encoding="utf-8",
+            )
+            env_path.chmod(0o600)
+            with self.assertRaises(VALIDATOR.ProfileEnvError) as caught:
+                VALIDATOR.validate_profiles(profiles_root, os.getuid())
+            message = str(caught.exception)
+            self.assertIn("FEISHU_ALLOW_BOTS must equal mentions", message)
+            self.assertIn("FEISHU_ALLOWED_USERS must be empty", message)
+            self.assertIn("FEISHU_HOME_CHANNEL must be empty", message)
 
     def test_wrong_owner_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

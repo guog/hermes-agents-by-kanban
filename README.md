@@ -278,7 +278,7 @@ dispatcher 只在以下条件同时成立时合并：
 sha=<checked_head>
 ```
 
-合并成功后，dispatcher 使用 merge commit SHA 在 MR 留下 PRD、SPEC、PLAN、TASKS 的排序后永久 blob 链接，清理成功 run 的 worktree，并在原飞书群聊、话题或单聊回复。群聊和话题中必须 `@` 原发起人。
+合并成功后，dispatcher 使用 merge commit SHA 在 MR 留下 PRD、SPEC、PLAN、TASKS 的排序后永久 blob 链接，清理成功 run 的 worktree，并在原飞书群聊或话题回复。回复中必须 `@` 原发起人。
 
 ## 3. 部署说明
 
@@ -399,7 +399,7 @@ GIT_COMMIT_EMAIL_CODER=coder-bot@hermes.invalid
 4. 订阅事件 `im.message.receive_v1`。
 5. 使用长连接/WebSocket 接收事件，不要求公网 webhook。
 6. 创建并发布应用版本；仅保存配置但未发布时，机器人可能无法收发消息。
-7. 将机器人加入允许的群聊，记录发起人的 open ID 和默认 chat ID。
+7. 在飞书开发者后台关闭机器人私聊能力，并将机器人加入需要使用的群聊。Hermes 不额外维护成员 allowlist；群内任何成员必须显式 `@` 机器人才能触发。
 
 Hermes 对飞书的配置说明见[飞书 Gateway 文档](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/feishu)。
 
@@ -432,10 +432,12 @@ FEISHU_APP_ID=<dispatcher App ID>
 FEISHU_APP_SECRET=<dispatcher App Secret>
 FEISHU_DOMAIN=feishu
 FEISHU_CONNECTION_MODE=websocket
-FEISHU_ALLOWED_USERS=<允许发起人的 open_id>
-FEISHU_HOME_CHANNEL=<默认 chat_id>
-FEISHU_GROUP_POLICY=allowlist
+FEISHU_ALLOW_ALL_USERS=true
+FEISHU_ALLOWED_USERS=
+FEISHU_HOME_CHANNEL=
+FEISHU_GROUP_POLICY=open
 FEISHU_REQUIRE_MENTION=true
+FEISHU_ALLOW_BOTS=mentions
 LARKSUITE_CLI_CONFIG_DIR=/opt/data/profiles/dispatcher/.lark-cli/config
 LARKSUITE_CLI_DATA_DIR=/opt/data/profiles/dispatcher/.lark-cli/data
 LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1
@@ -499,7 +501,7 @@ docker compose up -d
 
 运行态验收通过后，分别验证三个机器人原渠道回复：
 
-1. 向 `prd-writer` 发送一条无敏感信息的 PRD 澄清请求，确认单聊/群聊/话题回复正确。
+1. 在群聊中 `@prd-writer` 发送一条无敏感信息的 PRD 澄清请求，确认群聊/话题回复正确。
 2. 向 `fde` 发送一条测试现场反馈，明确要求只分析、不创建 Issue，确认分类与回复渠道。
 3. 向 `dispatcher` 发送缺少 URL 的 `实现 PRD`，确认它继续询问且没有创建 run。
 4. 最后使用专用测试项目和已合入测试 PRD 执行完整启动协议。
@@ -514,7 +516,7 @@ docker compose up -d
 2. Ubuntu 运行：`verify-runtime.sh` 全部通过，包括固定 commit、镜像 digest、Hermes/补丁/tooling、12 profiles、3 Gateways 和 Dashboard basic auth。
 3. Kanban：观察真实 `dispatcher gate → worker → dispatcher continuation` 状态链；非 dispatcher 创建/链接被 handler 拒绝；`created_by != dispatcher` 的 ready 卡不被调度；重复消息和重复 reconcile 不增加卡片数量。
 4. 身份：12 个 GitLab 用户互异且角色精确为表中级别；五个 producer 只能向测试分支各执行一次可回收 push；reviewer/tester/FDE 的 push 必须被拒绝。
-5. 飞书：三个机器人均在原单聊/群聊/话题回复；向 dispatcher 发送缺少正式启动参数的消息时不得创建 run。
+5. 飞书：三个机器人均通过群聊显式 `@` 触发并在原群聊/话题回复；向 dispatcher 发送缺少正式启动参数的消息时不得创建 run。
 6. 完整 E2E：一个已合入测试 PRD 串行通过 SPEC、PLAN、TASKS、实现、测试、代码审查和 `sha=<checked_head>` merge；MR 留下 merge commit 永久链接，原飞书会话收到一次完成通知。
 7. 故障注入：分别验证容器重启、worker crash、token 失效、pipeline 失败、阻塞 discussion、head drift 和重复消息；恢复后不得出现重复分支、MR、card 或通知，旧 head 的 test/review 结论不得复用。
 
@@ -658,10 +660,12 @@ FEISHU_APP_ID=
 FEISHU_APP_SECRET=
 FEISHU_DOMAIN=feishu
 FEISHU_CONNECTION_MODE=websocket
+FEISHU_ALLOW_ALL_USERS=true
 FEISHU_ALLOWED_USERS=
 FEISHU_HOME_CHANNEL=
-FEISHU_GROUP_POLICY=allowlist
+FEISHU_GROUP_POLICY=open
 FEISHU_REQUIRE_MENTION=true
+FEISHU_ALLOW_BOTS=mentions
 LARKSUITE_CLI_CONFIG_DIR=/opt/data/profiles/report-writer/.lark-cli/config
 LARKSUITE_CLI_DATA_DIR=/opt/data/profiles/report-writer/.lark-cli/data
 LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1

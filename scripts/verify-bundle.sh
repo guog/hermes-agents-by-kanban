@@ -185,7 +185,8 @@ for value in [
     "capture_output=True", "worker profile must not have lark-cli state",
     "GITLAB_HOST must match every other profile", "GITLAB_ALLOWED_GROUPS must match every other profile",
     "expected_feishu_policy", '"FEISHU_CONNECTION_MODE": "websocket"',
-    '"FEISHU_GROUP_POLICY": "allowlist"', '"FEISHU_REQUIRE_MENTION": "true"',
+    '"FEISHU_ALLOW_ALL_USERS": "true"', '"FEISHU_GROUP_POLICY": "open"',
+    '"FEISHU_REQUIRE_MENTION": "true"', '"FEISHU_ALLOW_BOTS": "mentions"',
     "access_level != required",
 ]:
     assert value in validator, f"profile env validator contract missing: {value}"
@@ -251,7 +252,9 @@ for profile in profiles:
         for value in [
             "API_SERVER_PORT=", "FEISHU_APP_ID=", "FEISHU_APP_SECRET=",
             "FEISHU_DOMAIN=feishu", "FEISHU_CONNECTION_MODE=websocket",
-            "FEISHU_GROUP_POLICY=allowlist", "FEISHU_REQUIRE_MENTION=true",
+            "FEISHU_ALLOW_ALL_USERS=true", "FEISHU_ALLOWED_USERS=",
+            "FEISHU_HOME_CHANNEL=", "FEISHU_GROUP_POLICY=open",
+            "FEISHU_REQUIRE_MENTION=true", "FEISHU_ALLOW_BOTS=mentions",
             f"LARKSUITE_CLI_CONFIG_DIR=/opt/data/profiles/{profile}/.lark-cli/config",
             f"LARKSUITE_CLI_DATA_DIR=/opt/data/profiles/{profile}/.lark-cli/data",
         ]:
