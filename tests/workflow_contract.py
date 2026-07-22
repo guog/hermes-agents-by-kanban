@@ -6,12 +6,45 @@ import base64
 import hashlib
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote, unquote, urlparse
 
 
 PRD_PATH_RE = re.compile(r"^docs/prds/prd-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+STAGE_ASSIGNEES = {
+    "spec-write": "spec-writer",
+    "spec-review": "spec-reviewer",
+    "spec-rework": "spec-writer",
+    "plan-write": "planner",
+    "plan-review": "plan-reviewer",
+    "plan-rework": "planner",
+    "tasks-write": "tasker",
+    "tasks-review": "task-reviewer",
+    "tasks-rework": "tasker",
+    "implement": "coder",
+    "test": "tester",
+    "code-review": "code-reviewer",
+    "code-rework": "coder",
+    "merge": "dispatcher",
+}
+CONTINUATION_STAGES = {
+    "spec-write": "spec-gate",
+    "spec-review": "spec-gate",
+    "spec-rework": "spec-gate",
+    "plan-write": "plan-gate",
+    "plan-review": "plan-gate",
+    "plan-rework": "plan-gate",
+    "tasks-write": "tasks-gate",
+    "tasks-review": "tasks-gate",
+    "tasks-rework": "tasks-gate",
+    "implement": "code-gate",
+    "test": "test-gate",
+    "code-review": "code-gate",
+    "code-rework": "code-gate",
+    "merge": "run-complete",
+}
 
 
 class ContractError(ValueError):
@@ -33,6 +66,131 @@ class PrdMrUrl:
     host: str
     project_path: str
     iid: int
+
+
+@dataclass
+class SimCard:
+    card_id: str
+    idempotency_key: str
+    stage: str
+    assignee: str
+    created_by: str
+    parent_ids: set[str] = field(default_factory=set)
+    status: str = "blocked"
+    attempts: int = 0
+    predicted_live_facts: dict[str, str | None] = field(default_factory=dict)
+
+
+class KanbanSimulation:
+    """Small contract model for dispatcher-only, idempotent card promotion."""
+
+    def __init__(self) -> None:
+        self.cards: dict[str, SimCard] = {}
+        self.by_key: dict[str, str] = {}
+
+    def create_card(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        stage: str,
+        assignee: str,
+        parent_ids: set[str],
+        created_by: str = "dispatcher",
+        predicted_live_facts: dict[str, str | None] | None = None,
+    ) -> SimCard:
+        if actor != "dispatcher":
+            raise ContractError("dispatcher_required", "只有 dispatcher 可以创建 Kanban card")
+        existing_id = self.by_key.get(idempotency_key)
+        if existing_id:
+            existing = self.cards[existing_id]
+            immutable = (existing.stage, existing.assignee, existing.parent_ids, existing.created_by)
+            requested = (stage, assignee, parent_ids, created_by)
+            if immutable != requested:
+                raise ContractError("idempotency_conflict", "稳定 key 已绑定到不同 card")
+            return existing
+        if any(parent_id not in self.cards for parent_id in parent_ids):
+            raise ContractError("missing_parent", "父卡不存在")
+        card_id = f"t_{len(self.cards) + 1}"
+        ready = not parent_ids or all(self.cards[parent_id].status == "complete" for parent_id in parent_ids)
+        card = SimCard(
+            card_id=card_id,
+            idempotency_key=idempotency_key,
+            stage=stage,
+            assignee=assignee,
+            created_by=created_by,
+            parent_ids=set(parent_ids),
+            status="ready" if ready else "blocked",
+            predicted_live_facts=dict(predicted_live_facts or {}),
+        )
+        self.cards[card_id] = card
+        self.by_key[idempotency_key] = card_id
+        return card
+
+    def link(self, *, actor: str, parent_id: str, child_id: str) -> None:
+        if actor != "dispatcher":
+            raise ContractError("dispatcher_required", "只有 dispatcher 可以链接 Kanban card")
+        if parent_id not in self.cards or child_id not in self.cards:
+            raise ContractError("missing_card", "链接的 card 不存在")
+        self.cards[child_id].parent_ids.add(parent_id)
+
+    def create_dispatch_pair(
+        self,
+        *,
+        actor: str,
+        current_gate_id: str,
+        run_key: str,
+        next_stage: str,
+        iteration: int,
+    ) -> tuple[SimCard, SimCard]:
+        if next_stage not in STAGE_ASSIGNEES or iteration < 1:
+            raise ContractError("invalid_transition", "未知阶段或迭代号")
+        transition_key = f"{run_key}:{next_stage}:{iteration}"
+        worker = self.create_card(
+            actor=actor,
+            idempotency_key=f"{transition_key}:work",
+            stage=next_stage,
+            assignee=STAGE_ASSIGNEES[next_stage],
+            parent_ids={current_gate_id},
+        )
+        continuation = self.create_card(
+            actor=actor,
+            idempotency_key=f"{transition_key}:continue",
+            stage=CONTINUATION_STAGES[next_stage],
+            assignee="dispatcher",
+            parent_ids={worker.card_id},
+            predicted_live_facts={
+                "head_sha": None,
+                "artifact_digest": None,
+                "result": None,
+            },
+        )
+        return worker, continuation
+
+    def complete(self, card_id: str) -> None:
+        self.cards[card_id].status = "complete"
+        for card in self.cards.values():
+            if card.status == "blocked" and card.parent_ids and all(
+                self.cards[parent_id].status == "complete" for parent_id in card.parent_ids
+            ):
+                card.status = "ready"
+
+    def fail_attempt(self, card_id: str, *, failure_limit: int = 3) -> None:
+        card = self.cards[card_id]
+        card.attempts += 1
+        card.status = "blocked" if card.attempts >= failure_limit else "ready"
+
+    def restore_card(self, card: SimCard) -> None:
+        """Load an existing database row, including legacy/untrusted provenance."""
+        self.cards[card.card_id] = card
+        self.by_key[card.idempotency_key] = card.card_id
+
+    def dispatchable_ready_cards(self) -> list[SimCard]:
+        return [
+            card
+            for card in self.cards.values()
+            if card.status == "ready" and card.created_by == "dispatcher"
+        ]
 
 
 def _split_gitlab_url(url: str) -> tuple[str, str, str]:
@@ -241,6 +399,13 @@ def checked_head_for_merge(
     if not artifact_gates_valid:
         raise ContractError("artifact_gate_stale", "设计工件门禁已失效")
     return current_head
+
+
+def validate_merge_completion(*, head_sha: str, checked_head: str, merge_api_sha: str) -> None:
+    if not all(SHA_RE.fullmatch(value) for value in (head_sha, checked_head, merge_api_sha)):
+        raise ContractError("invalid_merge_binding", "merge 必须绑定完整 SHA")
+    if head_sha != checked_head or checked_head != merge_api_sha:
+        raise ContractError("unchecked_merge", "completion head、checked_head 与 merge API sha 必须相同")
 
 
 def permanent_blob_links(project_url: str, merge_sha: str, paths: list[str]) -> list[str]:

@@ -156,6 +156,8 @@ def validate_profiles(profiles_root: pathlib.Path, expected_uid: int) -> dict[st
     errors: list[str] = []
     profile_values: dict[str, dict[str, str]] = {}
     ports: dict[str, str] = {}
+    fleet_host: str | None = None
+    fleet_groups: tuple[str, ...] | None = None
 
     for profile in PROFILES:
         profile_dir = profiles_root / profile
@@ -198,6 +200,26 @@ def validate_profiles(profiles_root: pathlib.Path, expected_uid: int) -> dict[st
             errors.append(f"{profile}: HERMES_PROFILE must equal {profile}")
         if "example" in values.get("GITLAB_HOST", "").lower():
             errors.append(f"{profile}: GITLAB_HOST still contains an example placeholder")
+        canonical_host = values.get("GITLAB_HOST", "").strip().lower().rstrip("/")
+        if canonical_host and not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[1-9][0-9]{0,4})?",
+            canonical_host,
+        ):
+            errors.append(f"{profile}: GITLAB_HOST must be a hostname with optional port, not a URL")
+        if canonical_host:
+            if fleet_host is None:
+                fleet_host = canonical_host
+            elif canonical_host != fleet_host:
+                errors.append(f"{profile}: GITLAB_HOST must match every other profile")
+        groups = tuple(
+            sorted({group.strip().strip("/") for group in values.get("GITLAB_ALLOWED_GROUPS", "").split(",") if group.strip()})
+        )
+        if not groups:
+            errors.append(f"{profile}: GITLAB_ALLOWED_GROUPS has no usable group path")
+        elif fleet_groups is None:
+            fleet_groups = groups
+        elif groups != fleet_groups:
+            errors.append(f"{profile}: GITLAB_ALLOWED_GROUPS must match every other profile")
 
         if profile in GATEWAY_PROFILES:
             for key in GATEWAY_REQUIRED:
@@ -213,6 +235,20 @@ def validate_profiles(profiles_root: pathlib.Path, expected_uid: int) -> dict[st
             for key in ("FEISHU_ALLOWED_USERS", "FEISHU_HOME_CHANNEL"):
                 if "replace_me" in values.get(key, ""):
                     errors.append(f"{profile}: {key} still contains a placeholder")
+            expected_feishu_policy = {
+                "FEISHU_DOMAIN": "feishu",
+                "FEISHU_CONNECTION_MODE": "websocket",
+                "FEISHU_GROUP_POLICY": "allowlist",
+                "FEISHU_REQUIRE_MENTION": "true",
+            }
+            for key, expected in expected_feishu_policy.items():
+                if values.get(key, "").strip() != expected:
+                    errors.append(f"{profile}: {key} must equal {expected}")
+            allowed_users = [
+                user.strip() for user in values.get("FEISHU_ALLOWED_USERS", "").split(",") if user.strip()
+            ]
+            if not allowed_users or "*" in allowed_users:
+                errors.append(f"{profile}: FEISHU_ALLOWED_USERS must be a non-wildcard allowlist")
             expected_config = f"/opt/data/profiles/{profile}/.lark-cli/config"
             expected_data = f"/opt/data/profiles/{profile}/.lark-cli/data"
             if values.get("LARKSUITE_CLI_CONFIG_DIR") != expected_config:
@@ -386,9 +422,9 @@ def validate_runtime_identities(
                 if not isinstance(access_level, int):
                     raise ProfileEnvError(f"{profile}: GitLab membership is missing access_level for {group}")
                 required = EXPECTED_ACCESS_LEVELS[profile]
-                if access_level < required:
+                if access_level != required:
                     raise ProfileEnvError(
-                        f"{profile}: GitLab access level {access_level} is below required {required} for {group}"
+                        f"{profile}: GitLab access level {access_level} must equal required {required} for {group}"
                     )
                 observed_level = min(observed_level or access_level, access_level)
             identities.append((profile, user_id, username, observed_level))
@@ -431,7 +467,7 @@ def main() -> int:
     for profile, user_id, username, access_level in identities:
         print(
             f"runtime identity: {profile}: GitLab user {username} "
-            f"(id={user_id}, minimum_access_level={access_level})"
+            f"(id={user_id}, access_level={access_level})"
         )
     if args.runtime_check:
         print("runtime identity validation: GitLab roles and isolated lark-cli state are valid")

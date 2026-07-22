@@ -154,6 +154,62 @@ class ProfileEnvValidationTests(unittest.TestCase):
             self.assertIn("FEISHU_APP_ID must be unique", message)
             self.assertIn("FEISHU_APP_SECRET must be unique", message)
 
+    def test_fleet_gitlab_policy_must_match(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_root = pathlib.Path(temp_dir) / "profiles"
+            make_valid_tree(profiles_root)
+            env_path = profiles_root / "coder" / ".env"
+            env_path.write_text(
+                env_text("coder")
+                .replace("GITLAB_HOST=green-git.internal", "GITLAB_HOST=other-git.internal")
+                .replace("GITLAB_ALLOWED_GROUPS=group,group/subgroup", "GITLAB_ALLOWED_GROUPS=other"),
+                encoding="utf-8",
+            )
+            env_path.chmod(0o600)
+            with self.assertRaises(VALIDATOR.ProfileEnvError) as caught:
+                VALIDATOR.validate_profiles(profiles_root, os.getuid())
+            message = str(caught.exception)
+            self.assertIn("GITLAB_HOST must match every other profile", message)
+            self.assertIn("GITLAB_ALLOWED_GROUPS must match every other profile", message)
+
+    def test_gitlab_host_must_not_be_a_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_root = pathlib.Path(temp_dir) / "profiles"
+            make_valid_tree(profiles_root)
+            for profile in VALIDATOR.PROFILES:
+                env_path = profiles_root / profile / ".env"
+                env_path.write_text(
+                    env_text(profile).replace(
+                        "GITLAB_HOST=green-git.internal",
+                        "GITLAB_HOST=https://green-git.internal/path",
+                    ),
+                    encoding="utf-8",
+                )
+                env_path.chmod(0o600)
+            with self.assertRaises(VALIDATOR.ProfileEnvError) as caught:
+                VALIDATOR.validate_profiles(profiles_root, os.getuid())
+            self.assertIn("must be a hostname with optional port, not a URL", str(caught.exception))
+
+    def test_gateway_feishu_policy_is_exact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profiles_root = pathlib.Path(temp_dir) / "profiles"
+            make_valid_tree(profiles_root)
+            env_path = profiles_root / "fde" / ".env"
+            env_path.write_text(
+                env_text("fde")
+                .replace("FEISHU_CONNECTION_MODE=websocket", "FEISHU_CONNECTION_MODE=webhook")
+                .replace("FEISHU_GROUP_POLICY=allowlist", "FEISHU_GROUP_POLICY=open")
+                .replace("FEISHU_REQUIRE_MENTION=true", "FEISHU_REQUIRE_MENTION=false"),
+                encoding="utf-8",
+            )
+            env_path.chmod(0o600)
+            with self.assertRaises(VALIDATOR.ProfileEnvError) as caught:
+                VALIDATOR.validate_profiles(profiles_root, os.getuid())
+            message = str(caught.exception)
+            self.assertIn("FEISHU_CONNECTION_MODE must equal websocket", message)
+            self.assertIn("FEISHU_GROUP_POLICY must equal allowlist", message)
+            self.assertIn("FEISHU_REQUIRE_MENTION must equal true", message)
+
     def test_wrong_owner_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             profiles_root = pathlib.Path(temp_dir) / "profiles"

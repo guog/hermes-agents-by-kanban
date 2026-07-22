@@ -30,7 +30,7 @@ Compose 包含两个 service：
 两个 service 都直接使用宿主机已有的：
 
 ```text
-nousresearch/hermes-agent:v2026.7.20
+nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40
 ```
 
 Compose 配置了 `pull_policy: never`，不会构建镜像，也不会静默拉取其他 tag。profiles、模板、schema、脚本、锁文件和 Hermes 0.19.0 小型运行时补丁均以只读 volume 挂载。glab、lark-cli 和外部 Skills 位于独立 named volume，更新它们不需要重建 Hermes 镜像。
@@ -203,6 +203,24 @@ PRD 已合入
 
 每一阶段整批过门禁，不按单个 SPEC 拆分分支或 MR。reviewer/tester 只写同一 MR 的评论和 gate，不修改 producer 工件。
 
+#### 2.4.1 Kanban 双卡协议
+
+每张 dispatcher gate 卡都必须先创建一个逻辑双卡对，再完成自己：
+
+```text
+dispatcher gate G (running)
+  ├─ worker W，parent=G，key=<run>:<stage>:<iteration>:work
+  └─ dispatcher continuation C，parent=W，key=<run>:<stage>:<iteration>:continue
+
+G complete → W ready → W complete → C ready
+```
+
+创建顺序固定为“创建或复用 W → 创建或复用 C → 核对两条依赖 → 完成 G”。如果任一步失败，G 不得完成；重试必须使用同一组稳定 idempotency key。这样容器重启、worker crash 或重复消息只会恢复原卡，不会产生重复工作卡或续跑卡。
+
+C 只保存父卡 ID、父阶段和 `live_reconcile_required=true`。它被唤醒后先读取 W 的 completion metadata 并按 schema 校验，再重新查询 GitLab 的分支、MR、评论、pipeline、discussion 和当前 head。创建 C 时不得预填未知的 `head_sha`、`artifact_digest`、review/pipeline/merge 结论。
+
+SPEC/PLAN/TASKS 的 write、review、rework，以及 implement、test、code-review、code-rework 均执行同一协议。merge 也作为受检 work card，后接 `run-complete` continuation；只有 checked-head merge 完成后，`run-complete` 才能进入 ready。
+
 ### 2.5 仓库工件目录
 
 不迁移或改名仓库既有文档。新产物固定为：
@@ -271,7 +289,7 @@ sha=<checked_head>
 - Ubuntu Linux，AMD64/x86_64。
 - Docker Engine 已安装并运行。
 - Docker Compose v2，可使用 `docker compose`。
-- 宿主机已经存在 `nousresearch/hermes-agent:v2026.7.20`。
+- 宿主机已经存在锁定的 AMD64 manifest：`nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40`。
 - 建议至少 2 vCPU、4 GB RAM；磁盘需要覆盖 Hermes 数据、tooling 和所有目标项目/build 产物。
 - 部署用户能读写本仓库、`HERMES_DATA_DIR` 和 `PROJECTS_DIR`，且能访问 Docker daemon。
 
@@ -288,7 +306,7 @@ uname -s
 uname -m
 docker version
 docker compose version
-docker image inspect nousresearch/hermes-agent:v2026.7.20 >/dev/null
+docker image inspect 'nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40' >/dev/null
 ```
 
 期望 `uname -s` 为 `Linux`，`uname -m` 为 `x86_64`。
@@ -300,29 +318,37 @@ docker image inspect nousresearch/hermes-agent:v2026.7.20 >/dev/null
 ```bash
 git clone <本部署包仓库URL> hermes-agents-by-kanban
 cd hermes-agents-by-kanban
+git checkout --detach <本次批准的40位commit或release tag>
 git status --short
 ```
 
-全新 clone 的 `git status --short` 应为空。
+全新 clone 的 `git status --short` 应为空。部署不得从浮动 `main` 直接启动；根 `.env` 中的 `FLEET_BUNDLE_REF` 会锁定当前完整 commit，运行态验收要求它与 `HEAD` 一致。
 
 ### 3.3 配置根 `.env`
 
+先确认锁定镜像已在本机，然后从真实终端运行：
+
 ```bash
-cp .env.example .env
-id -u
-id -g
+./scripts/init-deployment-env.sh
 ```
 
-将 `.env` 的 `PUID`、`PGID` 改为上述输出。使用该 UID 对应的宿主用户执行后续初始化，不要用 `sudo` 创建 profile 凭据文件。
+脚本要求仓库干净且 `git fsck` 通过，自动写入当前完整 commit、`PUID`/`PGID`、默认 Dashboard 用户名 `admin`，并交互式读取用户指定的初始密码。密码只经标准输入传给锁定镜像中的 Hermes `hash_password()`；根 `.env` 仅保存单引号包裹的 scrypt hash 和 `openssl rand -base64 32` 生成的独立 signing secret。脚本不会把明文密码写入文件、日志或命令行参数，并把根 `.env` 固定为普通文件、权限 `0600`。
+
+使用该 UID 对应的宿主用户执行后续初始化，不要用 `sudo` 创建 profile 凭据文件。
 
 至少配置：
 
 ```dotenv
-HERMES_IMAGE=nousresearch/hermes-agent:v2026.7.20
+HERMES_IMAGE=nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40
+FLEET_BUNDLE_REF=<当前40位commit，由初始化脚本写入>
 HERMES_DATA_DIR=./.runtime/hermes
 PROJECTS_DIR=./.runtime/projects
 PUID=<id -u 输出>
 PGID=<id -g 输出>
+
+HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH='<初始化脚本生成的scrypt hash>'
+HERMES_DASHBOARD_BASIC_AUTH_SECRET='<独立32字节随机signing secret的base64>'
 
 FLEET_MODEL=<Hermes 支持的 provider/model>
 <与所选模型对应的 API_KEY>=<模型服务密钥>
@@ -341,7 +367,7 @@ GIT_COMMIT_EMAIL_CODER=coder-bot@hermes.invalid
 
 `.invalid` 是保留的不可投递域名，适合标识这些提交来自自动化 Agent，不需要注册五个真实邮箱。如果私有 GitLab 启用了“提交者邮箱必须已验证”之类的 push rule，则应由管理员为五个 bot 身份创建并验证真实的 no-reply alias，再替换上述默认值。
 
-只填写所用模型对应的 Key。GitLab、飞书秘密不得写入根 `.env`。
+只填写所用模型对应的 Key。GitLab、飞书秘密不得写入根 `.env`；根 `.env` 也不得出现 `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` 明文变量，signing secret 不得复用登录密码。
 
 ### 3.4 创建 GitLab 身份
 
@@ -430,6 +456,8 @@ find "${HERMES_DATA_DIR:-./.runtime/hermes}/profiles" -maxdepth 2 -name .env -ty
 ### 3.7 静态校验并启动
 
 ```bash
+git diff --check
+git fsck --full
 ./scripts/verify-bundle.sh
 docker compose up -d
 ```
@@ -441,9 +469,11 @@ docker compose up -d
 3. bootstrap 安装 12 个 profiles，验证 12 个 GitLab 身份和 3 个飞书身份。
 4. 为五个 producer 配置独立 Git commit identity。
 5. 将三个飞书 `.env` 绑定到各自 lark-cli 加密存储。
-6. s6 启动 dispatcher、prd-writer、fde 三个 Gateway。
+6. s6 启动 dispatcher、prd-writer、fde 三个 Gateway，以及受 basic auth 保护的 Dashboard。
 
 若 `tooling-sync` 失败，Hermes 不会启动。先修复网络或锁文件问题，不要绕过 checksum。
+
+如果 `HERMES_DATA_DIR` 已有旧 profile 配置，本次升级只允许将根 `.env` 中的 `FLEET_FORCE_CONFIG` 临时改为 `1` 启动一次。确认 12 份持久化 `config.yaml` 已包含 `memory.write_approval: true` 和本次 Kanban 配置后，立即改回 `0` 并重启 `hermes`。`verify-runtime.sh` 会拒绝 `FLEET_FORCE_CONFIG=1`，避免它长期覆盖运行数据。
 
 ### 3.8 一键运行态验收
 
@@ -453,15 +483,17 @@ docker compose up -d
 ./scripts/verify-runtime.sh
 ```
 
-该命令只读取 Docker、Hermes、GitLab 和本地加密配置状态，不创建 Issue、分支、MR，也不发送飞书消息。成功时应报告：
+该命令只读取 Git、根 `.env`、Docker、Hermes、GitLab 和本地加密配置状态，不创建 Issue、分支、MR，也不发送飞书消息。成功时应报告：
 
-- Linux AMD64、本地镜像和 Compose service 正常。
+- checkout 干净、`git fsck` 正常，`HEAD` 等于固定 `FLEET_BUNDLE_REF`。
+- Linux AMD64、运行容器确实使用锁定 manifest digest，Compose service 正常。
 - Hermes 0.19.0、Kanban guard、锁定 tooling 均正确。
-- 12 个 profiles 存在，三个 Gateway running，九个 worker 未启动 Gateway。
-- 12 个 GitLab API 身份不同且满足角色要求。
+- 12 个 profiles 存在，`home_mode: profile` 与 Memory 写审批生效；三个 Gateway running，九个 worker 未启动 Gateway。
+- 12 个 GitLab API 身份不同且角色精确匹配；所有 profile 的 GitLab host/allowlist 一致。
 - 三个 lark-cli 状态目录独立且权限正确。
+- Dashboard s6 service running，`/api/status` 返回 `auth_required=true` 且 `auth_providers` 包含 `basic`；宿主端口只绑定 `127.0.0.1:9119`。
 
-失败时按输出中的 profile 和检查项处理；脚本不会打印 token 或 App Secret。
+失败时按输出中的 profile 和检查项处理；脚本不会打印 token 或 App Secret。脚本通过后仍需从宿主机浏览器访问 `http://127.0.0.1:9119`，用默认用户名和用户指定的初始密码完成一次真实登录；不得把密码放入 `curl` 参数、shell history 或验收日志。
 
 ### 3.9 首次消息 smoke test
 
@@ -473,6 +505,20 @@ docker compose up -d
 4. 最后使用专用测试项目和已合入测试 PRD 执行完整启动协议。
 
 前三项验证 Gateway 和原渠道回复，不证明 GitLab 写权限或完整自治。完整测试项目应继续验证 branch/MR/pipeline/discussion、checked-head merge、重启恢复和故障注入。
+
+### 3.10 内网受控试运行放行验收
+
+在专用测试项目保存每一步的命令、card/MR URL、完整 SHA、时间和结果。以下七组必须全部通过：
+
+1. 静态：checkout 干净，`git diff --check`、`git fsck --full`、`verify-bundle.sh`、全部测试和 Compose 解析通过。
+2. Ubuntu 运行：`verify-runtime.sh` 全部通过，包括固定 commit、镜像 digest、Hermes/补丁/tooling、12 profiles、3 Gateways 和 Dashboard basic auth。
+3. Kanban：观察真实 `dispatcher gate → worker → dispatcher continuation` 状态链；非 dispatcher 创建/链接被 handler 拒绝；`created_by != dispatcher` 的 ready 卡不被调度；重复消息和重复 reconcile 不增加卡片数量。
+4. 身份：12 个 GitLab 用户互异且角色精确为表中级别；五个 producer 只能向测试分支各执行一次可回收 push；reviewer/tester/FDE 的 push 必须被拒绝。
+5. 飞书：三个机器人均在原单聊/群聊/话题回复；向 dispatcher 发送缺少正式启动参数的消息时不得创建 run。
+6. 完整 E2E：一个已合入测试 PRD 串行通过 SPEC、PLAN、TASKS、实现、测试、代码审查和 `sha=<checked_head>` merge；MR 留下 merge commit 永久链接，原飞书会话收到一次完成通知。
+7. 故障注入：分别验证容器重启、worker crash、token 失效、pipeline 失败、阻塞 discussion、head drift 和重复消息；恢复后不得出现重复分支、MR、card 或通知，旧 head 的 test/review 结论不得复用。
+
+全部证据通过后，放行结论才是 **Go：内网受控试运行**。首发接受单容器同 UID 下 profile 凭据不是强安全边界，测试项目只使用最小权限、可随时撤销的 token；本阶段不增加多容器、独立 Unix 用户或外部凭据代理。任一真实 GitLab、飞书、checked-head merge 或恢复测试未完成时，结论仍为 **No-Go**，且不得声明生产自治部署完成。
 
 ## 4. 日常运维
 
@@ -711,7 +757,9 @@ docker compose down -v
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `No such image` | 官方 tag 不在本机，且 `pull_policy: never` | 手工准备 `nousresearch/hermes-agent:v2026.7.20` 后重试 |
+| `No such image` | 锁定 digest 不在本机，且 `pull_policy: never` | 手工准备 `.env.example` 中的完整 `tag@sha256` 后重试 |
+| Dashboard s6 down | basic auth 未初始化、容器非 loopback bind 时 fail-closed | 在固定 checkout 重新运行 `init-deployment-env.sh`，确认根 `.env` 为 `0600` 后重启 |
+| Dashboard status 未显示 basic | hash/signing secret 未注入或 Dashboard 未以 `0.0.0.0` 绑定 | 检查 Compose 三个 basic auth 变量，禁止改用明文密码或 `--insecure` |
 | `tooling-sync` 下载失败 | 无法访问 GitHub、GitLab.com、npm 或 TLS/代理错误 | 修复容器网络/CA/代理；不要绕过 checksum |
 | profile `.env` owner/mode 失败 | 用 sudo 初始化、PUID 不匹配、文件为软链接 | 用部署 UID 修正所有者，目录设 `0700`、文件设 `0600`，替换软链接为普通文件 |
 | token/app 重复 | 多个 profile 复制了同一秘密 | 为每个 profile/App 创建独立凭据，修改后重启 |
@@ -738,6 +786,6 @@ docker compose down -v
 ./scripts/verify-runtime.sh
 ```
 
-在 Ubuntu 启动后验证本机镜像、容器、Hermes/CLI 版本、profiles、Gateway、凭据隔离和 GitLab 只读身份。
+在 Ubuntu 启动后验证固定 bundle commit、镜像 digest、容器、Hermes/CLI 版本、profiles、Gateway、Memory 审批、Dashboard basic auth、凭据隔离和 GitLab 只读身份。
 
-两者通过可声明“静态部署包及本机只读运行验收通过”。真实 GitLab 写入、三个飞书机器人端到端消息、protected branch、MR/pipeline/discussion、checked-head merge、崩溃恢复和故障注入全部通过前，不得声明“生产自治 E2E”。
+两者通过只能声明“静态部署包及本机只读运行验收通过”。第 3.10 节全部真实验收通过后才可声明“Go：内网受控试运行”；在 GitLab 写入、三个飞书机器人端到端消息、protected branch、MR/pipeline/discussion、checked-head merge、崩溃恢复和故障注入全部通过前，不得声明“生产自治 E2E”。

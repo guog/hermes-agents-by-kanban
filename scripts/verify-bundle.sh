@@ -39,14 +39,16 @@ for script in "${repo_root}"/scripts/*.sh; do
   test -x "${script}"
   bash -n "${script}"
 done
-test -x "${repo_root}/scripts/validate-profile-envs.py"
-python3 - "${repo_root}/scripts/validate-profile-envs.py" <<'PY'
+for script in "${repo_root}"/scripts/*.py; do
+  test -x "${script}"
+  python3 - "${script}" <<'PY'
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
+done
 
 git apply --numstat "${repo_root}/patches/hermes-0.19.0-dispatcher-kanban-guard.patch" >/dev/null
 
@@ -74,7 +76,8 @@ for value in [
     "tooling_volume_schema: 1",
     "release_tag: v2026.7.20",
     "revision: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a",
-    "docker_image: nousresearch/hermes-agent:v2026.7.20",
+    "docker_image: nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40",
+    "amd64_manifest_digest: sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40",
     "minimum_version: 0.19.0",
     "config_version: 33",
 ]:
@@ -95,7 +98,8 @@ for value in [
 compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 assert 'command: ["sleep", "infinity"]' in compose
 assert "build:" not in compose
-assert compose.count("image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}") == 2
+locked_image = "nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40"
+assert compose.count(f"image: ${{HERMES_IMAGE:-{locked_image}}}") == 2
 assert compose.count("pull_policy: never") == 2
 assert "tooling-sync:" in compose
 assert "condition: service_completed_successfully" in compose
@@ -113,7 +117,15 @@ for value in [
     "021-hermes-sdd-gateways",
 ]:
     assert value in compose
-assert "@sha256:" not in compose
+assert compose.count("@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40") == 2
+for value in [
+    'HERMES_DASHBOARD: "1"', 'HERMES_DASHBOARD_HOST: "0.0.0.0"',
+    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+    "HERMES_DASHBOARD_BASIC_AUTH_SECRET", '"127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}:9119"',
+    "io.hermes.fleet.bundle-revision", "FLEET_BUNDLE_REF",
+]:
+    assert value in compose, f"authenticated Dashboard deployment contract missing: {value}"
+assert "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:" not in compose
 assert "gateway run" not in compose
 assert "env_file:" not in compose, "root .env must not be injected wholesale"
 for forbidden in ["GITLAB_TOKEN", "GITLAB_HOST", "FEISHU_", "LARKSUITE_CLI_"]:
@@ -171,12 +183,35 @@ for value in [
     "Feishu/Lark variables are not allowed", "hashlib.sha256",
     "--runtime-check", "validate_runtime_identities", "EXPECTED_ACCESS_LEVELS",
     "capture_output=True", "worker profile must not have lark-cli state",
+    "GITLAB_HOST must match every other profile", "GITLAB_ALLOWED_GROUPS must match every other profile",
+    "expected_feishu_policy", '"FEISHU_CONNECTION_MODE": "websocket"',
+    '"FEISHU_GROUP_POLICY": "allowlist"', '"FEISHU_REQUIRE_MENTION": "true"',
+    "access_level != required",
 ]:
     assert value in validator, f"profile env validator contract missing: {value}"
 
+deployment_initializer = (root / "scripts/init-deployment-env.sh").read_text(encoding="utf-8")
+for value in [
+    "run this script interactively", "plugins.dashboard_auth.basic import hash_password",
+    "openssl rand -base64 32", "FLEET_BUNDLE_REF", "chmod 0600",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "set +x",
+]:
+    assert value in deployment_initializer, f"deployment initializer contract missing: {value}"
+assert "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=" not in deployment_initializer
+
+deployment_validator = (root / "scripts/validate-deployment-env.py").read_text(encoding="utf-8")
+for value in [
+    "root .env mode must be 0600", "not a symbolic link", "FLEET_BUNDLE_REF",
+    "scrypt", "dashboard signing secret", "plaintext dashboard password variable is forbidden",
+    "FLEET_FORCE_CONFIG must be restored to 0", "locked Hermes 0.19.0 AMD64 digest",
+]:
+    assert value in deployment_validator, f"deployment env validator contract missing: {value}"
+
 env_example = (root / ".env.example").read_text(encoding="utf-8")
 for value in [
-    "HERMES_IMAGE=nousresearch/hermes-agent:v2026.7.20",
+    f"HERMES_IMAGE={locked_image}", "FLEET_BUNDLE_REF=",
+    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=", "HERMES_DASHBOARD_BASIC_AUTH_SECRET=",
     "TOOLING_VOLUME_NAME=hermes-sdd-tooling",
     "FLEET_MODEL=", "OPENAI_API_KEY=", "FLEET_FORCE_CONFIG=0",
     "GIT_COMMIT_EMAIL_PRD_WRITER=prd-writer-bot@hermes.invalid",
@@ -215,6 +250,8 @@ for profile in profiles:
         assert "/opt/fleet/vendor/current/lark/skills" in config
         for value in [
             "API_SERVER_PORT=", "FEISHU_APP_ID=", "FEISHU_APP_SECRET=",
+            "FEISHU_DOMAIN=feishu", "FEISHU_CONNECTION_MODE=websocket",
+            "FEISHU_GROUP_POLICY=allowlist", "FEISHU_REQUIRE_MENTION=true",
             f"LARKSUITE_CLI_CONFIG_DIR=/opt/data/profiles/{profile}/.lark-cli/config",
             f"LARKSUITE_CLI_DATA_DIR=/opt/data/profiles/{profile}/.lark-cli/data",
         ]:
@@ -223,6 +260,8 @@ for profile in profiles:
         for forbidden in ["API_SERVER_PORT", "FEISHU_", "LARKSUITE_CLI_"]:
             assert forbidden not in env_template, f"worker has Feishu/Lark configuration: {profile}"
     assert "OPENAI_API_KEY=" not in env_template, "model credentials remain deployment-level"
+    assert "home_mode: profile" in config, f"profile home isolation missing: {profile}"
+    assert "memory:\n" in config and "  write_approval: true" in config, f"memory approval missing: {profile}"
     if profile == "dispatcher":
         assert "dispatch_in_gateway: true" in config
         assert "auto_decompose: false" in config
@@ -248,12 +287,18 @@ for value in [
 ]:
     assert value in stages
 assert "next-spec-or-complete" not in stages
+conditions = schema.get("allOf", [])
+assert len(conditions) >= 3, "conditional completion gates are missing"
+schema_text = json.dumps(schema, sort_keys=True)
+for value in ["checked_head", "merge_commit_sha", "spec-review", "code-review", "sha=checked_head"]:
+    assert value in schema_text, f"conditional completion schema missing: {value}"
 
 card = (root / "templates/kanban-card.md").read_text(encoding="utf-8")
 for value in [
     "schema_version: 2", "created_by: dispatcher", "project_display_name:",
     "checkout:", "worktree:", "prd_mr_url:", "artifact_digest:",
-    "never create a second delivery branch or MR",
+    "never create a second delivery branch or MR", "card_role:", "transition_key:",
+    "awaits_parent_card_id:", "live_reconcile_required: true", ":work", ":continue",
 ]:
     assert value in card, f"card v2 contract missing: {value}"
 
@@ -279,7 +324,8 @@ for value in [
     "一个共享分支", "一个 Draft MR", "artifact_digest", "sha=<checked_head>",
     "SPEC、PLAN、TASKS 各阶段最多返工 3 轮",
     "代码、测试、代码审查引起的代码返工合计最多 5 轮",
-    "./scripts/verify-runtime.sh", "生产自治 E2E",
+    "./scripts/verify-runtime.sh", "生产自治 E2E", "双卡协议",
+    "./scripts/init-deployment-env.sh", "auth_required=true", "内网受控试运行",
 ]:
     assert value in readme, f"authoritative README workflow/deployment content missing: {value}"
 
@@ -288,10 +334,13 @@ assert (root / "tests/workflow_contract.py").is_file(), "test-only workflow help
 
 runtime_verifier = (root / "scripts/verify-runtime.sh").read_text(encoding="utf-8")
 for value in [
-    "nousresearch/hermes-agent:v2026.7.20", "expected Hermes 0.19.0",
+    "sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40",
+    "expected Hermes 0.19.0",
     "gateway_profiles=(dispatcher prd-writer fde)", "s6-svstat -o up",
     "dispatcher-only Kanban guard", ".tooling-lock", "--runtime-check",
-    "deployable read-only runtime checks passed",
+    "deployable read-only runtime checks passed", "Dashboard /api/status",
+    "auth_required", "auth_providers", "memory.write_approval must be true",
+    "validate-deployment-env.py", "git fsck --full",
 ]:
     assert value in runtime_verifier, f"runtime verifier contract missing: {value}"
 for forbidden in ["set -x", "source /opt/data/profiles", "glab auth login"]:
@@ -315,6 +364,7 @@ for value in [
     "docs/prds/<prd-basename>/tasks/task-<key>.md",
     "Draft: [PRD] <prd-basename>.md",
     "created_by=dispatcher",
+    "Worker/continuation pair protocol", ":work", ":continue",
 ]:
     assert value in skills, f"profile Skills missing single-MR contract: {value}"
 for stale in [
@@ -375,7 +425,11 @@ fi
 python3 -m unittest discover -s "${repo_root}/tests" -v
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  docker compose --env-file "${repo_root}/.env.example" \
+  HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin \
+  HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH='scrypt$16384$8$1$c3Nzc3Nzc3Nzc3Nzc3Nzcw==$ZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQ=' \
+  HERMES_DASHBOARD_BASIC_AUTH_SECRET='a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=' \
+  FLEET_BUNDLE_REF=1111111111111111111111111111111111111111 \
+    docker compose --env-file "${repo_root}/.env.example" \
     -f "${repo_root}/docker-compose.yml" config --quiet
   echo "Docker Compose config: ok"
 fi

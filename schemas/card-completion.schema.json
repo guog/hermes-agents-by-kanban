@@ -61,6 +61,8 @@
     "mr_url": {"type": ["string", "null"], "format": "uri"},
     "head_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
     "review_commit_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "checked_head": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "merge_commit_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
     "artifact_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
     "artifact_paths": {
       "type": "array",
@@ -83,5 +85,74 @@
     },
     "retry_notes": {"type": ["string", "null"]},
     "residual_risk": {"type": "array", "items": {"type": "string"}}
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "stage": {"enum": ["spec-review", "plan-review", "tasks-review"]},
+          "outcome": {"const": "pass"}
+        },
+        "required": ["stage", "outcome"]
+      },
+      "then": {
+        "required": ["artifact_paths", "artifact_digest", "review_commit_sha"],
+        "properties": {
+          "artifact_paths": {"type": "array", "minItems": 1},
+          "artifact_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "review_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"enum": ["test", "code-review"]},
+          "outcome": {"const": "pass"}
+        },
+        "required": ["stage", "outcome"]
+      },
+      "then": {
+        "required": ["head_sha", "mr_iid", "mr_url"],
+        "properties": {
+          "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+          "mr_iid": {"type": "integer", "minimum": 1},
+          "mr_url": {"type": "string", "format": "uri"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"const": "merge"}
+        },
+        "required": ["stage"]
+      },
+      "then": {
+        "$comment": "Dispatcher must also reject unless head_sha equals checked_head and the GitLab merge request used sha=checked_head.",
+        "required": ["head_sha", "checked_head", "mr_iid", "mr_url"],
+        "properties": {
+          "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+          "checked_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+          "mr_iid": {"type": "integer", "minimum": 1},
+          "mr_url": {"type": "string", "format": "uri"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {"const": "merge"},
+          "outcome": {"const": "pass"}
+        },
+        "required": ["stage", "outcome"]
+      },
+      "then": {
+        "required": ["merge_commit_sha"],
+        "properties": {
+          "merge_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        }
+      }
+    }
+  ]
 }

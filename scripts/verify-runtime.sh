@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${repo_root}"
+expected_image="nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40"
 
 fail() {
   echo "runtime verification: $*" >&2
@@ -18,14 +19,26 @@ if [[ $(uname -m) != "x86_64" ]]; then
 fi
 command -v docker >/dev/null 2>&1 || fail "docker is not installed or not in PATH"
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is unavailable"
+command -v git >/dev/null 2>&1 || fail "git is not installed or not in PATH"
+
+git diff --check || fail "git diff --check failed"
+git fsck --full || fail "git fsck failed"
+if [[ -n $(git status --porcelain) ]]; then
+  fail "deployment checkout is not clean"
+fi
+bundle_ref=$("${repo_root}/scripts/validate-deployment-env.py" \
+  --env-file "${repo_root}/.env" \
+  --print-bundle-ref) || fail "root deployment environment is invalid"
+[[ $(git rev-parse HEAD) == "${bundle_ref}" ]] || fail "deployed checkout HEAD does not match FLEET_BUNDLE_REF"
+echo "runtime verification: fixed bundle ref, image digest and hashed dashboard auth are valid"
 
 mapfile -t compose_images < <(docker compose config --images)
 if [[ ${#compose_images[@]} -eq 0 ]]; then
   fail "Compose did not resolve a Hermes image"
 fi
 for image in "${compose_images[@]}"; do
-  if [[ "${image}" != "nousresearch/hermes-agent:v2026.7.20" ]]; then
-    fail "effective Compose image must be nousresearch/hermes-agent:v2026.7.20"
+  if [[ "${image}" != "${expected_image}" ]]; then
+    fail "effective Compose image must equal the locked Hermes 0.19.0 AMD64 digest"
   fi
   docker image inspect "${image}" >/dev/null 2>&1 || fail "required local image is missing: ${image}"
 done
@@ -36,6 +49,16 @@ running_services=$(docker compose ps --status running --services)
 if ! grep -qx "hermes" <<<"${running_services}"; then
   fail "hermes Compose service is not running"
 fi
+published_dashboard=$(docker compose port hermes 9119)
+if [[ ! "${published_dashboard}" =~ ^127\.0\.0\.1:[1-9][0-9]*$ ]]; then
+  fail "dashboard port must be published only on host loopback"
+fi
+
+container_id=$(docker compose ps -q hermes)
+[[ -n "${container_id}" ]] || fail "could not resolve the running Hermes container"
+expected_image_id=$(docker image inspect --format '{{.Id}}' "${expected_image}")
+running_image_id=$(docker inspect --format '{{.Image}}' "${container_id}")
+[[ "${running_image_id}" == "${expected_image_id}" ]] || fail "running container does not use the locked image digest"
 
 if ! docker compose exec -T hermes /bin/bash -s <<'CONTAINER_CHECKS'
 set -euo pipefail
@@ -82,6 +105,66 @@ for profile in "${profiles[@]}"; do
   fi
 done
 echo "container runtime check: 12 profiles and 3 isolated Gateways"
+
+/opt/hermes/.venv/bin/python - <<'PY_CONFIG'
+import pathlib
+import yaml
+
+profiles = (
+    "dispatcher", "prd-writer", "fde", "spec-writer", "spec-reviewer", "planner",
+    "plan-reviewer", "tasker", "task-reviewer", "coder", "tester", "code-reviewer",
+)
+for profile in profiles:
+    path = pathlib.Path("/opt/data/profiles") / profile / "config.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if config.get("terminal", {}).get("home_mode") != "profile":
+        raise SystemExit(f"{profile}: terminal.home_mode must equal profile")
+    if config.get("memory", {}).get("write_approval") is not True:
+        raise SystemExit(f"{profile}: memory.write_approval must be true")
+
+dispatcher = yaml.safe_load(
+    pathlib.Path("/opt/data/profiles/dispatcher/config.yaml").read_text(encoding="utf-8")
+)
+kanban = dispatcher.get("kanban", {})
+expected = {
+    "auto_decompose": False,
+    "max_in_progress": 1,
+    "max_in_progress_per_profile": 1,
+    "orchestrator_profile": "dispatcher",
+}
+for key, value in expected.items():
+    if kanban.get(key) != value:
+        raise SystemExit(f"dispatcher: kanban.{key} must equal {value!r}")
+PY_CONFIG
+echo "container runtime check: profile home, memory approval and Kanban policy"
+
+dashboard_service=""
+for candidate in /run/s6-rc/servicedirs/dashboard /run/service/dashboard; do
+  if [[ -e "${candidate}" ]]; then
+    dashboard_service="${candidate}"
+    break
+  fi
+done
+[[ -n "${dashboard_service}" ]] || die "Dashboard s6 service slot is missing"
+dashboard_up=$(/command/s6-svstat -o up "${dashboard_service}")
+[[ "${dashboard_up}" == "true" ]] || die "Dashboard is not running"
+
+/opt/hermes/.venv/bin/python - <<'PY_DASHBOARD'
+import json
+import urllib.request
+
+try:
+    with urllib.request.urlopen("http://127.0.0.1:9119/api/status", timeout=10) as response:
+        payload = json.load(response)
+except Exception as exc:
+    raise SystemExit("Dashboard /api/status is unavailable") from exc
+if payload.get("auth_required") is not True:
+    raise SystemExit("Dashboard /api/status must report auth_required=true")
+providers = payload.get("auth_providers", [])
+if not isinstance(providers, list) or "basic" not in providers:
+    raise SystemExit("Dashboard /api/status must advertise the basic auth provider")
+PY_DASHBOARD
+echo "container runtime check: Dashboard s6 service and basic authentication"
 
 tool_handler=/opt/hermes/tools/kanban_tools.py
 dispatcher_db=/opt/hermes/hermes_cli/kanban_db.py

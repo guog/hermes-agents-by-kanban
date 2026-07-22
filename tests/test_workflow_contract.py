@@ -10,6 +10,9 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from workflow_contract import (  # noqa: E402
     ContractError,
+    KanbanSimulation,
+    SimCard,
+    STAGE_ASSIGNEES,
     artifact_digest,
     code_gates_match,
     checked_head_for_merge,
@@ -20,6 +23,7 @@ from workflow_contract import (  # noqa: E402
     permanent_blob_links,
     reconcile_run,
     validate_intake,
+    validate_merge_completion,
     validate_one_to_one_artifact_keys,
     workspace_reconcile_action,
 )
@@ -96,6 +100,134 @@ class IntakeContractTests(unittest.TestCase):
         )
         self.assertEqual(3, result.returncode)
         self.assertIn("outside GITLAB_ALLOWED_GROUPS", result.stderr)
+
+
+class KanbanContinuationTests(unittest.TestCase):
+    RUN_KEY = "sdd-abcdefghijklmnopqrst"
+
+    def create_gate(self, simulation: KanbanSimulation, key: str = "run-init") -> SimCard:
+        gate = simulation.create_card(
+            actor="dispatcher",
+            idempotency_key=f"{self.RUN_KEY}:{key}:1:gate",
+            stage="run-init",
+            assignee="dispatcher",
+            parent_ids=set(),
+        )
+        gate.status = "running"
+        return gate
+
+    def test_worker_continuation_state_chain_and_idempotency(self):
+        simulation = KanbanSimulation()
+        gate = self.create_gate(simulation)
+        worker, continuation = simulation.create_dispatch_pair(
+            actor="dispatcher",
+            current_gate_id=gate.card_id,
+            run_key=self.RUN_KEY,
+            next_stage="spec-write",
+            iteration=1,
+        )
+        self.assertEqual("blocked", worker.status)
+        self.assertEqual("blocked", continuation.status)
+        self.assertTrue(all(value is None for value in continuation.predicted_live_facts.values()))
+
+        simulation.complete(gate.card_id)
+        self.assertEqual("ready", worker.status)
+        self.assertEqual("blocked", continuation.status)
+        worker.status = "running"
+        simulation.complete(worker.card_id)
+        self.assertEqual("ready", continuation.status)
+
+        duplicate_worker, duplicate_continuation = simulation.create_dispatch_pair(
+            actor="dispatcher",
+            current_gate_id=gate.card_id,
+            run_key=self.RUN_KEY,
+            next_stage="spec-write",
+            iteration=1,
+        )
+        self.assertEqual(worker.card_id, duplicate_worker.card_id)
+        self.assertEqual(continuation.card_id, duplicate_continuation.card_id)
+        self.assertEqual(3, len(simulation.cards))
+
+    def test_non_dispatcher_graph_writes_and_source_cards_are_rejected(self):
+        simulation = KanbanSimulation()
+        gate = self.create_gate(simulation)
+        with self.assertRaises(ContractError) as caught:
+            simulation.create_card(
+                actor="coder",
+                idempotency_key="forbidden",
+                stage="implement",
+                assignee="coder",
+                parent_ids={gate.card_id},
+            )
+        self.assertEqual("dispatcher_required", caught.exception.code)
+        with self.assertRaises(ContractError) as caught:
+            simulation.link(actor="tester", parent_id=gate.card_id, child_id=gate.card_id)
+        self.assertEqual("dispatcher_required", caught.exception.code)
+
+        simulation.restore_card(
+            SimCard(
+                card_id="t_legacy",
+                idempotency_key="legacy-worker-created",
+                stage="implement",
+                assignee="coder",
+                created_by="coder",
+                status="ready",
+            )
+        )
+        ready_ids = [card.card_id for card in simulation.dispatchable_ready_cards()]
+        self.assertNotIn("t_legacy", ready_ids)
+
+    def test_worker_crash_retry_reuses_pair_and_respects_failure_limit(self):
+        simulation = KanbanSimulation()
+        gate = self.create_gate(simulation)
+        worker, continuation = simulation.create_dispatch_pair(
+            actor="dispatcher",
+            current_gate_id=gate.card_id,
+            run_key=self.RUN_KEY,
+            next_stage="implement",
+            iteration=1,
+        )
+        simulation.complete(gate.card_id)
+        simulation.fail_attempt(worker.card_id)
+        simulation.fail_attempt(worker.card_id)
+        self.assertEqual("ready", worker.status)
+        retry_worker, retry_continuation = simulation.create_dispatch_pair(
+            actor="dispatcher",
+            current_gate_id=gate.card_id,
+            run_key=self.RUN_KEY,
+            next_stage="implement",
+            iteration=1,
+        )
+        self.assertEqual(worker.card_id, retry_worker.card_id)
+        self.assertEqual(continuation.card_id, retry_continuation.card_id)
+        simulation.fail_attempt(worker.card_id)
+        self.assertEqual("blocked", worker.status)
+
+    def test_every_work_review_rework_test_and_merge_stage_uses_a_pair(self):
+        expected = {
+            "spec-write", "spec-review", "spec-rework",
+            "plan-write", "plan-review", "plan-rework",
+            "tasks-write", "tasks-review", "tasks-rework",
+            "implement", "test", "code-review", "code-rework", "merge",
+        }
+        self.assertEqual(expected, set(STAGE_ASSIGNEES))
+        for stage in sorted(expected):
+            with self.subTest(stage=stage):
+                simulation = KanbanSimulation()
+                gate = self.create_gate(simulation, key=stage)
+                worker, continuation = simulation.create_dispatch_pair(
+                    actor="dispatcher",
+                    current_gate_id=gate.card_id,
+                    run_key=self.RUN_KEY,
+                    next_stage=stage,
+                    iteration=1,
+                )
+                self.assertEqual({gate.card_id}, worker.parent_ids)
+                self.assertEqual({worker.card_id}, continuation.parent_ids)
+                self.assertTrue(worker.idempotency_key.endswith(":work"))
+                self.assertTrue(continuation.idempotency_key.endswith(":continue"))
+                if stage == "merge":
+                    self.assertEqual("run-complete", continuation.stage)
 
 
 class RecoveryAndGateTests(unittest.TestCase):
@@ -206,6 +338,16 @@ class RecoveryAndGateTests(unittest.TestCase):
                 with self.assertRaises(ContractError) as caught:
                     checked_head_for_merge(**kwargs)
                 self.assertEqual(code, caught.exception.code)
+
+    def test_merge_completion_and_api_are_bound_to_same_checked_head(self):
+        validate_merge_completion(head_sha=SHA, checked_head=SHA, merge_api_sha=SHA)
+        with self.assertRaises(ContractError) as caught:
+            validate_merge_completion(
+                head_sha=SHA,
+                checked_head="b" * 40,
+                merge_api_sha=SHA,
+            )
+        self.assertEqual("unchecked_merge", caught.exception.code)
 
     def test_permanent_links_use_merge_sha_and_sorted_paths(self):
         links = permanent_blob_links(BASE, SHA, ["z.md", "docs/prds/prd-login.md"])

@@ -11,6 +11,12 @@ identity:
   iteration: <positive-integer>
   idempotency_key: <stable-key>
   created_by: dispatcher
+dispatch:
+  card_role: <work-or-dispatcher-continuation>
+  transition_key: <run_key>:<next-stage>:<iteration>
+  awaits_parent_card_id: <worker-card-id-for-continuation-or-null>
+  awaits_parent_stage: <worker-stage-for-continuation-or-null>
+  live_reconcile_required: true
 origin:
   parent_card_ids: [<card-id>]
   feishu:
@@ -41,6 +47,7 @@ acceptance:
 output:
   schema: schemas/card-completion.schema.json
 reconcile_before_write:
+  - Parent completion metadata for dispatcher continuations
   - GitLab project, branch, MR, comments and current head
 prohibitions:
   - never create a GitLab Task work item for formal delivery
@@ -56,3 +63,5 @@ prohibitions:
 3. 每次写入前查询 GitLab live state；长任务定期 `kanban_heartbeat(note=...)`。
 4. 详细产物和证据写入同一 Draft MR；Kanban 只保存状态、摘要与指针。
 5. 正常完成调用 `kanban_complete(summary=..., metadata=...)`；无法完成调用 `kanban_block(kind=..., reason=...)`。
+6. dispatcher gate 必须先创建/复用 `<transition_key>:work`，再创建/复用以该 worker 为父卡的 `<transition_key>:continue`；两卡和依赖均确认后才能完成当前 gate。
+7. dispatcher continuation 只记录待读取的父卡，不预填未知 `head_sha`、digest、review/pipeline/merge 结论；被唤醒后同时重读父卡 completion metadata 与 GitLab live state。

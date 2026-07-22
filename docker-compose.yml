@@ -1,6 +1,6 @@
 services:
   tooling-sync:
-    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40}
     pull_policy: never
     user: "0:0"
     entrypoint: ["/bin/bash", "/opt/fleet/scripts/sync-tooling.sh"]
@@ -11,7 +11,7 @@ services:
       - ./config:/opt/fleet/config:ro
 
   hermes:
-    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40}
     pull_policy: never
     container_name: hermes-sdd
     restart: unless-stopped
@@ -21,6 +21,11 @@ services:
         condition: service_completed_successfully
     environment:
       HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: "0.0.0.0"
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:?run ./scripts/init-deployment-env.sh}
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH:?run ./scripts/init-deployment-env.sh}
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${HERMES_DASHBOARD_BASIC_AUTH_SECRET:?run ./scripts/init-deployment-env.sh}
+      FLEET_BUNDLE_REF: ${FLEET_BUNDLE_REF:?run ./scripts/init-deployment-env.sh}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       PATH: /opt/fleet/vendor/current/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -56,6 +61,8 @@ services:
       - ${HERMES_DATA_DIR:-./.runtime/hermes}:/opt/data
       - ${PROJECTS_DIR:-./.runtime/projects}:/workspace/projects
     shm_size: 1gb
+    labels:
+      io.hermes.fleet.bundle-revision: ${FLEET_BUNDLE_REF:?run ./scripts/init-deployment-env.sh}
 
 volumes:
   tooling:

@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import os
 import pathlib
 import shutil
@@ -93,6 +94,8 @@ def write_fake_glab(path: pathlib.Path) -> None:
                 level = roles[profile]
                 if os.environ.get("FAKE_LOW_ROLE") == profile:
                     level = 10
+                if os.environ.get("FAKE_HIGH_ROLE") == profile:
+                    level = 40
                 print(json.dumps({{"access_level": level}}))
             elif endpoint.startswith("groups/"):
                 print(json.dumps({{"id": 77}}))
@@ -106,7 +109,7 @@ def write_fake_glab(path: pathlib.Path) -> None:
 
 
 class RuntimeIdentityTests(unittest.TestCase):
-    def test_distinct_gitlab_identities_and_minimum_roles_pass(self):
+    def test_distinct_gitlab_identities_and_exact_roles_pass(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pathlib.Path(temp_dir) / "profiles"
             make_runtime_tree(root)
@@ -119,7 +122,7 @@ class RuntimeIdentityTests(unittest.TestCase):
             self.assertEqual(12, len(identities))
             self.assertEqual(12, len({item[1] for item in identities}))
 
-    def test_duplicate_identity_and_insufficient_role_are_rejected(self):
+    def test_duplicate_identity_and_wrong_role_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pathlib.Path(temp_dir) / "profiles"
             make_runtime_tree(root)
@@ -136,7 +139,21 @@ class RuntimeIdentityTests(unittest.TestCase):
                     )
             message = str(caught.exception)
             self.assertIn("GitLab identity must be unique", message)
-            self.assertIn("below required 40", message)
+            self.assertIn("must equal required 40", message)
+
+    def test_excessive_reviewer_role_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir) / "profiles"
+            make_runtime_tree(root)
+            glab = pathlib.Path(temp_dir) / "glab"
+            write_fake_glab(glab)
+            values = VALIDATOR.validate_profiles(root, os.getuid())
+            with mock.patch.dict(os.environ, {"FAKE_HIGH_ROLE": "tester"}):
+                with self.assertRaises(VALIDATOR.ProfileEnvError) as caught:
+                    VALIDATOR.validate_runtime_identities(
+                        values, root, os.getuid(), glab_bin=str(glab)
+                    )
+            self.assertIn("tester: GitLab access level 40 must equal required 20", str(caught.exception))
 
     def test_glab_failure_does_not_leak_token(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -167,7 +184,16 @@ class RuntimeIdentityTests(unittest.TestCase):
 
 
 class RuntimeShellTests(unittest.TestCase):
-    def run_verifier(self, *, running: bool = True, container_error: str = "") -> subprocess.CompletedProcess[str]:
+    def run_verifier(
+        self,
+        *,
+        running: bool = True,
+        container_error: str = "",
+        git_head: str = "1111111111111111111111111111111111111111",
+        compose_image: str = "",
+        dashboard_binding: str = "127.0.0.1:9119",
+        running_image_id: str = "sha256:locked-image-id",
+    ) -> subprocess.CompletedProcess[str]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         bundle = pathlib.Path(temp.name) / "bundle"
@@ -176,6 +202,10 @@ class RuntimeShellTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         fake_bin.mkdir()
         shutil.copy2(ROOT / "scripts" / "verify-runtime.sh", scripts / "verify-runtime.sh")
+        shutil.copy2(
+            ROOT / "scripts" / "validate-deployment-env.py",
+            scripts / "validate-deployment-env.py",
+        )
         verify_bundle = scripts / "verify-bundle.sh"
         verify_bundle.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         verify_bundle.chmod(0o755)
@@ -185,6 +215,44 @@ class RuntimeShellTests(unittest.TestCase):
             encoding="utf-8",
         )
         uname.chmod(0o755)
+        git = fake_bin / "git"
+        git.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                if [[ "$*" == *"rev-parse HEAD"* ]]; then
+                  printf '%s\n' "${FAKE_GIT_HEAD:-1111111111111111111111111111111111111111}"
+                  exit 0
+                fi
+                case "$*" in
+                  "diff --check"|"fsck --full"|"status --porcelain") exit 0 ;;
+                  *) echo "unexpected fake git call: $*" >&2; exit 2 ;;
+                esac
+                """
+            ),
+            encoding="utf-8",
+        )
+        git.chmod(0o755)
+        salt = base64.b64encode(b"s" * 16).decode()
+        digest = base64.b64encode(b"d" * 32).decode()
+        secret = base64.b64encode(b"k" * 32).decode()
+        deployment_env = bundle / ".env"
+        deployment_env.write_text(
+            "\n".join(
+                [
+                    "HERMES_IMAGE=nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40",
+                    "FLEET_BUNDLE_REF=1111111111111111111111111111111111111111",
+                    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin",
+                    f"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH='scrypt$16384$8$1${salt}${digest}'",
+                    f"HERMES_DASHBOARD_BASIC_AUTH_SECRET='{secret}'",
+                    "FLEET_FORCE_CONFIG=0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        deployment_env.chmod(0o600)
         docker = fake_bin / "docker"
         docker.write_text(
             textwrap.dedent(
@@ -195,14 +263,18 @@ class RuntimeShellTests(unittest.TestCase):
                 case "${command_line}" in
                   "compose version") exit 0 ;;
                   "compose config --images")
-                    printf '%s\n%s\n' 'nousresearch/hermes-agent:v2026.7.20' 'nousresearch/hermes-agent:v2026.7.20'
+                    image="${FAKE_COMPOSE_IMAGE:-nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40}"
+                    printf '%s\n%s\n' "${image}" "${image}"
                     ;;
-                  image\ inspect*) exit 0 ;;
+                  image\ inspect*) echo "${FAKE_EXPECTED_IMAGE_ID:-sha256:locked-image-id}"; exit 0 ;;
                   "compose ps --status running --services")
                     if [[ "${FAKE_RUNNING:-1}" == 1 ]]; then
                       echo hermes
                     fi
                     ;;
+                  "compose port hermes 9119") echo "${FAKE_DASHBOARD_BINDING:-127.0.0.1:9119}" ;;
+                  "compose ps -q hermes") echo 'fake-container-id' ;;
+                  "inspect --format {{.Image}} fake-container-id") echo "${FAKE_RUNNING_IMAGE_ID:-sha256:locked-image-id}" ;;
                   compose\ exec*)
                     if [[ -n "${FAKE_CONTAINER_ERROR:-}" ]]; then
                       echo "${FAKE_CONTAINER_ERROR}" >&2
@@ -222,6 +294,10 @@ class RuntimeShellTests(unittest.TestCase):
             PATH=f"{fake_bin}:{os.environ['PATH']}",
             FAKE_RUNNING="1" if running else "0",
             FAKE_CONTAINER_ERROR=container_error,
+            FAKE_GIT_HEAD=git_head,
+            FAKE_COMPOSE_IMAGE=compose_image,
+            FAKE_DASHBOARD_BINDING=dashboard_binding,
+            FAKE_RUNNING_IMAGE_ID=running_image_id,
         )
         return subprocess.run(
             [str(scripts / "verify-runtime.sh")],
@@ -237,11 +313,38 @@ class RuntimeShellTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("hermes Compose service is not running", result.stderr)
 
+    def test_fixed_ref_digest_loopback_and_running_image_are_enforced(self):
+        cases = [
+            (
+                {"git_head": "2" * 40},
+                "deployed checkout HEAD does not match FLEET_BUNDLE_REF",
+            ),
+            (
+                {"compose_image": "nousresearch/hermes-agent:latest"},
+                "effective Compose image must equal the locked Hermes 0.19.0 AMD64 digest",
+            ),
+            (
+                {"dashboard_binding": "0.0.0.0:9119"},
+                "dashboard port must be published only on host loopback",
+            ),
+            (
+                {"running_image_id": "sha256:other-image-id"},
+                "running container does not use the locked image digest",
+            ),
+        ]
+        for kwargs, message in cases:
+            with self.subTest(message=message):
+                result = self.run_verifier(**kwargs)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn(message, result.stderr)
+
     def test_container_version_profile_and_gateway_failures_are_reported(self):
         for message in (
             "expected Hermes 0.19.0, found 0.20.0",
             "profile is missing: coder",
             "Gateway is not running: dispatcher",
+            "Dashboard is not running",
+            "Dashboard /api/status must report auth_required=true",
         ):
             with self.subTest(message=message):
                 result = self.run_verifier(container_error=message)
