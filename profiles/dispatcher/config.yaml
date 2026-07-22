@@ -48,4 +48,4 @@ platforms:
     extra:
       ws_reconnect_interval: 120
       ws_ping_interval: 30
-      default_group_policy: allowlist
+      default_group_policy: open

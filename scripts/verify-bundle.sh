@@ -249,6 +249,7 @@ for profile in profiles:
     assert "/opt/fleet/vendor/current/gitlab/skills" in config
     if profile in gateway_profiles:
         assert "/opt/fleet/vendor/current/lark/skills" in config
+        assert "default_group_policy: open" in config, f"gateway group policy drift: {profile}"
         for value in [
             "API_SERVER_PORT=", "FEISHU_APP_ID=", "FEISHU_APP_SECRET=",
             "FEISHU_DOMAIN=feishu", "FEISHU_CONNECTION_MODE=websocket",
