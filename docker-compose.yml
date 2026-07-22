@@ -1,0 +1,22 @@
+services:
+  hermes:
+    build:
+      context: .
+      args:
+        HERMES_BASE_IMAGE: ${HERMES_BASE_IMAGE:-nousresearch/hermes-agent@sha256:3dcdb7b88092fc18846ba0276a84ccf86cfd9afebc83ed8f98cdd0e78bf46e69}
+    image: hermes-sdd-fleet:0.1.0
+    container_name: hermes-sdd
+    restart: unless-stopped
+    command: ["-p", "dispatcher", "gateway", "run"]
+    env_file:
+      - ${FLEET_ENV_FILE:-.env}
+    environment:
+      HERMES_DASHBOARD: "1"
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    ports:
+      - "127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}:9119"
+    volumes:
+      - ${HERMES_DATA_DIR:-./.runtime/hermes}:/opt/data
+      - ${PROJECTS_DIR:-./.runtime/projects}:/workspace/projects
+    shm_size: 1gb

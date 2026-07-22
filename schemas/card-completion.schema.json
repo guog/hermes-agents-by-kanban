@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/card-completion.schema.json",
+  "title": "Hermes SDD Kanban Card Completion",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "run_key",
+    "stage",
+    "outcome",
+    "project_path",
+    "kanban_task_id",
+    "verification",
+    "residual_risk"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run_key": {
+      "type": "string",
+      "pattern": "^sdd-[a-z2-7]{20}$"
+    },
+    "stage": {
+      "type": "string",
+      "enum": [
+        "run-init",
+        "spec-write",
+        "spec-queue",
+        "spec-review",
+        "spec-gate",
+        "spec-rework",
+        "plan-write",
+        "plan-review",
+        "plan-gate",
+        "plan-rework",
+        "tasks-write",
+        "tasks-analyze",
+        "tasks-gate",
+        "tasks-rework",
+        "implement",
+        "test",
+        "test-gate",
+        "code-review",
+        "code-gate",
+        "code-rework",
+        "converge-tasks",
+        "next-spec-or-complete",
+        "run-complete",
+        "human-decision"
+      ]
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["pass", "fail", "scope_gap", "blocked", "cancelled"]
+    },
+    "project_path": {
+      "type": "string",
+      "minLength": 3
+    },
+    "spec_key": {
+      "type": ["string", "null"]
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "kanban_task_id": {
+      "type": "string",
+      "pattern": "^t_[A-Za-z0-9_-]+$"
+    },
+    "mr_iid": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "head_sha": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "artifact_paths": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "verification": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "gitlab_urls": {
+      "type": "array",
+      "items": {"type": "string", "format": "uri"},
+      "uniqueItems": true
+    },
+    "next_task_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "retry_notes": {
+      "type": ["string", "null"]
+    },
+    "residual_risk": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}
+

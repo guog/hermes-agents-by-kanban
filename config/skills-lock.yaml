@@ -1,0 +1,33 @@
+schema_version: 1
+reviewed_at: "2026-07-20"
+
+sources:
+  hermes_agent:
+    repository: https://github.com/NousResearch/hermes-agent.git
+    revision: c8027d5e60bcb43ad27630962546199ee02af2af
+    docker_image: nousresearch/hermes-agent@sha256:3dcdb7b88092fc18846ba0276a84ccf86cfd9afebc83ed8f98cdd0e78bf46e69
+    docker_revision: 3441b80f4f20106d2adb8e3ff638c31e12656d2b
+    minimum_version: 0.18.2
+    config_version: 33
+  gitlab_official_skills:
+    repository: https://gitlab.com/gitlab-org/ai/skills.git
+    revision: 933cee89fbbec511241cae0914e5112feda29ab2
+    cli_version: 1.108.0
+    selected:
+      - path: skills/glab
+        name: glab
+        version: 1.11.0
+  lark_cli_official_skills:
+    repository: https://github.com/larksuite/cli.git
+    revision: d6cebd6723eb80e9e5761d34ccea9ab71e2f5a8d
+    cli_version: 1.0.72
+    selected:
+      - path: skills/lark-shared
+        name: lark-shared
+        version: 1.0.0
+      - path: skills/lark-im
+        name: lark-im
+        version: 1.0.0
+    deliberately_not_loaded:
+      - path: skills/lark-event
+        reason: Hermes native Feishu gateway is the only inbound IM consumer

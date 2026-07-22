@@ -1,0 +1,3 @@
+description: Classifies and sanitizes field evidence before PRD intake; never routes raw field input to coding.
+description_auto: false
+

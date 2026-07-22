@@ -1,0 +1,10 @@
+.env
+.runtime
+.git
+.gitignore
+.DS_Store
+vendor
+**/__pycache__
+*.pyc
+*.log
+

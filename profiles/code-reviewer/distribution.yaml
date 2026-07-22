@@ -1,0 +1,13 @@
+name: code-reviewer
+version: 0.1.0
+description: Reviews an exact tested code MR head for correctness, safety and maintainability
+hermes_requires: ">=0.18.2"
+author: Hermes MES Team
+license: Proprietary
+env_requires:
+  - name: GITLAB_HOST
+    description: Private GitLab hostname
+    required: true
+  - name: GITLAB_TOKEN
+    description: Code reviewer token with MR review permission
+    required: true

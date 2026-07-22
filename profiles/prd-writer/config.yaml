@@ -1,0 +1,17 @@
+_config_version: 33
+model: ""
+toolsets: [file, terminal]
+terminal:
+  backend: local
+  cwd: /workspace/projects
+  home_mode: profile
+memory:
+  memory_enabled: true
+  user_profile_enabled: false
+  write_approval: false
+skills:
+  external_dirs: [/opt/fleet/vendor/gitlab/skills]
+  template_vars: true
+  inline_shell: false
+  guard_agent_created: true
+  write_approval: true

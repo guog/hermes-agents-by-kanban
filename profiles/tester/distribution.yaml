@@ -1,0 +1,13 @@
+name: tester
+version: 0.1.0
+description: Tests an exact code MR head against approved artifacts and emits evidence
+hermes_requires: ">=0.18.2"
+author: Hermes MES Team
+license: Proprietary
+env_requires:
+  - name: GITLAB_HOST
+    description: Private GitLab hostname
+    required: true
+  - name: GITLAB_TOKEN
+    description: Tester token with MR comment permission
+    required: true

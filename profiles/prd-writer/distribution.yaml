@@ -1,0 +1,13 @@
+name: prd-writer
+version: 0.1.0
+description: Clarifies requirements and prepares reviewable PRD merge requests
+hermes_requires: ">=0.18.2"
+author: Hermes MES Team
+license: Proprietary
+env_requires:
+  - name: GITLAB_HOST
+    description: Private GitLab hostname
+    required: true
+  - name: GITLAB_TOKEN
+    description: PRD writer token with feature-branch and MR permission
+    required: true

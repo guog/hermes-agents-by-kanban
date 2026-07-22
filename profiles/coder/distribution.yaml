@@ -1,0 +1,13 @@
+name: coder
+version: 0.1.0
+description: Implements one approved SPEC task set in one code merge request
+hermes_requires: ">=0.18.2"
+author: Hermes MES Team
+license: Proprietary
+env_requires:
+  - name: GITLAB_HOST
+    description: Private GitLab hostname
+    required: true
+  - name: GITLAB_TOKEN
+    description: Coder token with branch and MR permission
+    required: true
