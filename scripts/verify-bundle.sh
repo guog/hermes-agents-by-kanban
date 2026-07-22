@@ -15,9 +15,16 @@ for profile in "${profiles[@]}"; do
   test -f "${base}/profile.yaml"
   test -f "${base}/config.yaml"
   test -f "${base}/.env.template"
-  test -f "${base}/.gitignore"
+  test ! -e "${base}/.gitignore"
   test -f "${base}/bootstrap/memories/MEMORY.md"
   test -f "${base}/bootstrap/memories/USER.md"
+  for seed in MEMORY.md USER.md; do
+    if git -C "${repo_root}" check-ignore -q \
+      "profiles/${profile}/bootstrap/memories/${seed}"; then
+      echo "seed memory must be visible to Git: ${profile}/${seed}" >&2
+      exit 1
+    fi
+  done
   test "$(find "${base}/skills" -name SKILL.md -type f | wc -l | tr -d ' ')" -eq 1
   grep -qx '_config_version: 33' "${base}/config.yaml"
   grep -qx 'hermes_requires: ">=0.19.0"' "${base}/distribution.yaml"
@@ -33,7 +40,13 @@ for script in "${repo_root}"/scripts/*.sh; do
   bash -n "${script}"
 done
 test -x "${repo_root}/scripts/validate-profile-envs.py"
-python3 -m py_compile "${repo_root}/scripts/validate-profile-envs.py"
+python3 - "${repo_root}/scripts/validate-profile-envs.py" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+compile(path.read_text(encoding="utf-8"), str(path), "exec")
+PY
 
 git apply --numstat "${repo_root}/patches/hermes-0.19.0-dispatcher-kanban-guard.patch" >/dev/null
 
@@ -156,6 +169,8 @@ for value in [
     "must be unique:", "FEISHU_APP_ID", "FEISHU_APP_SECRET",
     "not a symbolic link", "mode must be 0600", "profile directory mode must be 0700",
     "Feishu/Lark variables are not allowed", "hashlib.sha256",
+    "--runtime-check", "validate_runtime_identities", "EXPECTED_ACCESS_LEVELS",
+    "capture_output=True", "worker profile must not have lark-cli state",
 ]:
     assert value in validator, f"profile env validator contract missing: {value}"
 
@@ -235,13 +250,38 @@ assert "实现 PRD <精确 PRD blob/raw URL> <已合并 PRD MR URL>" in feishu
 for value in ["原 `chat_id`", "thread_id", "@initiator_open_id", "文件不存在", "已归档"]:
     assert value in feishu
 
-workflow = (root / "WORKFLOW.md").read_text(encoding="utf-8")
+assert not (root / "WORKFLOW.md").exists(), "README must be the only workflow authority"
+readme = (root / "README.md").read_text(encoding="utf-8")
 for value in [
+    "## 1. 总体介绍", "## 2. 流程设计", "## 3. 部署说明",
     "一个共享分支", "一个 Draft MR", "artifact_digest", "sha=<checked_head>",
-    "设计阶段每一阶段最多返工 3 轮", "代码返工合计最多 5 轮",
-    "静态部署包通过", "不能声明“生产自治 E2E”",
+    "SPEC、PLAN、TASKS 各阶段最多返工 3 轮",
+    "代码、测试、代码审查引起的代码返工合计最多 5 轮",
+    "./scripts/verify-runtime.sh", "生产自治 E2E",
 ]:
-    assert value in workflow, f"authoritative workflow missing: {value}"
+    assert value in readme, f"authoritative README workflow/deployment content missing: {value}"
+
+assert not (root / "scripts/workflow_contract.py").exists(), "test-only helper leaked into runtime scripts"
+assert (root / "tests/workflow_contract.py").is_file(), "test-only workflow helper is missing"
+
+runtime_verifier = (root / "scripts/verify-runtime.sh").read_text(encoding="utf-8")
+for value in [
+    "nousresearch/hermes-agent:v2026.7.20", "expected Hermes 0.19.0",
+    "gateway_profiles=(dispatcher prd-writer fde)", "s6-svstat -o up",
+    "dispatcher-only Kanban guard", ".tooling-lock", "--runtime-check",
+    "deployable read-only runtime checks passed",
+]:
+    assert value in runtime_verifier, f"runtime verifier contract missing: {value}"
+for forbidden in ["set -x", "source /opt/data/profiles", "glab auth login"]:
+    assert forbidden not in runtime_verifier, f"runtime verifier may leak or persist credentials: {forbidden}"
+
+seed_memory = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((root / "profiles").glob("*/bootstrap/memories/*.md"))
+)
+assert "一个 PRD 合入版本" in seed_memory
+for stale in ["每个 SPEC 一个代码 MR", "一个 SPEC 对应一个 code MR", "SPEC gate 必须绑定当前 MR head"]:
+    assert stale not in seed_memory, f"stale seed memory contract remains: {stale}"
 
 skills = "\n".join(
     path.read_text(encoding="utf-8")
@@ -283,6 +323,14 @@ if missing:
 
 print("bundle, Hermes 0.19 lock, profile credentials, gateways, schema v2 and single-MR contracts: ok")
 PY
+
+tracked_temporary=$(git -C "${repo_root}" ls-files | \
+  awk -F/ '$NF == ".DS_Store" || $0 ~ /(^|\/)__pycache__(\/|$)/ || $NF ~ /\.pyc$/')
+if [[ -n "${tracked_temporary}" ]]; then
+  echo "tracked temporary files must be removed:" >&2
+  echo "${tracked_temporary}" >&2
+  exit 1
+fi
 
 if python3 -c 'import yaml' >/dev/null 2>&1; then
   python3 - "${repo_root}" <<'PY'

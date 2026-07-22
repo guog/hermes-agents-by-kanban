@@ -1,4 +1,4 @@
-"""Deterministic helpers for the Hermes one-PRD/one-MR workflow contract."""
+"""Test-only helpers for the Hermes one-PRD/one-MR workflow contract."""
 
 from __future__ import annotations
 
