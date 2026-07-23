@@ -26,6 +26,12 @@ validate_environment() {
   for key in FLEET_MODEL; do
     require_env "${key}" || failed=1
   done
+  if [[ -n "${FLEET_MODEL:-}" ]]; then
+    if [[ "${FLEET_MODEL}" != */* || -z "${FLEET_MODEL%%/*}" || -z "${FLEET_MODEL#*/}" ]]; then
+      echo "fleet bootstrap: FLEET_MODEL must use provider/model format" >&2
+      failed=1
+    fi
+  fi
 
   for profile in prd-writer spec-writer planner tasker coder; do
     key=${profile^^}
@@ -71,10 +77,14 @@ install_profile() {
 }
 
 configure_model() {
-  local profile=$1
+  local profile=$1 provider model
   if [[ -n "${FLEET_MODEL:-}" ]]; then
+    provider=${FLEET_MODEL%%/*}
+    model=${FLEET_MODEL#*/}
     /command/s6-setuidgid hermes hermes -p "${profile}" \
-      config set model "${FLEET_MODEL}" >/dev/null
+      config set model.provider "${provider}" >/dev/null
+    /command/s6-setuidgid hermes hermes -p "${profile}" \
+      config set model.default "${model}" >/dev/null
   fi
 }
 

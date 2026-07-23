@@ -108,15 +108,27 @@ echo "container runtime check: 12 profiles and 3 isolated Gateways"
 
 /opt/hermes/.venv/bin/python - <<'PY_CONFIG'
 import pathlib
+import os
 import yaml
 
 profiles = (
     "dispatcher", "prd-writer", "fde", "spec-writer", "spec-reviewer", "planner",
     "plan-reviewer", "tasker", "task-reviewer", "coder", "tester", "code-reviewer",
 )
+fleet_model = os.environ.get("FLEET_MODEL", "")
+if "/" not in fleet_model:
+    raise SystemExit("FLEET_MODEL must use provider/model format")
+expected_provider, expected_model = fleet_model.split("/", 1)
 for profile in profiles:
     path = pathlib.Path("/opt/data/profiles") / profile / "config.yaml"
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    model = config.get("model")
+    if not isinstance(model, dict):
+        raise SystemExit(f"{profile}: model must be a provider/default mapping")
+    if model.get("provider") != expected_provider:
+        raise SystemExit(f"{profile}: model.provider must equal {expected_provider!r}")
+    if model.get("default") != expected_model:
+        raise SystemExit(f"{profile}: model.default must equal {expected_model!r}")
     if config.get("terminal", {}).get("home_mode") != "profile":
         raise SystemExit(f"{profile}: terminal.home_mode must equal profile")
     if config.get("memory", {}).get("write_approval") is not True:
@@ -136,7 +148,7 @@ for key, value in expected.items():
     if kanban.get(key) != value:
         raise SystemExit(f"dispatcher: kanban.{key} must equal {value!r}")
 PY_CONFIG
-echo "container runtime check: profile home, memory approval and Kanban policy"
+echo "container runtime check: fleet model, profile home, memory approval and Kanban policy"
 
 dashboard_service=""
 for candidate in /run/s6-rc/servicedirs/dashboard /run/service/dashboard; do
