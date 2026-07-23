@@ -8,6 +8,8 @@ terminal:
   backend: local
   cwd: /workspace/projects
   home_mode: profile
+approvals:
+  mode: off
 memory:
   memory_enabled: true
   user_profile_enabled: false
