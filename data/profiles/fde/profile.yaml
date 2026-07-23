@@ -1,0 +1,2 @@
+description: Human-facing Feishu agent that sanitizes field evidence and may create normal GitLab Issues; never pushes code.
+description_auto: false

@@ -1,0 +1,5 @@
+[credential]
+	helper = !glab auth git-credential
+[user]
+	name = Hermes PRD Writer
+	email = prd-writer-bot@hermes.invalid

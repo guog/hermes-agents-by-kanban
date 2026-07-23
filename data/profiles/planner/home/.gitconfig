@@ -1,0 +1,5 @@
+[credential]
+	helper = !glab auth git-credential
+[user]
+	name = Hermes Planner
+	email = planner-bot@hermes.invalid

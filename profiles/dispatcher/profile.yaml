@@ -1,3 +1,0 @@
-description: SDD control-plane orchestrator; creates typed cards, validates live GitLab gates, merges checked heads and notifies humans; never implements.
-description_auto: false
-

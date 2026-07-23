@@ -1,0 +1,19 @@
+---
+name: sdd-review-plan
+description: Review the complete PLAN set and post a digest-bound gate on the shared MR
+version: 0.2.0
+---
+
+# Review PLAN set
+
+## Fleet-wide execution rules
+
+- Perform GitLab project, repository-metadata, MR, pipeline, discussion and comment operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal read-only `git` commands explicitly required by this Skill remain allowed.
+- The card's designated Hermes shared `worktree` is the working copy of the Agent-owned delivery branch. Do not run routine `git fetch origin` or pull loops after dispatcher reconciliation. Fetch only to recover missing refs/worktree, investigate a proven local/remote head mismatch, or satisfy `live_reconcile_required`; record the reason. Use local `git rev-parse`/`git status` for artifact state and `glab` for current MR state.
+- A PRD omission or ambiguity is not by itself a blocking finding. Decide from explicit acceptance/constraints, current repository behavior and conventions, approved upstream artifacts, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. Put every critical decision in the idempotent gate MR comment's `## 关键自主决策` section and include that comment URL in completion `gitlab_urls`; use `无` in the existing gate comment when none was made, without posting a separate empty comment. Escalate only contradictory evidence with no safe acceptance-preserving choice, or a genuine permission, credential or capability failure.
+
+1. Call `kanban_show()`; require dispatcher origin and verify project/run/worktree/branch/shared MR plus the still-valid SPEC digest.
+2. Enumerate one `plan-<key>.md` for every SPEC key. Check traceability, feasibility against actual code, architecture fit, interfaces, data/migration, compatibility, security, observability, tests, rollback, unresolved decisions and over-design.
+3. Compute the sorted path/blob-SHA digest at the review commit. Post an idempotent v2 `plan-review` gate with digest and `review_commit_sha`.
+4. Use `fail` for PLAN defects and `scope_gap` only when SPEC cannot support an implementable plan. Avoid cosmetic-only blockers.
+5. Complete with pass/fail/scope_gap metadata and evidence. Pass one flat v2 metadata object conforming to `/opt/fleet/schemas/card-completion.schema.json`; repeat every required project/workspace/source field from the card at the top level. A pass must include non-empty `artifact_paths`, `artifact_digest` and `review_commit_sha`. Never edit PLAN, create TASKS, push, create another MR or merge.
