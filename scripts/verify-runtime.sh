@@ -72,6 +72,7 @@ profiles=(
 gateway_profiles=(dispatcher prd-writer fde)
 skill_marker_root=/opt/data/.fleet/skills-v1
 projects_root=/workspace/projects
+profile_command_root=/opt/data/.fleet/bin
 
 die() {
   echo "container runtime check: $*" >&2
@@ -106,6 +107,7 @@ echo "container runtime check: projects workspace is owned by and writable to he
 
 for profile in "${profiles[@]}"; do
   profile_root="/opt/data/profiles/${profile}"
+  profile_command="${profile_command_root}/${profile}"
   [[ -d "${profile_root}" ]] || die "profile is missing: ${profile}"
   for file in config.yaml distribution.yaml profile.yaml SOUL.md; do
     [[ -r "${profile_root}/${file}" ]] || die "${profile} is missing ${file}"
@@ -119,6 +121,20 @@ for profile in "${profiles[@]}"; do
   [[ -s "${profile_root}/skills/.bundled_manifest" && \
      ! -L "${profile_root}/skills/.bundled_manifest" ]] || \
     die "${profile} bundled Skill provenance manifest is missing, empty or unsafe"
+  [[ -f "${profile_command}" && ! -L "${profile_command}" && \
+     -x "${profile_command}" ]] || \
+    die "${profile} managed profile command is missing or unsafe"
+  [[ "$(command -v "${profile}")" == "${profile_command}" ]] || \
+    die "${profile} managed profile command is not available on PATH"
+  [[ "$(stat -c %u "${profile_command}")" == 0 && \
+     "$(stat -c %g "${profile_command}")" == 0 ]] || \
+    die "${profile} managed profile command must be owned by root"
+  grep -qF "/command/s6-setuidgid hermes" "${profile_command}" || \
+    die "${profile} managed profile command does not drop root privileges"
+  grep -qF " -p ${profile}" "${profile_command}" || \
+    die "${profile} managed profile command selects the wrong profile"
+  "${profile_command}" --version | grep -qF "0.19.0" || \
+    die "${profile} managed profile command is not executable"
 
   service="/run/service/gateway-${profile}"
   if is_gateway_profile "${profile}"; then
@@ -130,7 +146,7 @@ for profile in "${profiles[@]}"; do
     [[ "${up}" == "false" ]] || die "worker Gateway must be stopped: ${profile}"
   fi
 done
-echo "container runtime check: 12 profiles and 3 isolated Gateways"
+echo "container runtime check: 12 profile commands and 3 isolated Gateways"
 
 /opt/hermes/.venv/bin/python - <<'PY_CONFIG'
 import pathlib

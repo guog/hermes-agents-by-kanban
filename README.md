@@ -573,6 +573,17 @@ docker compose exec hermes hermes gateway list
 docker compose exec hermes hermes -p dispatcher kanban boards list
 ```
 
+bootstrap 会为全部 12 个 Profile 在 root-owned 的 `/opt/data/.fleet/bin/<profile>` 安装受管命令，因此也可以直接运行：
+
+```bash
+docker compose exec hermes coder
+docker compose exec hermes coder chat -q "检查当前实现卡"
+docker compose exec hermes tester doctor
+docker compose exec hermes spec-writer skills list --enabled-only
+```
+
+`coder`、`tester` 等命令等价于 `hermes -p <profile>`。`docker compose exec` 默认进入 root 身份时，包装器会先通过 s6 降权到 `hermes`，再加载对应 Profile；不要绕过包装器以 root 直接启动 Hermes，否则新会话或状态文件可能变成 root-owned。包装器及其专用目录由 root 所有、Agent 只可执行不可修改，每次 bootstrap 会原子校准；Agent 自建命令仍可使用 `/opt/data/.local/bin`，Profile 的 Memory、Skills、pending 审批和会话数据均不受影响。
+
 观察项目 board：
 
 ```bash
@@ -806,6 +817,7 @@ docker compose down -v
 | `tooling-sync` 下载失败 | 无法访问 GitHub、GitLab.com、npm 或 TLS/代理错误 | 修复容器网络/CA/代理；不要绕过 checksum |
 | profile `.env` owner/mode 失败 | 用 sudo 初始化、PUID 不匹配、文件为软链接 | 用部署 UID 修正所有者，目录设 `0700`、文件设 `0600`，替换软链接为普通文件 |
 | 首次 `spec-writer` 无法写 `/workspace/projects` | Docker 在 bind mount 源目录缺失时以 root 创建了 `PROJECTS_DIR`，或目录的 `PUID:PGID` 与部署用户不一致 | 停止 Hermes，按 `init-deployment-env.sh` 输出的精确路径执行 `sudo chown -R -- <PUID>:<PGID> <PROJECTS_DIR>`，再运行初始化脚本并重启；禁止用 `chmod 777` |
+| 容器 Bash 中 `coder`/`tester` 提示 command not found | 旧部署未安装 fleet 管理的 Profile 命令包装器，或 `/opt/data/.fleet/bin` 不在有效 PATH | 更新部署包并重启 `hermes` 触发 bootstrap，再运行 `verify-runtime.sh`；临时可使用 `/command/s6-setuidgid hermes /usr/bin/env HOME=/opt/data HERMES_HOME=/opt/data hermes -p coder`，不要以 root 直接运行 |
 | token/app 重复 | 多个 profile 复制了同一秘密 | 为每个 profile/App 创建独立凭据，修改后重启 |
 | 根 `.env` 缺 `FLEET_MODEL` 或 commit identity | 共享部署参数未填 | 填写根 `.env`，不要把它们移入 profile `.env` |
 | Gateway stopped/failed | 飞书 App 未发布、权限/事件缺失、App Secret 错误或端口冲突 | 检查三个 App、事件和 profile 日志，再重启 Hermes |

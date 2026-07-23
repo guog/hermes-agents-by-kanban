@@ -28,7 +28,7 @@ services:
       FLEET_BUNDLE_REF: ${FLEET_BUNDLE_REF:?run ./scripts/init-deployment-env.sh}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
-      PATH: /command:/opt/fleet/vendor/current/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PATH: /opt/data/.fleet/bin:/command:/opt/fleet/vendor/current/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       FLEET_MODEL: ${FLEET_MODEL:-}
       FLEET_MODEL_BASE_URL: ${FLEET_MODEL_BASE_URL:-}
       FLEET_FORCE_CONFIG: ${FLEET_FORCE_CONFIG:-0}

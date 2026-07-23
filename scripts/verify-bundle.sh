@@ -114,7 +114,7 @@ assert "./schemas:/opt/fleet/schemas:ro" in compose
 assert "./scripts:/opt/fleet/scripts:ro" in compose
 assert "./patches:/opt/fleet/patches:ro" in compose
 assert "./config:/opt/fleet/config:ro" in compose
-assert "PATH: /command:/opt/fleet/vendor/current/bin:" in compose
+assert "PATH: /opt/data/.fleet/bin:/command:/opt/fleet/vendor/current/bin:" in compose
 for value in [
     "017-hermes-runtime-patch", "018-hermes-sdd-fleet",
     "021-hermes-sdd-gateways",
@@ -191,6 +191,12 @@ for value in [
     "projects_root=/workspace/projects", "prepare_projects_root",
     'chown -- "${PUID}:${PGID}" "${projects_root}"',
     "mktemp -d", ".fleet-write-check.XXXXXX",
+    "install-profile-commands.py", "install_profile_commands",
+    'profile_command_root="${data_root}/.fleet/bin"',
+    "--runtime-user hermes", "--owner root", "--group root",
+    "--hermes-cli /opt/hermes/.venv/bin/hermes",
+    "--setuidgid /command/s6-setuidgid",
+    "profile command is shadowed on PATH",
 ]:
     assert value in bootstrap, f"bootstrap isolation contract missing: {value}"
 for forbidden in [
@@ -204,6 +210,21 @@ for forbidden in [
     assert forbidden not in bootstrap, f"bootstrap must not persist or overwrite credentials: {forbidden}"
 identity_loop = re.search(r"for profile in ([^;]+); do\n\s+key=.*?GIT_COMMIT_NAME", bootstrap, re.S)
 assert identity_loop and "fde" not in identity_loop.group(1), "FDE must not require Git identity"
+
+profile_command_installer = (
+    root / "scripts/install-profile-commands.py"
+).read_text(encoding="utf-8")
+for value in [
+    "PROFILE_RE", "tempfile.mkstemp", "os.replace",
+    'current_uid=$(/usr/bin/id -u)',
+    'if [ \\"${current_uid}\\" = 0 ]',
+    "HERMES_HOME=", "runtime user, file owner or group does not exist",
+    "existing profile command must be a regular file",
+]:
+    assert value in profile_command_installer, (
+        f"profile command installer contract missing: {value}"
+    )
+assert "chmod 0777" not in profile_command_installer
 
 runtime_verifier = (root / "scripts/verify-runtime.sh").read_text(encoding="utf-8")
 for value in [
@@ -223,6 +244,11 @@ for value in [
     "external Skill directory must be read-only",
     "projects workspace root is not writable by hermes",
     "projects workspace is owned by and writable to hermes",
+    "profile_command_root=/opt/data/.fleet/bin",
+    "managed profile command is not available on PATH",
+    "managed profile command does not drop root privileges",
+    "managed profile command must be owned by root",
+    "12 profile commands and 3 isolated Gateways",
 ]:
     assert value in runtime_verifier, f"runtime verification missing: {value}"
 

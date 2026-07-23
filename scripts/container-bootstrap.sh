@@ -7,6 +7,7 @@ data_root=/opt/data
 profiles_root="${data_root}/profiles"
 skill_marker_root="${data_root}/.fleet/skills-v1"
 projects_root=/workspace/projects
+profile_command_root="${data_root}/.fleet/bin"
 
 profiles=(
   dispatcher prd-writer fde spec-writer spec-reviewer planner
@@ -94,6 +95,26 @@ prepare_projects_root() {
     echo "fleet bootstrap: could not remove projects write probe ${probe}" >&2
     exit 65
   }
+}
+
+install_profile_commands() {
+  local profile
+  install -d -m 0755 -o root -g root "${profile_command_root}"
+  python3 "${fleet_root}/scripts/install-profile-commands.py" \
+    --output-dir "${profile_command_root}" \
+    --runtime-user hermes \
+    --owner root \
+    --group root \
+    --base-home "${data_root}" \
+    --hermes-cli /opt/hermes/.venv/bin/hermes \
+    --setuidgid /command/s6-setuidgid \
+    --profiles "${profiles[@]}"
+  for profile in "${profiles[@]}"; do
+    if [[ "$(command -v "${profile}")" != "${profile_command_root}/${profile}" ]]; then
+      echo "fleet bootstrap: profile command is shadowed on PATH: ${profile}" >&2
+      exit 65
+    fi
+  done
 }
 
 install_profile() {
@@ -246,6 +267,7 @@ install -d -m 0700 -o root -g root "${skill_marker_root}"
 for profile in "${profiles[@]}"; do
   install_profile "${profile}"
 done
+install_profile_commands
 
 python3 "${fleet_root}/scripts/validate-profile-envs.py" \
   --profiles-root "${profiles_root}" --owner hermes
