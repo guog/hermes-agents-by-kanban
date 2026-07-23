@@ -183,11 +183,30 @@ echo "container runtime check: Dashboard s6 service and basic authentication"
 
 tool_handler=/opt/hermes/tools/kanban_tools.py
 dispatcher_db=/opt/hermes/hermes_cli/kanban_db.py
+kanban_cli=/opt/hermes/hermes_cli/kanban.py
+dashboard_api=/opt/hermes/plugins/kanban/dashboard/plugin_api.py
+completion_validator=/opt/fleet/scripts/validate_card_completion.py
+completion_schema=/opt/fleet/schemas/card-completion.schema.json
 grep -qF 'profile != "dispatcher"' "${tool_handler}" || die "worker Kanban guard is missing"
 grep -qF '_require_dispatcher_profile("kanban_create")' "${tool_handler}" || die "kanban_create guard is missing"
 grep -qF '_require_dispatcher_profile("kanban_link")' "${tool_handler}" || die "kanban_link guard is missing"
+grep -qF "CompletionMetadataValidationError" "${tool_handler}" || die "Kanban completion tool guard is missing"
 grep -qF "AND created_by = 'dispatcher'" "${dispatcher_db}" || die "dispatcher created_by guard is missing"
-echo "container runtime check: dispatcher-only Kanban guard"
+grep -qF "SDD_COMPLETION_SCHEMA_MARKER" "${dispatcher_db}" || die "formal completion kernel guard is missing"
+grep -qF "kanban: completion blocked:" "${kanban_cli}" || die "Kanban CLI completion guard is missing"
+grep -qF "status_code=422" "${dashboard_api}" || die "Dashboard completion guard is missing"
+[[ -x "${completion_validator}" ]] || die "completion metadata validator is not executable"
+validator_errors=""
+if validator_errors=$(printf '{}\n' | /opt/hermes/.venv/bin/python \
+    "${completion_validator}" \
+    --schema "${completion_schema}" \
+    --metadata-file - \
+    --task-id t_runtime_check 2>&1); then
+  die "completion metadata validator accepted an empty formal handoff"
+fi
+grep -qF '$.worktree: is required' <<<"${validator_errors}" || die "completion validator did not require worktree"
+grep -qF '$.project_id: is required' <<<"${validator_errors}" || die "completion validator did not require project_id"
+echo "container runtime check: dispatcher-only graph and formal completion guards"
 
 read_lock_value() {
   local section=$1 key=$2

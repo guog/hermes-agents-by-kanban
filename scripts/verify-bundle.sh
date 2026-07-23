@@ -145,8 +145,22 @@ for value in [
     'version}" != "0.19.0"', "git -C \"${install_root}\" apply --check",
     "git -C \"${install_root}\" apply --reverse --check",
     "hermes-0.19.0-dispatcher-kanban-guard.patch", "dispatcher_required",
+    "validate_card_completion.py", "CompletionMetadataValidationError",
+    "status_code=422",
 ]:
     assert value in runtime_patch, f"runtime patch contract missing: {value}"
+
+completion_validator = (
+    root / "scripts/validate_card_completion.py"
+).read_text(encoding="utf-8")
+for value in [
+    "SUPPORTED_KEYWORDS", "validate_completion_metadata",
+    "kanban_card_id", "must equal the completing task id",
+    "minItems", "uniqueItems", "absolute URI",
+]:
+    assert value in completion_validator, (
+        f"completion metadata validator missing: {value}"
+    )
 
 start_gateways = (root / "scripts/start-profile-gateways.sh").read_text(encoding="utf-8")
 assert start_gateways.startswith("#!/command/with-contenv bash\n"), (
@@ -185,8 +199,12 @@ for value in [
     'expected_provider, expected_model = fleet_model.split("/", 1)',
     'model.get("provider") != expected_provider',
     'model.get("default") != expected_model',
+    "CompletionMetadataValidationError",
+    "completion metadata validator accepted an empty formal handoff",
+    "$.worktree: is required",
+    "$.project_id: is required",
 ]:
-    assert value in runtime_verifier, f"runtime model verification missing: {value}"
+    assert value in runtime_verifier, f"runtime verification missing: {value}"
 
 initializer = (root / "scripts/init-profile-envs.sh").read_text(encoding="utf-8")
 for value in [
@@ -334,17 +352,35 @@ for value in [
     "checkout:", "worktree:", "prd_mr_url:", "artifact_digest:",
     "never create a second delivery branch or MR", "card_role:", "transition_key:",
     "awaits_parent_card_id:", "live_reconcile_required: true", ":work", ":continue",
+    "一个扁平的 v2 JSON 对象", "嵌套", "正式 SDD 卡在 Hermes 公共完成入口强制校验",
+    "锁定的 `glab` CLI", "禁止阶段间例行 `git fetch origin`",
+    "PRD 未说明或表述模糊本身不是 `needs_input`/`scope_gap`",
+    "`gitlab_urls`", "交付 MR 尚不存在时将决策明确交给 `spec-writer`",
+    "/opt/fleet/templates/decision-comment.md",
 ]:
     assert value in card, f"card v2 contract missing: {value}"
 
 gate = (root / "templates/gate-comment.md").read_text(encoding="utf-8")
-for value in ["SDD-GATE: v=2", "artifact_digest", "review_commit_sha", "head_sha"]:
+for value in [
+    "SDD-GATE: v=2", "artifact_digest", "review_commit_sha", "head_sha",
+    "## 关键自主决策", "影响与可逆方式",
+]:
     assert value in gate
 
 mr = (root / "templates/mr-description.md").read_text(encoding="utf-8")
-for value in ["schema_version: 2", "source_prd:", "specs:", "plans:", "tasks:", "merge_commit_sha"]:
+for value in [
+    "schema_version: 2", "source_prd:", "specs:", "plans:", "tasks:",
+    "merge_commit_sha", "## 关键自主决策", "`spec-writer` 首次创建本 MR 前填写",
+]:
     assert value in mr
 assert "artifact_type:" not in mr
+
+decision = (root / "templates/decision-comment.md").read_text(encoding="utf-8")
+for value in [
+    "SDD-DECISION: v=1", "run=<run_key>", "stage=<stage>",
+    "card=<kanban-card-id>", "关键自主决策", "稳定", "不重复发布",
+]:
+    assert value in decision, f"decision comment contract missing: {value}"
 
 feishu = (root / "templates/feishu-messages.md").read_text(encoding="utf-8")
 assert "实现 PRD <精确 PRD blob/raw URL> <已合并 PRD MR URL>" in feishu
@@ -361,6 +397,12 @@ for value in [
     "代码、测试、代码审查引起的代码返工合计最多 5 轮",
     "./scripts/verify-runtime.sh", "生产自治 E2E", "双卡协议",
     "./scripts/init-deployment-env.sh", "auth_required=true", "内网受控试运行",
+    "扁平 v2 对象", "hermes kanban edit", "禁止 schema 例外",
+    "只使用 bundle 锁定的 `glab` CLI", "不执行例行 `git fetch origin`",
+    "PRD 未说明或表述模糊本身不是请求人类",
+    "关键自主决策", "templates/decision-comment.md",
+    "completion metadata 的 `gitlab_urls`",
+    "交付 MR 尚不存在时", "包含本卡全部关键决策",
 ]:
     assert value in readme, f"authoritative README workflow/deployment content missing: {value}"
 
@@ -372,7 +414,7 @@ for value in [
     "sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40",
     "expected Hermes 0.19.0",
     "gateway_profiles=(dispatcher prd-writer fde)", "s6-svstat -o up",
-    "dispatcher-only Kanban guard", ".tooling-lock", "--runtime-check",
+    "dispatcher-only graph and formal completion guards", ".tooling-lock", "--runtime-check",
     "deployable read-only runtime checks passed", "Dashboard /api/status",
     "auth_required", "auth_providers", "memory.write_approval must be true",
     "validate-deployment-env.py", "git fsck --full",
@@ -410,10 +452,45 @@ for stale in [
     assert stale not in skills
 
 for profile in profiles:
+    skill = next((root / f"profiles/{profile}/skills").glob("*/SKILL.md")).read_text(encoding="utf-8")
+    for value in ["locked `glab` CLI", "raw HTTP/`curl`", "smallest reversible"]:
+        assert value in skill, f"fleet-wide GitLab/autonomy rule missing: {profile}: {value}"
+    assert (
+        "A decision is critical" in skill or "critical decision" in skill
+    ), f"critical-decision definition missing: {profile}"
     if profile == "dispatcher":
         continue
-    skill = next((root / f"profiles/{profile}/skills").glob("*/SKILL.md")).read_text(encoding="utf-8")
     assert "kanban_create" not in skill and "kanban_link" not in skill, f"worker shapes Kanban DAG: {profile}"
+    if profile in {
+        "spec-writer", "spec-reviewer", "planner", "plan-reviewer",
+        "tasker", "task-reviewer", "coder", "tester", "code-reviewer",
+    }:
+        for value in ["shared `worktree`", "`git fetch origin`", "`live_reconcile_required`"]:
+            assert value in skill, f"formal worktree reconciliation rule missing: {profile}: {value}"
+        assert "one flat v2 metadata object" in skill, (
+            f"formal worker completion contract missing: {profile}"
+        )
+
+spec_writer_skill = next(
+    (root / "profiles/spec-writer/skills").glob("*/SKILL.md")
+).read_text(encoding="utf-8")
+for value in ["## 关键自主决策", "MR description", "`gitlab_urls`"]:
+    assert value in spec_writer_skill, f"spec-writer decision audit missing: {value}"
+
+for profile in {
+    "dispatcher", "prd-writer", "fde", "spec-reviewer", "planner",
+    "plan-reviewer", "tasker", "task-reviewer", "coder", "tester",
+    "code-reviewer",
+}:
+    skill = next((root / f"profiles/{profile}/skills").glob("*/SKILL.md")).read_text(encoding="utf-8")
+    assert "idempotent" in skill and "MR comment" in skill, (
+        f"critical-decision MR comment audit missing: {profile}"
+    )
+
+for profile in {"spec-reviewer", "plan-reviewer", "task-reviewer"}:
+    skill = next((root / f"profiles/{profile}/skills").glob("*/SKILL.md")).read_text(encoding="utf-8")
+    for value in ["artifact_paths", "artifact_digest", "review_commit_sha"]:
+        assert value in skill, f"{profile} pass metadata missing: {value}"
 
 missing = []
 pattern = re.compile(r"\[[^]]*\]\(([^)]+)\)")

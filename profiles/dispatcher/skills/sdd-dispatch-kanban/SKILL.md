@@ -8,6 +8,12 @@ version: 0.3.0
 
 Use this Skill only for formal run intake, deterministic stage transitions, recovery, checked-head merge, status and original-channel notification. Never write professional SPEC/PLAN/TASKS/code or their reviews.
 
+## Fleet-wide execution rules
+
+- Perform GitLab project, repository-metadata, MR, pipeline, discussion, comment and merge operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal `git` commands explicitly required by this Skill remain allowed for checkout/worktree preparation, inspection, commit and push.
+- The card's designated Hermes shared `worktree` is the only editable working copy of the Agent-owned delivery branch. After initial preparation/recovery, do not run routine `git fetch origin` or pull loops between stages. Fetch only to create/recover missing refs or a worktree, investigate a proven local/remote head mismatch or rejected push, or satisfy `live_reconcile_required`; record the reason. Use local `git rev-parse`/`git status` for worktree state and `glab` for current MR, pipeline and discussion state.
+- A PRD omission or ambiguity is not by itself `needs_input`. Decide from explicit acceptance/constraints, current repository behavior and conventions, approved upstream artifacts, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. If the delivery MR exists, reconcile one idempotent MR comment containing all critical decisions made by this card using `/opt/fleet/templates/decision-comment.md` and include its URL in completion `gitlab_urls`. Before the first MR exists, carry those decisions explicitly into the spec-writer card so it can put them in the initial MR description. Do not post an empty comment when no critical decision was made. Ask a human only when evidence is contradictory and no safe choice preserves acceptance, or a permission, credential or capability is genuinely missing.
+
 ## Intake
 
 1. Accept only `实现 PRD <exact blob/raw URL> <merged PRD MR URL>`. If either URL is missing, their host/project IDs differ, or repository identity is ambiguous, ask only for the missing/correct value in the original Feishu channel and do not create a card.
@@ -19,7 +25,7 @@ Use this Skill only for formal run intake, deterministic stage transitions, reco
 
 ## Card and gate reconciliation
 
-1. Call `kanban_show()`; validate completion metadata against `/opt/fleet/schemas/card-completion.schema.json`. Refuse any next card whose stored or returned `created_by` is not exactly `dispatcher`.
+1. Call `kanban_show()`; validate the single flat completion metadata object against `/opt/fleet/schemas/card-completion.schema.json`. Card-body `identity`/`workspace`/`source`/`delivery` sections and comments do not fill missing completion fields. Refuse any next card whose stored or returned `created_by` is not exactly `dispatcher`.
 2. Every card must repeat project ID/path/display name, checkout/worktree, shared branch/target, PRD path/commit/MR, run, delivery MR and expected head. Reconcile GitLab live state before every write.
 3. Advance only through the worker/continuation pair protocol below. `kanban_create` and `kanban_link` are dispatcher-only; never delegate graph shaping.
 4. Artifact gates use sorted path/blob-SHA digest plus reviewer identity and `review_commit_sha`. Recompute the stage path set at every transition. A changed approved artifact invalidates that gate and every downstream gate; later PLAN/code additions do not invalidate an unchanged SPEC digest.
@@ -34,7 +40,7 @@ Every dispatcher gate, including `run-init` and every resumed dispatcher continu
 2. Create or reuse work card `W` with key `<transition_key>:work`, exact stage/assignee/Skills, `created_by=dispatcher`, and parent equal to the current dispatcher gate.
 3. Create or reuse dispatcher continuation card `C` with key `<transition_key>:continue`, assignee `dispatcher`, and parent equal to `W`. `C` records only the expected parent card/stage and `live_reconcile_required=true`.
 4. Verify both cards and both parent relationships. Only then complete the current gate with `next_card_ids=[W,C]`. If either create/link fails, leave the current gate running or blocked and retry the same keys; do not complete it.
-5. Completing the current gate promotes only `W` to `ready`. Completing `W` promotes `C` to `ready`. `C` must read `W` completion metadata, validate it against the schema, then re-read GitLab project/branch/MR/comments/pipeline/discussions/current head before deciding the next pair.
+5. Completing the current gate promotes only `W` to `ready`. Completing `W` promotes `C` to `ready`. `C` must read `W` completion metadata, validate it against the schema, then re-read GitLab project/branch/MR/comments/pipeline/discussions/current head before deciding the next pair. For a historical invalid handoff, create nothing and accept only an audited `kanban edit` backfill or a fresh review/work pair; never infer missing fields or approve a schema exception.
 6. Never put a predicted `head_sha`, `artifact_digest`, review result, pipeline result or merge result into `C`. Unknown live facts stay null until `C` runs. Duplicate messages, dispatcher restarts and worker retries must reuse the same pair.
 
 Use the same protocol for every transition: write, independent review, any design/code rework, test, code review and merge. The merge work card is assigned to `dispatcher` and is followed by a `run-complete` continuation; `run-complete` becomes ready only after the checked-head merge card completes.
@@ -61,4 +67,4 @@ Every created card sets the exact assignee and Skill list:
 | tester | `sdd-test`, `glab` |
 | code-reviewer | `sdd-review-code`, `glab` |
 
-Block with a concrete human action only for `needs_input`, `capability`, credential/environment failure or exhausted budget. Never create a GitLab Task work item for formal delivery and never run a second Feishu inbound consumer.
+Block with a concrete human action only for missing required intake identity, contradictory requirements with no safe acceptance-preserving choice, `capability`, credential/environment failure or exhausted budget. PRD ambiguity alone is not a reason to block. Never create a GitLab Task work item for formal delivery and never run a second Feishu inbound consumer.

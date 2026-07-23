@@ -22,6 +22,16 @@ SDD-GATE: v=2 run=<run_key> stage=<spec-review|plan-review|tasks-review|test|cod
 
 - <risk-or-none>
 
+## 关键自主决策
+
+仅在本轮 gate 对 PRD 未明确或模糊点作出关键自主决策时填写；否则写“无”。
+关键决策包括影响用户可见范围/验收、公共接口、数据与迁移、安全与权限、
+兼容性、恢复/回滚或必需测试门禁的选择。
+
+| 决策 ID | 模糊点 | 自主决策 | 依据 | 影响与可逆方式 |
+| --- | --- | --- | --- | --- |
+| `<stable-decision-id-or-none>` | <ambiguity-or-none> | <decision-or-none> | <evidence> | <impact/rollback> |
+
 ## 结构化摘要
 
 ```json

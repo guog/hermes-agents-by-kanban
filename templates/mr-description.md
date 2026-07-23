@@ -26,6 +26,15 @@ gates:
 ```
 <!-- SDD-RUN:END -->
 
+## 关键自主决策
+
+`spec-writer` 首次创建本 MR 前填写。若没有关键决策，保留一行“无”；SPEC
+返工产生新的关键决策时更新同一表格，不另发首次决策评论。
+
+| 决策 ID | PRD 未明确或模糊点 | 自主决策 | 依据 | 影响与可逆方式 |
+| --- | --- | --- | --- | --- |
+| `<stable-decision-id-or-none>` | <ambiguity-or-none> | <decision-or-none> | <acceptance/repository/upstream/security evidence> | <scope/compatibility/rollback> |
+
 ## TASKS 与实现覆盖
 
 | TASK ID | SPEC/需求 | 实现位置 | 测试 |

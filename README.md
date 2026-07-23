@@ -184,6 +184,14 @@ Draft: [PRD] <prd-basename>.md
 
 后续所有 producer 和返工都复用同一分支、worktree 和 MR。`coder` 完成完整实现与自测后才将 MR 标记为 ready。
 
+所有 Agent 的 GitLab 项目、仓库元数据、MR、pipeline、discussion、comment、Issue 和 merge 操作只使用 bundle 锁定的 `glab` CLI 或已安装官方 `glab` Skill。不得临时改用 raw HTTP/`curl`、自建 SDK、浏览器或手工 UI。各角色 Skill 明确要求的本地 `git` checkout、检查、commit 和 push 不受此限制。
+
+正式 run 的交付分支只在卡片指定的 Hermes 共享 worktree 中存在可编辑工作副本；该分支由 Agent 按串行阶段维护，人类不参与修改。dispatcher 完成初次准备或恢复后，各阶段以该 worktree 为本地代码事实源，不执行例行 `git fetch origin` 或来回 pull。只有缺少 ref/worktree、已有证据表明本地/远端 head 不一致、push 被拒绝，或 continuation 明确要求 `live_reconcile_required` 时才 fetch，并记录原因；MR、pipeline 和 discussion 的当前状态仍通过 `glab` 查询。
+
+PRD 未说明或表述模糊本身不是请求人类、`needs_input` 或 `scope_gap` 的理由。Agent 依次依据明确验收与约束、仓库现状与惯例、已批准的上游工件、兼容性/安全性和最小可逆范围自主决策。只有证据互相冲突且不存在保持验收的安全选择，或确实缺少项目身份、权限、凭据、环境或能力时才暂停并给出具体的人类动作。
+
+影响用户可见范围或验收、公共接口、数据模型/迁移、安全/权限、兼容性、恢复/回滚或必需测试门禁的选择属于**关键自主决策**。交付 MR 尚不存在时，前置角色把决策明确交给 `spec-writer`；`spec-writer` 首次创建 MR 前，将全部前置决策和本阶段决策直接写入 MR description 的“关键自主决策”表，没有时写“无”。MR 已存在后，每张卡使用 `templates/decision-comment.md` 在同一 MR 发布或更新一条带稳定 marker、包含本卡全部关键决策的幂等评论；reviewer/tester 可以把同样字段合并进已有 gate comment。存在关键决策时，正式卡 completion metadata 的 `gitlab_urls` 必须包含对应 MR description 或 comment URL；没有关键决策时不制造空评论。
+
 ### 2.4 串行阶段
 
 ```text
@@ -218,6 +226,10 @@ G complete → W ready → W complete → C ready
 创建顺序固定为“创建或复用 W → 创建或复用 C → 核对两条依赖 → 完成 G”。如果任一步失败，G 不得完成；重试必须使用同一组稳定 idempotency key。这样容器重启、worker crash 或重复消息只会恢复原卡，不会产生重复工作卡或续跑卡。
 
 C 只保存父卡 ID、父阶段和 `live_reconcile_required=true`。它被唤醒后先读取 W 的 completion metadata 并按 schema 校验，再重新查询 GitLab 的分支、MR、评论、pipeline、discussion 和当前 head。创建 C 时不得预填未知的 `head_sha`、`artifact_digest`、review/pipeline/merge 结论。
+
+正式 SDD 卡的 completion metadata 是一个扁平 v2 对象；卡片正文中的 `identity`、`workspace`、`source`、`delivery` 分段不能代替顶层必填字段。Hermes 公共完成入口会在写入前校验 schema 和真实 `kanban_card_id`，因此 Tool、CLI、Dashboard 都不能把残缺 handoff 标记为完成；校验失败时原卡保持可重试。
+
+历史卡片若已保存残缺 metadata，dispatcher 不得根据评论或卡片正文推断放行。只允许使用 `hermes kanban edit` 审计回填完整对象，或创建新的 review/work pair 重跑。
 
 SPEC/PLAN/TASKS 的 write、review、rework，以及 implement、test、code-review、code-rework 均执行同一协议。merge 也作为受检 work card，后接 `run-complete` continuation；只有 checked-head merge 完成后，`run-complete` 才能进入 ready。
 
@@ -259,7 +271,7 @@ tester 与 code-reviewer 必须绑定同一个当前 MR `head_sha`。任何新 p
 - SPEC、PLAN、TASKS 各阶段最多返工 3 轮。
 - 代码、测试、代码审查引起的代码返工合计最多 5 轮。
 - reviewer 必须区分当前产物问题与上游 `scope_gap`，scope gap 返回真正的上游 owner。
-- 需求冲突、合同外业务决策、能力/凭据/环境故障或预算耗尽时进入暂停，并在飞书说明原因、证据、已尝试动作和需要的人类决定。
+- 只有证据互相冲突且不存在保持验收的安全选择、能力/凭据/环境故障或预算耗尽时才进入暂停，并在飞书说明原因、证据、已尝试动作和需要的人类决定；普通 PRD 模糊项和可逆的合同内决策继续自主处理并按上述规则记录。
 
 ### 2.8 Checked-head merge
 
@@ -777,6 +789,7 @@ docker compose down -v
 | “项目已归档” | `archived=true` | 不继续交付；由项目管理员决定是否恢复项目 |
 | MR pipeline/discussion 阻塞 | pipeline 未成功或阻塞 discussion 未解决 | 修复失败项/解决讨论，dispatcher 再次核对 live state |
 | `head drift` | tester/reviewer 通过后又有 push | 对新 head 重新执行 tester 与 code-reviewer，不能复用旧结论 |
+| completion metadata 缺 `worktree`/`project_*` | worker 提交了阶段结果但未复制扁平 v2 公共上下文 | 同一卡修正完整 metadata 后重试；历史完成卡使用审计 `kanban edit` 回填或重跑，禁止 schema 例外 |
 | 容器重启后 run 未推进 | Kanban card blocked/paused、凭据故障或 worker attempt 耗尽 | 查看 board/card 和 profile 日志，修复原因后通过 dispatcher 恢复 |
 
 ## 6. 验证声明边界

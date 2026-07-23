@@ -67,3 +67,256 @@ diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
          "ORDER BY priority DESC, created_at ASC"
      ).fetchall()
      for row in review_rows:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -72,6 +72,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import hashlib
++import importlib.util
+ import json
+ import os
+ import re
+@@ -4091,6 +4092,101 @@ class ArtifactPreservationError(RuntimeError):
+     """Raised when a declared scratch deliverable cannot be preserved."""
+ 
+ 
++SDD_COMPLETION_SCHEMA_MARKER = "schema: schemas/card-completion.schema.json"
++_SDD_COMPLETION_VALIDATOR_DEFAULT = (
++    "/opt/fleet/scripts/validate_card_completion.py"
++)
++_SDD_COMPLETION_SCHEMA_DEFAULT = (
++    "/opt/fleet/schemas/card-completion.schema.json"
++)
++_sdd_completion_validator_cache: tuple[str, Any] | None = None
++
++
++class CompletionMetadataValidationError(ValueError):
++    """Raised before a formal SDD card can persist an invalid handoff."""
++
++    def __init__(self, task_id: str, errors: Iterable[str]):
++        self.task_id = task_id
++        self.errors = [str(error) for error in errors]
++        super().__init__(
++            f"formal SDD completion metadata for {task_id} is invalid: "
++            + "; ".join(self.errors)
++        )
++
++
++def _load_sdd_completion_validator():
++    global _sdd_completion_validator_cache
++    validator_path = os.environ.get(
++        "HERMES_SDD_COMPLETION_VALIDATOR",
++        _SDD_COMPLETION_VALIDATOR_DEFAULT,
++    )
++    if (
++        _sdd_completion_validator_cache is not None
++        and _sdd_completion_validator_cache[0] == validator_path
++    ):
++        return _sdd_completion_validator_cache[1]
++
++    spec = importlib.util.spec_from_file_location(
++        "hermes_sdd_completion_validator",
++        validator_path,
++    )
++    if spec is None or spec.loader is None:
++        raise RuntimeError(
++            f"cannot load SDD completion validator from {validator_path}"
++        )
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    if not callable(getattr(module, "validate_completion_metadata", None)):
++        raise RuntimeError(
++            f"SDD completion validator {validator_path} has no "
++            "validate_completion_metadata function"
++        )
++    _sdd_completion_validator_cache = (validator_path, module)
++    return module
++
++
++def _validate_formal_sdd_completion(
++    conn: sqlite3.Connection,
++    task_id: str,
++    metadata: Optional[dict],
++) -> None:
++    row = conn.execute(
++        "SELECT body, created_by FROM tasks WHERE id = ?",
++        (task_id,),
++    ).fetchone()
++    if row is None or SDD_COMPLETION_SCHEMA_MARKER not in (row["body"] or ""):
++        return
++    if row["created_by"] != "dispatcher":
++        raise CompletionMetadataValidationError(
++            task_id,
++            [
++                "formal SDD cards must have tasks.created_by='dispatcher', "
++                f"got {row['created_by']!r}"
++            ],
++        )
++
++    schema_path = os.environ.get(
++        "HERMES_SDD_COMPLETION_SCHEMA",
++        _SDD_COMPLETION_SCHEMA_DEFAULT,
++    )
++    try:
++        validator = _load_sdd_completion_validator()
++        errors = validator.validate_completion_metadata(
++            metadata,
++            task_id=task_id,
++            schema_path=schema_path,
++        )
++    except CompletionMetadataValidationError:
++        raise
++    except Exception as exc:
++        raise CompletionMetadataValidationError(
++            task_id,
++            [f"completion validator unavailable: {exc}"],
++        ) from exc
++    if errors:
++        raise CompletionMetadataValidationError(task_id, errors)
++
++
+ def complete_task(
+     conn: sqlite3.Connection,
+     task_id: str,
+@@ -4130,6 +4226,7 @@ def complete_task(
+     and never blocks.
+     """
+     now = int(time.time())
++    _validate_formal_sdd_completion(conn, task_id, metadata)
+ 
+     # Gate: verify created_cards BEFORE the main write txn. A rejected
+     # completion still needs an auditable event, so we emit it in a
+@@ -4816,6 +4913,8 @@ def edit_completed_task_result(
+ ) -> bool:
+     """Backfill the user-visible result for an already completed task."""
+     handoff_summary = summary if summary is not None else result
++    if metadata is not None:
++        _validate_formal_sdd_completion(conn, task_id, metadata)
+     with write_txn(conn):
+         row = conn.execute(
+             "SELECT status FROM tasks WHERE id = ?", (task_id,),
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -635,6 +646,14 @@ def _handle_complete(args: dict, **kw) -> str:
+                     created_cards=created_cards,
+                     expected_run_id=_worker_run_id(tid),
+                 )
++            except kb.CompletionMetadataValidationError as metadata_err:
++                return tool_error(
++                    f"kanban_complete blocked: {metadata_err}. "
++                    f"Task {tid} is still in-flight with no completion "
++                    f"metadata written. Retry kanban_complete with one flat "
++                    f"v2 metadata object; nested card body sections do not "
++                    f"satisfy the completion schema."
++                )
+             except kb.ArtifactPreservationError as artifact_err:
+                 return tool_error(
+                     f"kanban_complete could not preserve the declared artifacts: "
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -2040,13 +2040,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                         failed.append(tid)
+                         continue
+ 
+-            if not kb.complete_task(
+-                conn, tid,
+-                result=args.result,
+-                summary=summary,
+-                metadata=metadata,
+-                expected_run_id=_worker_run_id_for(tid),
+-            ):
++            try:
++                completed = kb.complete_task(
++                    conn, tid,
++                    result=args.result,
++                    summary=summary,
++                    metadata=metadata,
++                    expected_run_id=_worker_run_id_for(tid),
++                )
++            except kb.CompletionMetadataValidationError as exc:
++                failed.append(tid)
++                print(f"kanban: completion blocked: {exc}", file=sys.stderr)
++                continue
++            if not completed:
+                 failed.append(tid)
+                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+             else:
+@@ -2066,13 +2072,18 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+             print(f"kanban: --metadata: {exc}", file=sys.stderr)
+             return 2
+     with kb.connect_closing() as conn:
+-        if not kb.edit_completed_task_result(
+-            conn,
+-            args.task_id,
+-            result=args.result,
+-            summary=getattr(args, "summary", None),
+-            metadata=metadata,
+-        ):
++        try:
++            edited = kb.edit_completed_task_result(
++                conn,
++                args.task_id,
++                result=args.result,
++                summary=getattr(args, "summary", None),
++                metadata=metadata,
++            )
++        except kb.CompletionMetadataValidationError as exc:
++            print(f"kanban: edit blocked: {exc}", file=sys.stderr)
++            return 2
++        if not edited:
+             print(
+                 f"cannot edit {args.task_id} (unknown id or task is not done)",
+                 file=sys.stderr,
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -842,12 +842,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+             s = payload.status
+             ok = True
+             if s == "done":
+-                ok = kanban_db.complete_task(
+-                    conn, task_id,
+-                    result=payload.result,
+-                    summary=payload.summary,
+-                    metadata=payload.metadata,
+-                )
++                try:
++                    ok = kanban_db.complete_task(
++                        conn, task_id,
++                        result=payload.result,
++                        summary=payload.summary,
++                        metadata=payload.metadata,
++                    )
++                except kanban_db.CompletionMetadataValidationError as exc:
++                    raise HTTPException(status_code=422, detail=str(exc))
+             elif s == "blocked":
+                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+             elif s == "scheduled":
+@@ -1185,12 +1188,17 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
+                 if payload.status is not None and not payload.archive:
+                     s = payload.status
+                     if s == "done":
+-                        ok = kanban_db.complete_task(
+-                            conn, tid,
+-                            result=payload.result,
+-                            summary=payload.summary,
+-                            metadata=payload.metadata,
+-                        )
++                        try:
++                            ok = kanban_db.complete_task(
++                                conn, tid,
++                                result=payload.result,
++                                summary=payload.summary,
++                                metadata=payload.metadata,
++                            )
++                        except kanban_db.CompletionMetadataValidationError as exc:
++                            entry.update(ok=False, error=str(exc))
++                            results.append(entry)
++                            continue
+                     elif s == "blocked":
+                         ok = kanban_db.block_task(conn, tid)
+                     elif s == "ready":
