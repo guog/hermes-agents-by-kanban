@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/command/with-contenv bash
 set -euo pipefail
 
 for profile in dispatcher prd-writer fde; do

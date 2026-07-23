@@ -112,7 +112,7 @@ assert "./schemas:/opt/fleet/schemas:ro" in compose
 assert "./scripts:/opt/fleet/scripts:ro" in compose
 assert "./patches:/opt/fleet/patches:ro" in compose
 assert "./config:/opt/fleet/config:ro" in compose
-assert "/opt/fleet/vendor/current/bin:" in compose
+assert "PATH: /command:/opt/fleet/vendor/current/bin:" in compose
 for value in [
     "017-hermes-runtime-patch", "018-hermes-sdd-fleet",
     "021-hermes-sdd-gateways",
@@ -149,6 +149,9 @@ for value in [
     assert value in runtime_patch, f"runtime patch contract missing: {value}"
 
 start_gateways = (root / "scripts/start-profile-gateways.sh").read_text(encoding="utf-8")
+assert start_gateways.startswith("#!/command/with-contenv bash\n"), (
+    "Gateway bootstrap must import the s6 container environment"
+)
 assert "for profile in dispatcher prd-writer fde" in start_gateways
 assert "gateway start" in start_gateways
 
