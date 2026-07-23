@@ -1,0 +1,13 @@
+{
+  "apps": [
+    {
+      "name": "dispatcher",
+      "appId": "REPLACE_WITH_FEISHU_APP_ID",
+      "appSecret": "REPLACE_WITH_FEISHU_APP_SECRET",
+      "brand": "feishu",
+      "defaultAs": "bot",
+      "strictMode": "bot",
+      "users": []
+    }
+  ]
+}

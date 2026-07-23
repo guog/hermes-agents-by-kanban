@@ -1,0 +1,31 @@
+services:
+  hermes:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40}
+    pull_policy: missing
+    container_name: hermes-sdd
+    restart: unless-stopped
+    command: ["sleep", "infinity"]
+    environment:
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: "0.0.0.0"
+      # Change these three values before deployment. Rotate PASSWORD and SECRET
+      # together later so existing dashboard sessions are invalidated.
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: "admin"
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: "CHANGE_ME_BEFORE_DEPLOYMENT"
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: "CHANGE_ME_TO_A_RANDOM_SECRET_OF_AT_LEAST_32_BYTES"
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      PATH: /opt/tooling/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NOUS_API_KEY: ${NOUS_API_KEY:-}
+    ports:
+      - "0.0.0.0:${HERMES_DASHBOARD_PORT:-9119}:9119"
+    volumes:
+      - ${HERMES_DATA_DIR:-./data}:/opt/data
+      - ${PROJECTS_DIR:-./projects}:/workspace/projects
+      - ./tooling:/opt/tooling:ro
+      - ./templates:/opt/fleet/templates:ro
+      - ./schemas:/opt/fleet/schemas:ro
+    shm_size: 1gb

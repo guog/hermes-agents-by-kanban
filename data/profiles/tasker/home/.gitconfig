@@ -1,0 +1,5 @@
+[credential]
+	helper = !glab auth git-credential
+[user]
+	name = Hermes Tasker
+	email = tasker-bot@hermes.invalid
