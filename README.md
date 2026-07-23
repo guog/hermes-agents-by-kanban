@@ -351,6 +351,7 @@ HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH='<初始化脚本生成的scrypt hash>
 HERMES_DASHBOARD_BASIC_AUTH_SECRET='<独立32字节随机signing secret的base64>'
 
 FLEET_MODEL=<Hermes 支持的 provider/model>
+FLEET_MODEL_BASE_URL=<模型服务端点；OpenAI Codex 使用 https://chatgpt.com/backend-api/codex>
 <与所选模型对应的 API_KEY>=<模型服务密钥>
 
 GIT_COMMIT_NAME_PRD_WRITER="Hermes PRD Writer"

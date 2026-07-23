@@ -233,7 +233,7 @@ for value in [
     "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin",
     "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=", "HERMES_DASHBOARD_BASIC_AUTH_SECRET=",
     "TOOLING_VOLUME_NAME=hermes-sdd-tooling",
-    "FLEET_MODEL=", "OPENAI_API_KEY=", "FLEET_FORCE_CONFIG=0",
+    "FLEET_MODEL=", "FLEET_MODEL_BASE_URL=", "OPENAI_API_KEY=", "FLEET_FORCE_CONFIG=0",
     "GIT_COMMIT_EMAIL_PRD_WRITER=prd-writer-bot@hermes.invalid",
     "GIT_COMMIT_EMAIL_SPEC_WRITER=spec-writer-bot@hermes.invalid",
     "GIT_COMMIT_EMAIL_PLANNER=planner-bot@hermes.invalid",
@@ -245,6 +245,18 @@ assert "HERMES_BASE_IMAGE" not in env_example
 assert "GIT_COMMIT_NAME_FDE" not in env_example
 for forbidden in ["GITLAB_", "FEISHU_", "LARKSUITE_CLI_", "GATEWAY_API_PORT_", "FLEET_SYNC_SECRETS"]:
     assert forbidden not in env_example, f"root .env.example contains profile credential: {forbidden}"
+
+compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+for value in ["FLEET_MODEL: ${FLEET_MODEL:-}", "FLEET_MODEL_BASE_URL: ${FLEET_MODEL_BASE_URL:-}"]:
+    assert value in compose, f"Compose model environment contract missing: {value}"
+
+bootstrap = (root / "scripts/container-bootstrap.sh").read_text(encoding="utf-8")
+for value in ["config set model.provider", "config set model.default", "config set model.base_url"]:
+    assert value in bootstrap, f"model bootstrap contract missing: {value}"
+
+runtime_verifier = (root / "scripts/verify-runtime.sh").read_text(encoding="utf-8")
+for value in ["FLEET_MODEL_BASE_URL", 'model.get("base_url")']:
+    assert value in runtime_verifier, f"runtime model endpoint check missing: {value}"
 
 disabled_skills = {
     "ascii-video", "comfyui", "manim-video", "touchdesigner-mcp",

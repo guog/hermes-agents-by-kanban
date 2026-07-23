@@ -85,6 +85,10 @@ configure_model() {
       config set model.provider "${provider}" >/dev/null
     /command/s6-setuidgid hermes hermes -p "${profile}" \
       config set model.default "${model}" >/dev/null
+    if [[ -n "${FLEET_MODEL_BASE_URL:-}" ]]; then
+      /command/s6-setuidgid hermes hermes -p "${profile}" \
+        config set model.base_url "${FLEET_MODEL_BASE_URL}" >/dev/null
+    fi
   fi
 }
 
