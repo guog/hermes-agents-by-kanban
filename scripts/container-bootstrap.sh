@@ -5,6 +5,7 @@ umask 077
 fleet_root=/opt/fleet
 data_root=/opt/data
 profiles_root="${data_root}/profiles"
+skill_marker_root="${data_root}/.fleet/skills-v1"
 
 profiles=(
   dispatcher prd-writer fde spec-writer spec-reviewer planner
@@ -50,9 +51,34 @@ install_profile() {
   local profile=$1
   local source_dir="${fleet_root}/profiles/${profile}"
   local target_dir="${profiles_root}/${profile}"
+  local new_profile=0
+  local -a skill_init_args
+
+  if [[ -L "${target_dir}/config.yaml" ]]; then
+    echo "fleet bootstrap: existing config must not be a symbolic link: ${target_dir}/config.yaml" >&2
+    exit 65
+  elif [[ ! -e "${target_dir}/config.yaml" ]]; then
+    new_profile=1
+  elif [[ ! -f "${target_dir}/config.yaml" ]]; then
+    echo "fleet bootstrap: existing config is not a regular file: ${target_dir}/config.yaml" >&2
+    exit 65
+  fi
 
   install -d -m 0700 -o hermes -g hermes "${target_dir}" "${target_dir}/skills" \
     "${target_dir}/memories" "${target_dir}/home"
+  skill_init_args=(
+    --profile "${profile}"
+    --source "${source_dir}/skills"
+    --target "${target_dir}/skills"
+    --marker-root "${skill_marker_root}"
+    --owner hermes
+    --group hermes
+  )
+  if [[ ${new_profile} -eq 1 ]]; then
+    skill_init_args+=(--new-profile)
+  fi
+  python3 "${fleet_root}/scripts/initialize-profile-skills.py" "${skill_init_args[@]}"
+
   install -o hermes -g hermes -m 0640 "${source_dir}/SOUL.md" "${target_dir}/SOUL.md"
   install -o hermes -g hermes -m 0640 "${source_dir}/distribution.yaml" "${target_dir}/distribution.yaml"
   install -o hermes -g hermes -m 0640 "${source_dir}/profile.yaml" "${target_dir}/profile.yaml"
@@ -60,12 +86,6 @@ install_profile() {
   if [[ ! -f "${target_dir}/config.yaml" || "${FLEET_FORCE_CONFIG:-0}" == "1" ]]; then
     install -o hermes -g hermes -m 0640 "${source_dir}/config.yaml" "${target_dir}/config.yaml"
   fi
-
-  if [[ -d "${target_dir}/skills" ]]; then
-    find "${target_dir}/skills" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-  fi
-  cp -a "${source_dir}/skills/." "${target_dir}/skills/"
-  chown -R hermes:hermes "${target_dir}/skills"
 
   for context_file in MEMORY.md USER.md; do
     if [[ ! -f "${target_dir}/memories/${context_file}" ]]; then
@@ -172,6 +192,7 @@ if [[ ! -d "${profiles_root}" ]]; then
   exit 65
 fi
 chmod 0700 "${profiles_root}"
+install -d -m 0700 -o root -g root "${skill_marker_root}"
 for profile in "${profiles[@]}"; do
   install_profile "${profile}"
 done

@@ -320,3 +320,98 @@ diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/p
                      elif s == "blocked":
                          ok = kanban_db.block_task(conn, tid)
                      elif s == "ready":
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -433,8 +433,79 @@
+     if not existing:
+         return None
+     return _background_review_write_guard(name, existing["path"], action)
+-
+-
++
++
++_FLEET_EXISTING_SKILL_MUTATIONS = frozenset(
++    {"edit", "patch", "delete", "write_file", "remove_file"}
++)
++
++
++def _fleet_skill_mutation_guard(
++    action: str,
++    name: str,
++) -> Optional[Dict[str, Any]]:
++    """Protect immutable bundled Skills and the fleet role Skill boundary."""
++    if action not in _FLEET_EXISTING_SKILL_MUTATIONS:
++        return None
++
++    # The bundled manifest is the fixed Hermes revision's provenance source.
++    # If it cannot be read, fail closed instead of guessing that a Skill is
++    # locally owned and allowing an irreversible built-in mutation.
++    manifest = _skills_dir() / ".bundled_manifest"
++    try:
++        if not manifest.is_file():
++            raise OSError("manifest is missing")
++        manifest_text = manifest.read_text(encoding="utf-8")
++        manifest_names = {
++            line.split(":", 1)[0].strip()
++            for line in manifest_text.splitlines()
++            if line.strip()
++        }
++        if not manifest_names:
++            raise OSError("manifest is empty")
++        from tools import skill_usage
++        bundled = skill_usage.is_bundled(name)
++        if bundled != (name in manifest_names):
++            raise OSError("manifest changed during provenance check")
++    except Exception as exc:
++        logger.warning(
++            "fleet bundled Skill provenance unavailable for %s: %s",
++            name,
++            exc,
++        )
++        return {
++            "success": False,
++            "error": (
++                "Refusing to modify any existing Skill because bundled "
++                "provenance is unavailable. Restore the active Profile's "
++                ".bundled_manifest and retry."
++            ),
++            "_fleet_fail_closed": True,
++        }
++
++    if bundled:
++        return {
++            "success": False,
++            "error": (
++                f"Refusing {action} for Hermes bundled built-in Skill "
++                f"'{name}': built-in Skills are permanently immutable. "
++                "Create a differently named local Skill instead."
++            ),
++            "_fleet_builtin_immutable": True,
++        }
++
++    if action == "delete" and name.startswith("sdd-"):
++        return {
++            "success": False,
++            "error": (
++                f"Refusing delete for fleet role Skill '{name}'. Role Skills "
++                "may be edited after human approval but cannot be deleted."
++            ),
++            "_fleet_role_skill_protected": True,
++        }
++    return None
++
++
+ def _curator_consolidation_delete_guard(
+     name: str, absorbed_into: Optional[str]
+ ) -> Optional[Dict[str, Any]]:
+@@ -1355,5 +1426,9 @@
+     Returns JSON string with results.
+     """
++    fleet_guard = _fleet_skill_mutation_guard(action, name)
++    if fleet_guard is not None:
++        return json.dumps(fleet_guard, ensure_ascii=False)
++
+     preflight = _background_review_preflight(action, name)
+     if preflight is not None:
+         return json.dumps(preflight, ensure_ascii=False)

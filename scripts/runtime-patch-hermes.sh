@@ -8,6 +8,7 @@ tool_handler="${install_root}/tools/kanban_tools.py"
 dispatcher_db="${install_root}/hermes_cli/kanban_db.py"
 kanban_cli="${install_root}/hermes_cli/kanban.py"
 dashboard_api="${install_root}/plugins/kanban/dashboard/plugin_api.py"
+skill_manager="${install_root}/tools/skill_manager_tool.py"
 completion_validator=/opt/fleet/scripts/validate_card_completion.py
 completion_schema=/opt/fleet/schemas/card-completion.schema.json
 
@@ -19,6 +20,7 @@ test -w "${tool_handler}"
 test -w "${dispatcher_db}"
 test -w "${kanban_cli}"
 test -w "${dashboard_api}"
+test -w "${skill_manager}"
 
 version=$("${python_bin}" -c 'import hermes_cli; print(hermes_cli.__version__)')
 if [[ "${version}" != "0.19.0" ]]; then
@@ -36,7 +38,8 @@ fi
 
 "${python_bin}" - \
   "${tool_handler}" "${dispatcher_db}" "${kanban_cli}" \
-  "${dashboard_api}" "${completion_validator}" "${completion_schema}" <<'PY'
+  "${dashboard_api}" "${skill_manager}" \
+  "${completion_validator}" "${completion_schema}" <<'PY'
 import importlib.util
 import pathlib
 import sys
@@ -45,8 +48,9 @@ tool_source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 dispatcher_source = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 cli_source = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 dashboard_source = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
-validator_path = pathlib.Path(sys.argv[5])
-schema_path = pathlib.Path(sys.argv[6])
+skill_manager_source = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
+validator_path = pathlib.Path(sys.argv[6])
+schema_path = pathlib.Path(sys.argv[7])
 tool_required = (
     'profile != "dispatcher"',
     '_require_dispatcher_profile("kanban_create")',
@@ -70,10 +74,24 @@ dashboard_required = (
     "CompletionMetadataValidationError",
     "status_code=422",
 )
+skill_manager_required = (
+    "_FLEET_EXISTING_SKILL_MUTATIONS",
+    "skill_usage.is_bundled(name)",
+    "_fleet_fail_closed",
+    "manifest changed during provenance check",
+    "_fleet_builtin_immutable",
+    'action == "delete" and name.startswith("sdd-")',
+    "_fleet_role_skill_protected",
+    "_fleet_skill_mutation_guard(action, name)",
+)
 missing = [value for value in tool_required if value not in tool_source]
 missing += [value for value in dispatcher_required if value not in dispatcher_source]
 missing += [value for value in cli_required if value not in cli_source]
 missing += [value for value in dashboard_required if value not in dashboard_source]
+missing += [
+    value for value in skill_manager_required
+    if value not in skill_manager_source
+]
 if missing:
     raise SystemExit(f"fleet runtime patch verification failed: {missing}")
 

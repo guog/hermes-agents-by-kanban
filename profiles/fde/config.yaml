@@ -14,6 +14,8 @@ memory:
   memory_enabled: true
   user_profile_enabled: false
   write_approval: true
+curator:
+  prune_builtins: false
 skills:
   disabled: [ascii-video, comfyui, manim-video, touchdesigner-mcp, hyperframes, kanban-video-orchestrator, blender-mcp, gif-search, youtube-content, songwriting-and-ai-music, heartmula, songsee, audiocraft-audio-generation, openhue, minecraft-modpack-server, pokemon-player]
   external_dirs:

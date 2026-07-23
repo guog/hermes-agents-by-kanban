@@ -68,6 +68,7 @@ profiles=(
   plan-reviewer tasker task-reviewer coder tester code-reviewer
 )
 gateway_profiles=(dispatcher prd-writer fde)
+skill_marker_root=/opt/data/.fleet/skills-v1
 
 die() {
   echo "container runtime check: $*" >&2
@@ -85,6 +86,8 @@ is_gateway_profile() {
 version=$(/opt/hermes/.venv/bin/python -c 'import hermes_cli; print(hermes_cli.__version__)')
 [[ "${version}" == "0.19.0" ]] || die "expected Hermes 0.19.0, found ${version}"
 echo "container runtime check: Hermes 0.19.0"
+[[ -d "${skill_marker_root}" && ! -L "${skill_marker_root}" ]] || \
+  die "persistent Skill marker root is missing or unsafe"
 
 for profile in "${profiles[@]}"; do
   profile_root="/opt/data/profiles/${profile}"
@@ -93,6 +96,14 @@ for profile in "${profiles[@]}"; do
     [[ -r "${profile_root}/${file}" ]] || die "${profile} is missing ${file}"
   done
   [[ -d "${profile_root}/skills" ]] || die "${profile} is missing skills"
+  /command/s6-setuidgid hermes /bin/bash -c '[[ -w "$1" ]]' \
+    fleet-skill-check "${profile_root}/skills" || \
+    die "${profile} local Skill directory is not writable by hermes"
+  [[ -f "${skill_marker_root}/${profile}" && ! -L "${skill_marker_root}/${profile}" ]] || \
+    die "${profile} persistent Skill initialization marker is missing or unsafe"
+  [[ -s "${profile_root}/skills/.bundled_manifest" && \
+     ! -L "${profile_root}/skills/.bundled_manifest" ]] || \
+    die "${profile} bundled Skill provenance manifest is missing, empty or unsafe"
 
   service="/run/service/gateway-${profile}"
   if is_gateway_profile "${profile}"; then
@@ -109,6 +120,7 @@ echo "container runtime check: 12 profiles and 3 isolated Gateways"
 /opt/hermes/.venv/bin/python - <<'PY_CONFIG'
 import pathlib
 import os
+import re
 import yaml
 
 profiles = (
@@ -136,6 +148,28 @@ for profile in profiles:
         raise SystemExit(f"{profile}: terminal.home_mode must equal profile")
     if config.get("memory", {}).get("write_approval") is not True:
         raise SystemExit(f"{profile}: memory.write_approval must be true")
+    if config.get("skills", {}).get("write_approval") is not True:
+        raise SystemExit(f"{profile}: skills.write_approval must be true")
+    if config.get("curator", {}).get("prune_builtins") is not False:
+        raise SystemExit(f"{profile}: curator.prune_builtins must be false")
+    marker = pathlib.Path("/opt/data/.fleet/skills-v1") / profile
+    try:
+        payload = __import__("json").loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{profile}: persistent Skill marker is invalid") from exc
+    if (
+        set(payload) != {"schema_version", "profile", "role_skill"}
+        or payload.get("schema_version") != 1
+        or payload.get("profile") != profile
+        or not isinstance(payload.get("role_skill"), str)
+        or re.fullmatch(
+            r"sdd-[a-z0-9][a-z0-9._-]*", payload["role_skill"]
+        ) is None
+    ):
+        raise SystemExit(f"{profile}: persistent Skill marker contract is invalid")
+    role_entrypoint = path.parent / "skills" / payload["role_skill"] / "SKILL.md"
+    if not role_entrypoint.is_file() or role_entrypoint.is_symlink():
+        raise SystemExit(f"{profile}: persistent role Skill is missing or unsafe")
 
 dispatcher = yaml.safe_load(
     pathlib.Path("/opt/data/profiles/dispatcher/config.yaml").read_text(encoding="utf-8")
@@ -151,7 +185,7 @@ for key, value in expected.items():
     if kanban.get(key) != value:
         raise SystemExit(f"dispatcher: kanban.{key} must equal {value!r}")
 PY_CONFIG
-echo "container runtime check: fleet model endpoint, profile home, memory approval and Kanban policy"
+echo "container runtime check: model, approvals, persistent Skills, curator and Kanban policy"
 
 dashboard_service=""
 for candidate in /run/s6-rc/servicedirs/dashboard /run/service/dashboard; do
@@ -185,6 +219,7 @@ tool_handler=/opt/hermes/tools/kanban_tools.py
 dispatcher_db=/opt/hermes/hermes_cli/kanban_db.py
 kanban_cli=/opt/hermes/hermes_cli/kanban.py
 dashboard_api=/opt/hermes/plugins/kanban/dashboard/plugin_api.py
+skill_manager=/opt/hermes/tools/skill_manager_tool.py
 completion_validator=/opt/fleet/scripts/validate_card_completion.py
 completion_schema=/opt/fleet/schemas/card-completion.schema.json
 grep -qF 'profile != "dispatcher"' "${tool_handler}" || die "worker Kanban guard is missing"
@@ -195,6 +230,64 @@ grep -qF "AND created_by = 'dispatcher'" "${dispatcher_db}" || die "dispatcher c
 grep -qF "SDD_COMPLETION_SCHEMA_MARKER" "${dispatcher_db}" || die "formal completion kernel guard is missing"
 grep -qF "kanban: completion blocked:" "${kanban_cli}" || die "Kanban CLI completion guard is missing"
 grep -qF "status_code=422" "${dashboard_api}" || die "Dashboard completion guard is missing"
+grep -qF "_FLEET_EXISTING_SKILL_MUTATIONS" "${skill_manager}" || die "Skill mutation guard is missing"
+grep -qF "skill_usage.is_bundled(name)" "${skill_manager}" || die "bundled Skill provenance guard is missing"
+grep -qF "_fleet_fail_closed" "${skill_manager}" || die "bundled Skill provenance fail-closed guard is missing"
+grep -qF "_fleet_builtin_immutable" "${skill_manager}" || die "built-in Skill immutability guard is missing"
+grep -qF "_fleet_role_skill_protected" "${skill_manager}" || die "role Skill delete guard is missing"
+(cd /opt/hermes && /opt/hermes/.venv/bin/python - <<'PY_SKILL_GUARD'
+import json
+import pathlib
+
+from tools import skill_manager_tool, skill_usage
+
+profiles = (
+    "dispatcher", "prd-writer", "fde", "spec-writer", "spec-reviewer", "planner",
+    "plan-reviewer", "tasker", "task-reviewer", "coder", "tester", "code-reviewer",
+)
+mutations = ("edit", "patch", "delete", "write_file", "remove_file")
+for profile in profiles:
+    profile_root = pathlib.Path("/opt/data/profiles") / profile
+    skills_root = profile_root / "skills"
+    manifest_names = [
+        line.split(":", 1)[0].strip()
+        for line in (skills_root / ".bundled_manifest").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    if not manifest_names:
+        raise SystemExit(f"{profile}: bundled Skill manifest is empty")
+    skill_manager_tool.SKILLS_DIR = skills_root
+    skill_usage._skills_dir = lambda root=skills_root: root
+    bundled_name = manifest_names[0]
+    for action in mutations:
+        result = skill_manager_tool._fleet_skill_mutation_guard(
+            action, bundled_name
+        )
+        if not result or result.get("_fleet_builtin_immutable") is not True:
+            raise SystemExit(
+                f"{profile}: bundled Skill {action} was not rejected"
+            )
+
+    marker = json.loads(
+        (pathlib.Path("/opt/data/.fleet/skills-v1") / profile).read_text(
+            encoding="utf-8"
+        )
+    )
+    role_name = marker["role_skill"]
+    for action in ("edit", "patch", "write_file", "remove_file"):
+        if skill_manager_tool._fleet_skill_mutation_guard(action, role_name):
+            raise SystemExit(
+                f"{profile}: role Skill {action} should remain approval-capable"
+            )
+    deleted = skill_manager_tool._fleet_skill_mutation_guard(
+        "delete", role_name
+    )
+    if not deleted or deleted.get("_fleet_role_skill_protected") is not True:
+        raise SystemExit(f"{profile}: role Skill delete was not rejected")
+PY_SKILL_GUARD
+) || die "runtime Skill mutation guard behavior is invalid"
 [[ -x "${completion_validator}" ]] || die "completion metadata validator is not executable"
 validator_errors=""
 if validator_errors=$(printf '{}\n' | /opt/hermes/.venv/bin/python \
@@ -206,7 +299,7 @@ if validator_errors=$(printf '{}\n' | /opt/hermes/.venv/bin/python \
 fi
 grep -qF '$.worktree: is required' <<<"${validator_errors}" || die "completion validator did not require worktree"
 grep -qF '$.project_id: is required' <<<"${validator_errors}" || die "completion validator did not require project_id"
-echo "container runtime check: dispatcher-only graph and formal completion guards"
+echo "container runtime check: dispatcher graph, completion and Skill mutation guards"
 
 read_lock_value() {
   local section=$1 key=$2
@@ -236,6 +329,14 @@ expected_lock="glab=${glab_version};gitlab=${gitlab_skills_rev};lark-cli=${lark_
 [[ -f /opt/fleet/vendor/current/gitlab/skills/glab/SKILL.md ]] || die "GitLab Skill is missing"
 [[ -f /opt/fleet/vendor/current/lark/skills/lark-shared/SKILL.md ]] || die "lark-shared Skill is missing"
 [[ -f /opt/fleet/vendor/current/lark/skills/lark-im/SKILL.md ]] || die "lark-im Skill is missing"
+for external_skills in \
+  /opt/fleet/vendor/current/gitlab/skills \
+  /opt/fleet/vendor/current/lark/skills; do
+  if /command/s6-setuidgid hermes /bin/bash -c '[[ -w "$1" ]]' \
+      fleet-external-skill-check "${external_skills}"; then
+    die "external Skill directory must be read-only: ${external_skills}"
+  fi
+done
 echo "container runtime check: locked glab, lark-cli and Skills"
 
 /command/s6-setuidgid hermes python3 /opt/fleet/scripts/validate-profile-envs.py \

@@ -93,6 +93,8 @@ for value in [
     '_require_dispatcher_profile("kanban_create")',
     '_require_dispatcher_profile("kanban_link")',
     "AND created_by = 'dispatcher'", "status = 'ready'", "status = 'review'",
+    "_FLEET_EXISTING_SKILL_MUTATIONS", "skill_usage.is_bundled(name)",
+    "_fleet_builtin_immutable", "_fleet_role_skill_protected",
 ]:
     assert value in patch, f"worker Kanban handler guard incomplete: {value}"
 
@@ -146,7 +148,8 @@ for value in [
     "git -C \"${install_root}\" apply --reverse --check",
     "hermes-0.19.0-dispatcher-kanban-guard.patch", "dispatcher_required",
     "validate_card_completion.py", "CompletionMetadataValidationError",
-    "status_code=422",
+    "status_code=422", "skill_manager_tool.py",
+    "skill_manager_required", "_fleet_builtin_immutable",
 ]:
     assert value in runtime_patch, f"runtime patch contract missing: {value}"
 
@@ -183,12 +186,16 @@ for value in [
     "git config --global credential.helper '!glab auth git-credential'",
     "config set model.provider", "config set model.default",
     "FLEET_MODEL must use provider/model format",
+    "initialize-profile-skills.py", 'skill_marker_root="${data_root}/.fleet/skills-v1"',
+    "--new-profile", "--owner hermes", "--group hermes",
 ]:
     assert value in bootstrap, f"bootstrap isolation contract missing: {value}"
 for forbidden in [
     "write_profile_env", "validate_profile_env_file", "FLEET_SYNC_SECRETS",
     "lark-cli config init", "glab auth login", "GITLAB_TOKEN_DISPATCHER",
     "FEISHU_APP_ID_PRD_WRITER", "FEISHU_APP_ID_FDE", "GATEWAY_API_PORT_DISPATCHER",
+    'find "${target_dir}/skills"', 'cp -a "${source_dir}/skills/."',
+    'chown -R hermes:hermes "${target_dir}/skills"',
 ]:
     assert forbidden not in bootstrap, f"bootstrap must not persist or overwrite credentials: {forbidden}"
 identity_loop = re.search(r"for profile in ([^;]+); do\n\s+key=.*?GIT_COMMIT_NAME", bootstrap, re.S)
@@ -203,6 +210,13 @@ for value in [
     "completion metadata validator accepted an empty formal handoff",
     "$.worktree: is required",
     "$.project_id: is required",
+    "skill_marker_root=/opt/data/.fleet/skills-v1",
+    "local Skill directory is not writable by hermes",
+    "persistent role Skill is missing or unsafe",
+    "curator.prune_builtins must be false",
+    "_fleet_builtin_immutable",
+    "runtime Skill mutation guard behavior is invalid",
+    "external Skill directory must be read-only",
 ]:
     assert value in runtime_verifier, f"runtime verification missing: {value}"
 
@@ -227,6 +241,20 @@ for value in [
     "access_level != required",
 ]:
     assert value in validator, f"profile env validator contract missing: {value}"
+
+skill_initializer = (
+    root / "scripts/initialize-profile-skills.py"
+).read_text(encoding="utf-8")
+for value in [
+    "MARKER_SCHEMA_VERSION = 1", "_source_role_skill",
+    "_seed_role_skill", "new profile local Skill directory is not empty",
+    "existing profile migration requires exactly the bundled",
+    "persistent role Skill is missing; restore it before startup",
+    'return "preserved"', "os.link(temporary, marker)",
+]:
+    assert value in skill_initializer, (
+        f"persistent Skill initializer contract missing: {value}"
+    )
 
 deployment_initializer = (root / "scripts/init-deployment-env.sh").read_text(encoding="utf-8")
 for value in [
@@ -315,6 +343,13 @@ for profile in profiles:
     assert "OPENAI_API_KEY=" not in env_template, "model credentials remain deployment-level"
     assert "home_mode: profile" in config, f"profile home isolation missing: {profile}"
     assert "memory:\n" in config and "  write_approval: true" in config, f"memory approval missing: {profile}"
+    assert "curator:\n  prune_builtins: false" in config, (
+        f"curator must not prune built-ins: {profile}"
+    )
+    skills_block = config.split("skills:\n", 1)[1]
+    assert "  write_approval: true" in skills_block, (
+        f"Skill write approval missing: {profile}"
+    )
     if profile == "dispatcher":
         assert "dispatch_in_gateway: true" in config
         assert "auto_decompose: false" in config
@@ -392,6 +427,12 @@ readme = (root / "README.md").read_text(encoding="utf-8")
 for value in [
     "## 1. 总体介绍", "## 2. 流程设计", "## 3. 部署说明",
     "#### 1.3.1 Hermes 内置 Skill 边界", "skills.disabled",
+    "#### 1.3.2 Agent Skill 的永久数据边界",
+    "${HERMES_DATA_DIR}/profiles/<profile>/skills",
+    "/opt/data/.fleet/skills-v1/<profile>",
+    "pending/skills/", "curator.prune_builtins: false",
+    "不会同步或覆盖持久化 `skills/`",
+    "仓库中同名角色 Skill 的更新或删除不会改变运行环境",
     "一个共享分支", "一个 Draft MR", "artifact_digest", "sha=<checked_head>",
     "SPEC、PLAN、TASKS 各阶段最多返工 3 轮",
     "代码、测试、代码审查引起的代码返工合计最多 5 轮",
@@ -414,7 +455,7 @@ for value in [
     "sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40",
     "expected Hermes 0.19.0",
     "gateway_profiles=(dispatcher prd-writer fde)", "s6-svstat -o up",
-    "dispatcher-only graph and formal completion guards", ".tooling-lock", "--runtime-check",
+    "dispatcher graph, completion and Skill mutation guards", ".tooling-lock", "--runtime-check",
     "deployable read-only runtime checks passed", "Dashboard /api/status",
     "auth_required", "auth_providers", "memory.write_approval must be true",
     "validate-deployment-env.py", "git fsck --full",
