@@ -119,6 +119,7 @@ fleet_model = os.environ.get("FLEET_MODEL", "")
 if "/" not in fleet_model:
     raise SystemExit("FLEET_MODEL must use provider/model format")
 expected_provider, expected_model = fleet_model.split("/", 1)
+expected_base_url = os.environ.get("FLEET_MODEL_BASE_URL", "")
 for profile in profiles:
     path = pathlib.Path("/opt/data/profiles") / profile / "config.yaml"
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -129,6 +130,8 @@ for profile in profiles:
         raise SystemExit(f"{profile}: model.provider must equal {expected_provider!r}")
     if model.get("default") != expected_model:
         raise SystemExit(f"{profile}: model.default must equal {expected_model!r}")
+    if expected_base_url and model.get("base_url") != expected_base_url:
+        raise SystemExit(f"{profile}: model.base_url must equal {expected_base_url!r}")
     if config.get("terminal", {}).get("home_mode") != "profile":
         raise SystemExit(f"{profile}: terminal.home_mode must equal profile")
     if config.get("memory", {}).get("write_approval") is not True:
@@ -148,7 +151,7 @@ for key, value in expected.items():
     if kanban.get(key) != value:
         raise SystemExit(f"dispatcher: kanban.{key} must equal {value!r}")
 PY_CONFIG
-echo "container runtime check: fleet model, profile home, memory approval and Kanban policy"
+echo "container runtime check: fleet model endpoint, profile home, memory approval and Kanban policy"
 
 dashboard_service=""
 for candidate in /run/s6-rc/servicedirs/dashboard /run/service/dashboard; do
