@@ -167,6 +167,8 @@ for value in [
     ".lark-cli", "LARKSUITE_CLI_CONFIG_DIR", "LARKSUITE_CLI_DATA_DIR",
     "lark-cli config bind --source hermes --identity bot-only",
     "git config --global credential.helper '!glab auth git-credential'",
+    "config set model.provider", "config set model.default",
+    "FLEET_MODEL must use provider/model format",
 ]:
     assert value in bootstrap, f"bootstrap isolation contract missing: {value}"
 for forbidden in [
@@ -177,6 +179,14 @@ for forbidden in [
     assert forbidden not in bootstrap, f"bootstrap must not persist or overwrite credentials: {forbidden}"
 identity_loop = re.search(r"for profile in ([^;]+); do\n\s+key=.*?GIT_COMMIT_NAME", bootstrap, re.S)
 assert identity_loop and "fde" not in identity_loop.group(1), "FDE must not require Git identity"
+
+runtime_verifier = (root / "scripts/verify-runtime.sh").read_text(encoding="utf-8")
+for value in [
+    'expected_provider, expected_model = fleet_model.split("/", 1)',
+    'model.get("provider") != expected_provider',
+    'model.get("default") != expected_model',
+]:
+    assert value in runtime_verifier, f"runtime model verification missing: {value}"
 
 initializer = (root / "scripts/init-profile-envs.sh").read_text(encoding="utf-8")
 for value in [
