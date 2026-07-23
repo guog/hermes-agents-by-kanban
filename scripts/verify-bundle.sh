@@ -152,6 +152,9 @@ assert "for profile in dispatcher prd-writer fde" in start_gateways
 assert "gateway start" in start_gateways
 
 bootstrap = (root / "scripts/container-bootstrap.sh").read_text(encoding="utf-8")
+assert bootstrap.startswith("#!/command/with-contenv bash\n"), (
+    "container bootstrap must import the s6 container environment"
+)
 for value in [
     "gateway_profiles=(dispatcher prd-writer fde)",
     "validate-profile-envs.py", "--profiles-root", "--owner hermes",
