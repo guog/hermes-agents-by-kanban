@@ -56,6 +56,7 @@ python3 - "${repo_root}" <<'PY'
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import urllib.parse
 
@@ -389,7 +390,13 @@ for profile in profiles:
 
 missing = []
 pattern = re.compile(r"\[[^]]*\]\(([^)]+)\)")
-for source in root.rglob("*.md"):
+tracked_markdown = subprocess.run(
+    ["git", "-C", str(root), "ls-files", "-z", "--", "*.md"],
+    check=True,
+    capture_output=True,
+).stdout.decode("utf-8").split("\0")
+for relative in filter(None, tracked_markdown):
+    source = root / relative
     for raw_target in pattern.findall(source.read_text(encoding="utf-8")):
         target = raw_target.strip().split(maxsplit=1)[0].strip("<>")
         if target.startswith(("http://", "https://", "mailto:", "#")):
