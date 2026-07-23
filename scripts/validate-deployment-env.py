@@ -10,9 +10,11 @@ import binascii
 import os
 import pathlib
 import re
+import shlex
 import stat
 import subprocess
 import sys
+from collections.abc import Mapping
 
 
 EXPECTED_IMAGE = (
@@ -21,6 +23,11 @@ EXPECTED_IMAGE = (
 )
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+INTEGER_RE = re.compile(r"^[0-9]+$")
+RUNTIME_DIRECTORY_DEFAULTS = {
+    "HERMES_DATA_DIR": ".runtime/hermes",
+    "PROJECTS_DIR": ".runtime/projects",
+}
 
 
 class DeploymentEnvError(ValueError):
@@ -94,10 +101,120 @@ def _decode_base64(value: str, *, field: str) -> bytes:
         raise DeploymentEnvError(f"{field} must be valid base64") from exc
 
 
+def _parse_runtime_id(value: str, *, field: str) -> int:
+    if not INTEGER_RE.fullmatch(value):
+        raise DeploymentEnvError(f"{field} must be a non-negative decimal integer")
+    return int(value)
+
+
+def _runtime_path(
+    raw_value: str,
+    *,
+    field: str,
+    repo_root: pathlib.Path,
+) -> pathlib.Path:
+    if "\x00" in raw_value or "$" in raw_value:
+        raise DeploymentEnvError(f"{field} must be a literal filesystem path")
+    candidate = pathlib.Path(raw_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return pathlib.Path(os.path.abspath(candidate))
+
+
+def resolve_runtime_directories(
+    values: Mapping[str, str],
+    *,
+    repo_root: pathlib.Path,
+) -> dict[str, pathlib.Path]:
+    repo_root = pathlib.Path(os.path.abspath(repo_root))
+    home = pathlib.Path(os.path.abspath(pathlib.Path.home()))
+    resolved = {
+        key: _runtime_path(
+            values.get(key) or default,
+            field=key,
+            repo_root=repo_root,
+        )
+        for key, default in RUNTIME_DIRECTORY_DEFAULTS.items()
+    }
+    for key, path in resolved.items():
+        if path in {pathlib.Path(path.anchor), repo_root, home}:
+            raise DeploymentEnvError(
+                f"{key} resolves to unsafe broad directory {path}"
+            )
+    data_path = resolved["HERMES_DATA_DIR"]
+    projects_path = resolved["PROJECTS_DIR"]
+    if data_path == projects_path:
+        raise DeploymentEnvError("HERMES_DATA_DIR and PROJECTS_DIR must be different")
+    if data_path in projects_path.parents or projects_path in data_path.parents:
+        raise DeploymentEnvError(
+            "HERMES_DATA_DIR and PROJECTS_DIR must not contain one another"
+        )
+    return resolved
+
+
+def _validate_runtime_directory(
+    path: pathlib.Path,
+    *,
+    field: str,
+    expected_uid: int,
+    expected_gid: int,
+    initialize: bool,
+) -> None:
+    existed = path.exists() or path.is_symlink()
+    if not existed:
+        if not initialize:
+            raise DeploymentEnvError(
+                f"{field} does not exist: {path}; rerun scripts/init-deployment-env.sh"
+            )
+        path.mkdir(mode=0o700, parents=True)
+        path.chmod(0o700)
+
+    status = path.lstat()
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+        raise DeploymentEnvError(
+            f"{field} must be a real directory, not a symbolic link: {path}"
+        )
+    if status.st_uid != expected_uid or status.st_gid != expected_gid:
+        quoted_path = shlex.quote(str(path))
+        raise DeploymentEnvError(
+            f"{field} owner must be {expected_uid}:{expected_gid}, found "
+            f"{status.st_uid}:{status.st_gid}: {path}; stop Hermes, then run "
+            f"`sudo chown -R -- {expected_uid}:{expected_gid} {quoted_path}` and retry"
+        )
+    owner_bits = stat.S_IMODE(status.st_mode) & 0o700
+    if owner_bits != 0o700:
+        quoted_path = shlex.quote(str(path))
+        raise DeploymentEnvError(
+            f"{field} owner requires read/write/execute permissions: {path}; "
+            f"run `chmod 0700 -- {quoted_path}` and retry"
+        )
+
+
+def validate_runtime_directories(
+    values: Mapping[str, str],
+    *,
+    repo_root: pathlib.Path,
+    expected_uid: int,
+    expected_gid: int,
+    initialize: bool = False,
+) -> dict[str, pathlib.Path]:
+    paths = resolve_runtime_directories(values, repo_root=repo_root)
+    for field, path in paths.items():
+        _validate_runtime_directory(
+            path,
+            field=field,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            initialize=initialize,
+        )
+    return paths
+
+
 def validate_deployment_env(
     env_path: pathlib.Path,
     *,
     expected_uid: int,
+    expected_gid: int | None = None,
     allow_force_config: bool = False,
 ) -> dict[str, str]:
     try:
@@ -120,6 +237,10 @@ def validate_deployment_env(
         "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
         "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
         "FLEET_FORCE_CONFIG",
+        "HERMES_DATA_DIR",
+        "PROJECTS_DIR",
+        "PUID",
+        "PGID",
     )
     missing = [key for key in required if not values.get(key)]
     if missing:
@@ -158,6 +279,12 @@ def validate_deployment_env(
         raise DeploymentEnvError("FLEET_FORCE_CONFIG must be 0 or 1")
     if values["FLEET_FORCE_CONFIG"] != "0" and not allow_force_config:
         raise DeploymentEnvError("FLEET_FORCE_CONFIG must be restored to 0 before runtime acceptance")
+    runtime_uid = _parse_runtime_id(values["PUID"], field="PUID")
+    runtime_gid = _parse_runtime_id(values["PGID"], field="PGID")
+    if runtime_uid != expected_uid:
+        raise DeploymentEnvError("PUID must equal the deployment user UID")
+    if expected_gid is not None and runtime_gid != expected_gid:
+        raise DeploymentEnvError("PGID must equal the deployment user primary GID")
     return values
 
 
@@ -181,20 +308,42 @@ def main() -> int:
     parser.add_argument("--env-file", type=pathlib.Path, required=True)
     parser.add_argument("--allow-force-config", action="store_true")
     parser.add_argument("--print-bundle-ref", action="store_true")
+    directory_action = parser.add_mutually_exclusive_group()
+    directory_action.add_argument("--initialize-runtime-dirs", action="store_true")
+    directory_action.add_argument("--check-runtime-dirs", action="store_true")
+    parser.add_argument("--repo-root", type=pathlib.Path)
     args = parser.parse_args()
     try:
         values = validate_deployment_env(
             args.env_file,
             expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
             allow_force_config=args.allow_force_config,
         )
+        if args.initialize_runtime_dirs or args.check_runtime_dirs:
+            if args.repo_root is None:
+                raise DeploymentEnvError(
+                    "--repo-root is required when checking runtime directories"
+                )
+            validate_runtime_directories(
+                values,
+                repo_root=args.repo_root,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                initialize=args.initialize_runtime_dirs,
+            )
     except (OSError, DeploymentEnvError) as exc:
         print(f"deployment env validation: {exc}", file=sys.stderr)
         return 65
     if args.print_bundle_ref:
         print(values["FLEET_BUNDLE_REF"])
     else:
-        print("deployment env validation: image digest and hashed dashboard auth are valid")
+        message = "deployment env validation: image digest and hashed dashboard auth are valid"
+        if args.initialize_runtime_dirs:
+            message += "; persistent runtime directories are initialized"
+        elif args.check_runtime_dirs:
+            message += "; persistent runtime directories are valid"
+        print(message)
     return 0
 
 

@@ -188,6 +188,9 @@ for value in [
     "FLEET_MODEL must use provider/model format",
     "initialize-profile-skills.py", 'skill_marker_root="${data_root}/.fleet/skills-v1"',
     "--new-profile", "--owner hermes", "--group hermes",
+    "projects_root=/workspace/projects", "prepare_projects_root",
+    'chown -- "${PUID}:${PGID}" "${projects_root}"',
+    "mktemp -d", ".fleet-write-check.XXXXXX",
 ]:
     assert value in bootstrap, f"bootstrap isolation contract missing: {value}"
 for forbidden in [
@@ -196,6 +199,7 @@ for forbidden in [
     "FEISHU_APP_ID_PRD_WRITER", "FEISHU_APP_ID_FDE", "GATEWAY_API_PORT_DISPATCHER",
     'find "${target_dir}/skills"', 'cp -a "${source_dir}/skills/."',
     'chown -R hermes:hermes "${target_dir}/skills"',
+    'chmod 777 "${projects_root}"', 'chown -R -- "${PUID}:${PGID}" "${projects_root}"',
 ]:
     assert forbidden not in bootstrap, f"bootstrap must not persist or overwrite credentials: {forbidden}"
 identity_loop = re.search(r"for profile in ([^;]+); do\n\s+key=.*?GIT_COMMIT_NAME", bootstrap, re.S)
@@ -217,6 +221,8 @@ for value in [
     "_fleet_builtin_immutable",
     "runtime Skill mutation guard behavior is invalid",
     "external Skill directory must be read-only",
+    "projects workspace root is not writable by hermes",
+    "projects workspace is owned by and writable to hermes",
 ]:
     assert value in runtime_verifier, f"runtime verification missing: {value}"
 
@@ -261,6 +267,7 @@ for value in [
     "run this script interactively", "plugins.dashboard_auth.basic import hash_password",
     "openssl rand -base64 32", "FLEET_BUNDLE_REF", "chmod 0600",
     "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "set +x",
+    "--initialize-runtime-dirs", "--repo-root",
 ]:
     assert value in deployment_initializer, f"deployment initializer contract missing: {value}"
 assert "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=" not in deployment_initializer
@@ -270,6 +277,8 @@ for value in [
     "root .env mode must be 0600", "not a symbolic link", "FLEET_BUNDLE_REF",
     "scrypt", "dashboard signing secret", "plaintext dashboard password variable is forbidden",
     "FLEET_FORCE_CONFIG must be restored to 0", "locked Hermes 0.19.0 AMD64 digest",
+    "validate_runtime_directories", "HERMES_DATA_DIR and PROJECTS_DIR must not contain one another",
+    "PUID must equal the deployment user UID", "sudo chown -R --",
 ]:
     assert value in deployment_validator, f"deployment env validator contract missing: {value}"
 

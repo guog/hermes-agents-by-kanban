@@ -36,6 +36,10 @@ def valid_env_text(revision: str) -> str:
             f"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH='scrypt$16384$8$1${salt}${digest}'",
             f"HERMES_DASHBOARD_BASIC_AUTH_SECRET='{secret}'",
             "FLEET_FORCE_CONFIG=0",
+            "HERMES_DATA_DIR=.runtime/hermes",
+            "PROJECTS_DIR=.runtime/projects",
+            f"PUID={os.getuid()}",
+            f"PGID={os.getgid()}",
         ]
     ) + "\n"
 
@@ -116,6 +120,129 @@ class DeploymentEnvValidationTests(unittest.TestCase):
             with self.assertRaises(VALIDATOR.DeploymentEnvError) as caught:
                 VALIDATOR.validate_repository_lock(ROOT, values["FLEET_BUNDLE_REF"])
             self.assertIn("does not match", str(caught.exception))
+
+    def test_runtime_directories_are_initialized_once_and_preserve_contents(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir) / "bundle"
+            repo_root.mkdir()
+            values = {
+                "HERMES_DATA_DIR": ".runtime/hermes",
+                "PROJECTS_DIR": ".runtime/projects",
+            }
+            paths = VALIDATOR.validate_runtime_directories(
+                values,
+                repo_root=repo_root,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                initialize=True,
+            )
+            marker = paths["PROJECTS_DIR"] / "preserved.txt"
+            marker.write_text("keep", encoding="utf-8")
+            second = VALIDATOR.validate_runtime_directories(
+                values,
+                repo_root=repo_root,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                initialize=True,
+            )
+            self.assertEqual("keep", marker.read_text(encoding="utf-8"))
+            for path in second.values():
+                self.assertEqual(0o700, path.stat().st_mode & 0o777)
+
+    def test_runtime_directory_symlink_wrong_owner_and_mode_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir) / "bundle"
+            repo_root.mkdir()
+            data = pathlib.Path(temp_dir) / "data"
+            data.mkdir(mode=0o700)
+            target = pathlib.Path(temp_dir) / "target"
+            target.mkdir(mode=0o700)
+            projects = pathlib.Path(temp_dir) / "projects"
+            projects.symlink_to(target, target_is_directory=True)
+            values = {
+                "HERMES_DATA_DIR": str(data),
+                "PROJECTS_DIR": str(projects),
+            }
+            with self.assertRaises(VALIDATOR.DeploymentEnvError) as caught:
+                VALIDATOR.validate_runtime_directories(
+                    values,
+                    repo_root=repo_root,
+                    expected_uid=os.getuid(),
+                    expected_gid=os.getgid(),
+                )
+            self.assertIn("not a symbolic link", str(caught.exception))
+
+            projects.unlink()
+            projects.mkdir(mode=0o700)
+            with self.assertRaises(VALIDATOR.DeploymentEnvError) as caught:
+                VALIDATOR.validate_runtime_directories(
+                    values,
+                    repo_root=repo_root,
+                    expected_uid=os.getuid() + 1,
+                    expected_gid=os.getgid(),
+                )
+            self.assertIn("owner must be", str(caught.exception))
+
+            data.chmod(0o500)
+            with self.assertRaises(VALIDATOR.DeploymentEnvError) as caught:
+                VALIDATOR.validate_runtime_directories(
+                    values,
+                    repo_root=repo_root,
+                    expected_uid=os.getuid(),
+                    expected_gid=os.getgid(),
+                )
+            self.assertIn("read/write/execute", str(caught.exception))
+
+    def test_runtime_directory_broad_equal_and_nested_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir) / "bundle"
+            repo_root.mkdir()
+            cases = (
+                (
+                    {
+                        "HERMES_DATA_DIR": str(repo_root),
+                        "PROJECTS_DIR": str(pathlib.Path(temp_dir) / "projects"),
+                    },
+                    "unsafe broad directory",
+                ),
+                (
+                    {
+                        "HERMES_DATA_DIR": ".runtime",
+                        "PROJECTS_DIR": ".runtime",
+                    },
+                    "must be different",
+                ),
+                (
+                    {
+                        "HERMES_DATA_DIR": ".runtime",
+                        "PROJECTS_DIR": ".runtime/projects",
+                    },
+                    "must not contain one another",
+                ),
+            )
+            for values, message in cases:
+                with self.subTest(message=message):
+                    with self.assertRaises(VALIDATOR.DeploymentEnvError) as caught:
+                        VALIDATOR.resolve_runtime_directories(
+                            values,
+                            repo_root=repo_root,
+                        )
+                    self.assertIn(message, str(caught.exception))
+
+    def test_runtime_ids_must_match_deployment_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            text = valid_env_text(current_revision()).replace(
+                f"PUID={os.getuid()}",
+                f"PUID={os.getuid() + 1}",
+            )
+            env_path = self.write_env(pathlib.Path(temp_dir), text)
+            with self.assertRaises(VALIDATOR.DeploymentEnvError) as caught:
+                VALIDATOR.validate_deployment_env(
+                    env_path,
+                    expected_uid=os.getuid(),
+                    expected_gid=os.getgid(),
+                )
+            self.assertIn("PUID must equal", str(caught.exception))
 
 
 if __name__ == "__main__":

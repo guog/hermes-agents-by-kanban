@@ -249,12 +249,22 @@ class RuntimeShellTests(unittest.TestCase):
                     f"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH='scrypt$16384$8$1${salt}${digest}'",
                     f"HERMES_DASHBOARD_BASIC_AUTH_SECRET='{secret}'",
                     "FLEET_FORCE_CONFIG=0",
+                    "HERMES_DATA_DIR=.runtime/hermes",
+                    "PROJECTS_DIR=.runtime/projects",
+                    f"PUID={os.getuid()}",
+                    f"PGID={os.getgid()}",
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
         deployment_env.chmod(0o600)
+        for runtime_dir in (
+            bundle / ".runtime" / "hermes",
+            bundle / ".runtime" / "projects",
+        ):
+            runtime_dir.mkdir(parents=True)
+            runtime_dir.chmod(0o700)
         docker = fake_bin / "docker"
         docker.write_text(
             textwrap.dedent(

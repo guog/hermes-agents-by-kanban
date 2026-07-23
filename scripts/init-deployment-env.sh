@@ -124,5 +124,7 @@ PY
 
 unset password_hash signing_secret
 "${repo_root}/scripts/validate-deployment-env.py" \
-  --env-file "${env_file}"
-echo "deployment env initialization: root .env created with hashed dashboard authentication"
+  --env-file "${env_file}" \
+  --repo-root "${repo_root}" \
+  --initialize-runtime-dirs
+echo "deployment env initialization: root .env and writable persistent runtime directories are ready"

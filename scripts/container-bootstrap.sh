@@ -6,6 +6,7 @@ fleet_root=/opt/fleet
 data_root=/opt/data
 profiles_root="${data_root}/profiles"
 skill_marker_root="${data_root}/.fleet/skills-v1"
+projects_root=/workspace/projects
 
 profiles=(
   dispatcher prd-writer fde spec-writer spec-reviewer planner
@@ -24,7 +25,7 @@ require_env() {
 validate_environment() {
   local profile key failed=0
 
-  for key in FLEET_MODEL; do
+  for key in FLEET_MODEL PUID PGID; do
     require_env "${key}" || failed=1
   done
   if [[ -n "${FLEET_MODEL:-}" ]]; then
@@ -45,6 +46,54 @@ validate_environment() {
     echo "fleet bootstrap: fix the deployment .env and restart the container" >&2
     exit 64
   fi
+}
+
+prepare_projects_root() {
+  local expected_uid expected_gid actual_uid actual_gid probe
+
+  [[ "${PUID}" =~ ^[0-9]+$ ]] || {
+    echo "fleet bootstrap: PUID must be a non-negative decimal integer" >&2
+    exit 65
+  }
+  [[ "${PGID}" =~ ^[0-9]+$ ]] || {
+    echo "fleet bootstrap: PGID must be a non-negative decimal integer" >&2
+    exit 65
+  }
+  expected_uid=$(id -u hermes)
+  expected_gid=$(id -g hermes)
+  [[ "${expected_uid}" == "${PUID}" && "${expected_gid}" == "${PGID}" ]] || {
+    echo "fleet bootstrap: hermes identity does not match PUID:PGID ${PUID}:${PGID}" >&2
+    exit 65
+  }
+  [[ -d "${projects_root}" && ! -L "${projects_root}" ]] || {
+    echo "fleet bootstrap: ${projects_root} must be a real mounted directory" >&2
+    exit 65
+  }
+
+  actual_uid=$(stat -c %u "${projects_root}")
+  actual_gid=$(stat -c %g "${projects_root}")
+  if [[ "${actual_uid}:${actual_gid}" != "${PUID}:${PGID}" ]]; then
+    chown -- "${PUID}:${PGID}" "${projects_root}"
+  fi
+  chmod 0700 "${projects_root}"
+
+  actual_uid=$(stat -c %u "${projects_root}")
+  actual_gid=$(stat -c %g "${projects_root}")
+  [[ "${actual_uid}:${actual_gid}" == "${PUID}:${PGID}" ]] || {
+    echo "fleet bootstrap: could not assign ${projects_root} to hermes ${PUID}:${PGID}" >&2
+    exit 65
+  }
+  probe=$(
+    /command/s6-setuidgid hermes \
+      mktemp -d "${projects_root}/.fleet-write-check.XXXXXX"
+  ) || {
+    echo "fleet bootstrap: ${projects_root} is not writable by hermes" >&2
+    exit 65
+  }
+  /command/s6-setuidgid hermes rmdir -- "${probe}" || {
+    echo "fleet bootstrap: could not remove projects write probe ${probe}" >&2
+    exit 65
+  }
 }
 
 install_profile() {
@@ -187,6 +236,7 @@ scrub_container_environment() {
 }
 
 validate_environment
+prepare_projects_root
 if [[ ! -d "${profiles_root}" ]]; then
   echo "fleet bootstrap: ${profiles_root} is missing; run ./scripts/init-profile-envs.sh on the host" >&2
   exit 65

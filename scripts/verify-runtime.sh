@@ -28,6 +28,8 @@ if [[ -n $(git status --porcelain) ]]; then
 fi
 bundle_ref=$("${repo_root}/scripts/validate-deployment-env.py" \
   --env-file "${repo_root}/.env" \
+  --repo-root "${repo_root}" \
+  --check-runtime-dirs \
   --print-bundle-ref) || fail "root deployment environment is invalid"
 [[ $(git rev-parse HEAD) == "${bundle_ref}" ]] || fail "deployed checkout HEAD does not match FLEET_BUNDLE_REF"
 echo "runtime verification: fixed bundle ref, image digest and hashed dashboard auth are valid"
@@ -69,6 +71,7 @@ profiles=(
 )
 gateway_profiles=(dispatcher prd-writer fde)
 skill_marker_root=/opt/data/.fleet/skills-v1
+projects_root=/workspace/projects
 
 die() {
   echo "container runtime check: $*" >&2
@@ -88,6 +91,18 @@ version=$(/opt/hermes/.venv/bin/python -c 'import hermes_cli; print(hermes_cli._
 echo "container runtime check: Hermes 0.19.0"
 [[ -d "${skill_marker_root}" && ! -L "${skill_marker_root}" ]] || \
   die "persistent Skill marker root is missing or unsafe"
+[[ -d "${projects_root}" && ! -L "${projects_root}" ]] || \
+  die "projects workspace root is missing or unsafe"
+projects_uid=$(stat -c %u "${projects_root}")
+projects_gid=$(stat -c %g "${projects_root}")
+[[ "${projects_uid}" == "$(id -u hermes)" && \
+   "${projects_gid}" == "$(id -g hermes)" ]] || \
+  die "projects workspace root owner does not match hermes"
+/command/s6-setuidgid hermes /bin/bash -c \
+  '[[ -r "$1" && -w "$1" && -x "$1" ]]' \
+  fleet-projects-check "${projects_root}" || \
+  die "projects workspace root is not writable by hermes"
+echo "container runtime check: projects workspace is owned by and writable to hermes"
 
 for profile in "${profiles[@]}"; do
   profile_root="/opt/data/profiles/${profile}"

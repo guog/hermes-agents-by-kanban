@@ -366,6 +366,8 @@ git status --short
 
 脚本要求仓库干净且 `git fsck` 通过，自动写入当前完整 commit、`PUID`/`PGID`、默认 Dashboard 用户名 `admin`，并交互式读取用户指定的初始密码。密码只经标准输入传给锁定镜像中的 Hermes `hash_password()`；根 `.env` 仅保存单引号包裹的 scrypt hash 和 `openssl rand -base64 32` 生成的独立 signing secret。脚本不会把明文密码写入文件、日志或命令行参数，并把根 `.env` 固定为普通文件、权限 `0600`。
 
+同一脚本还会在 `docker compose up` 前解析并初始化 `HERMES_DATA_DIR`、`PROJECTS_DIR`：两者必须是不同且互不包含的真实目录，由当前部署用户的 `PUID:PGID` 所有，目录所有者具备读、写、执行权限。新目录使用 `0700`；已有内容不会被覆盖或递归改权。这样可以避免 Docker 在 bind mount 源路径不存在时以 root 创建 `PROJECTS_DIR`，导致首次 `spec-writer` 无法创建 `/workspace/projects` 下的 checkout/worktree。
+
 使用该 UID 对应的宿主用户执行后续初始化，不要用 `sudo` 创建 profile 凭据文件。
 
 至少配置：
@@ -502,9 +504,10 @@ docker compose up -d
 1. `tooling-sync` 下载并验证锁定工具，写入 named volume 后退出 0。
 2. `hermes` 启动，确认版本精确为 0.19.0 并幂等应用 Kanban guard patch。
 3. bootstrap 安装 12 个 profiles；为新 Profile 初始化一次角色 Skill，为已有 Profile 建立不覆盖的迁移标记，并验证角色 Skill 仍存在。
-4. 为五个 producer 配置独立 Git commit identity。
-5. 验证 12 个 GitLab 身份和 3 个飞书身份，将三个飞书 `.env` 绑定到各自 lark-cli 加密存储。
-6. s6 启动 dispatcher、prd-writer、fde 三个 Gateway，以及受 basic auth 保护的 Dashboard。
+4. bootstrap 将 `/workspace/projects` 挂载根的所有者和权限校准为 `hermes` 对应的 `PUID:PGID`，并以 `hermes` 身份创建、删除一次临时目录验证可写；不会递归修改已有项目内容。
+5. 为五个 producer 配置独立 Git commit identity。
+6. 验证 12 个 GitLab 身份和 3 个飞书身份，将三个飞书 `.env` 绑定到各自 lark-cli 加密存储。
+7. s6 启动 dispatcher、prd-writer、fde 三个 Gateway，以及受 basic auth 保护的 Dashboard。
 
 若 `tooling-sync` 失败，Hermes 不会启动。先修复网络或锁文件问题，不要绕过 checksum。
 
@@ -524,6 +527,7 @@ docker compose up -d
 - Linux AMD64、运行容器确实使用锁定 manifest digest，Compose service 正常。
 - Hermes 0.19.0、Kanban guard、内置 Skill 修改保护、锁定 tooling 均正确。
 - 12 个 profiles 存在，本地 Skill 目录可写、初始化标记和角色 Skill 存在，`home_mode: profile`、Memory/Skill 写审批和 `curator.prune_builtins=false` 生效；三个 Gateway running，九个 worker 未启动 Gateway。
+- 宿主 `PROJECTS_DIR` 由部署 `PUID:PGID` 所有，容器 `/workspace/projects` 由 `hermes` 所有且具备读、写、执行权限。
 - 12 个 GitLab API 身份不同且角色精确匹配；所有 profile 的 GitLab host/allowlist 一致。
 - 三个 lark-cli 状态目录独立且权限正确。
 - Dashboard s6 service running，`/api/status` 返回 `auth_required=true` 且 `auth_providers` 包含 `basic`；宿主端口只绑定 `127.0.0.1:9119`。
@@ -801,6 +805,7 @@ docker compose down -v
 | Dashboard status 未显示 basic | hash/signing secret 未注入或 Dashboard 未以 `0.0.0.0` 绑定 | 检查 Compose 三个 basic auth 变量，禁止改用明文密码或 `--insecure` |
 | `tooling-sync` 下载失败 | 无法访问 GitHub、GitLab.com、npm 或 TLS/代理错误 | 修复容器网络/CA/代理；不要绕过 checksum |
 | profile `.env` owner/mode 失败 | 用 sudo 初始化、PUID 不匹配、文件为软链接 | 用部署 UID 修正所有者，目录设 `0700`、文件设 `0600`，替换软链接为普通文件 |
+| 首次 `spec-writer` 无法写 `/workspace/projects` | Docker 在 bind mount 源目录缺失时以 root 创建了 `PROJECTS_DIR`，或目录的 `PUID:PGID` 与部署用户不一致 | 停止 Hermes，按 `init-deployment-env.sh` 输出的精确路径执行 `sudo chown -R -- <PUID>:<PGID> <PROJECTS_DIR>`，再运行初始化脚本并重启；禁止用 `chmod 777` |
 | token/app 重复 | 多个 profile 复制了同一秘密 | 为每个 profile/App 创建独立凭据，修改后重启 |
 | 根 `.env` 缺 `FLEET_MODEL` 或 commit identity | 共享部署参数未填 | 填写根 `.env`，不要把它们移入 profile `.env` |
 | Gateway stopped/failed | 飞书 App 未发布、权限/事件缺失、App Secret 错误或端口冲突 | 检查三个 App、事件和 profile 日志，再重启 Hermes |
