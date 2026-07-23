@@ -154,6 +154,8 @@ assert start_gateways.startswith("#!/command/with-contenv bash\n"), (
 )
 assert "for profile in dispatcher prd-writer fde" in start_gateways
 assert "gateway start" in start_gateways
+assert "gateway status" in start_gateways
+assert "for attempt in 1 2 3 4 5" in start_gateways
 
 bootstrap = (root / "scripts/container-bootstrap.sh").read_text(encoding="utf-8")
 assert bootstrap.startswith("#!/command/with-contenv bash\n"), (
