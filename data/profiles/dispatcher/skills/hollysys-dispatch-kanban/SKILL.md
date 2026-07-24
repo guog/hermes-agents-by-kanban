@@ -1,7 +1,7 @@
 ---
-name: sdd-dispatch-kanban
-description: 在白名单 GitLab 项目中启动、恢复并合并单 PRD 单 MR 的交付运行
-version: 0.4.0
+name: hollysys-dispatch-kanban
+description: 当收到正式 PRD 交付启动、恢复、状态查询或合并请求时，编排单 PRD 单 MR 流程。
+version: 0.5.0
 ---
 
 # SDD Kanban 调度器
@@ -77,15 +77,15 @@ version: 0.4.0
 
 | 承担者（Assignee） | Skills |
 | --- | --- |
-| dispatcher | `sdd-dispatch-kanban`, `glab`, `lark-shared`, `lark-im` |
-| spec-writer | `sdd-write-spec`, `glab` |
-| spec-reviewer | `sdd-review-spec`, `glab` |
-| planner | `sdd-write-plan`, `glab` |
-| plan-reviewer | `sdd-review-plan`, `glab` |
-| tasker | `sdd-create-tasks`, `glab` |
-| task-reviewer | `sdd-analyze-tasks`, `glab` |
-| coder | `sdd-implement`, `glab` |
-| tester | `sdd-test`, `glab` |
-| code-reviewer | `sdd-review-code`, `glab` |
+| dispatcher | `hollysys-dispatch-kanban`, `glab`, `lark-shared`, `lark-im` |
+| spec-writer | `hollysys-write-spec`, `glab` |
+| spec-reviewer | `hollysys-review-spec`, `glab` |
+| planner | `hollysys-write-plan`, `glab` |
+| plan-reviewer | `hollysys-review-plan`, `glab` |
+| tasker | `hollysys-create-tasks`, `glab` |
+| task-reviewer | `hollysys-analyze-tasks`, `glab` |
+| coder | `hollysys-implement`, `glab` |
+| tester | `hollysys-test`, `glab` |
+| code-reviewer | `hollysys-review-code`, `glab` |
 
 只有在缺少必需的受理身份、需求互相矛盾且不存在能保留验收语义的安全选择、发生 `capability`/凭据/环境故障，或预算耗尽时，才能阻断流程，并给出明确的人类操作。仅有 PRD 歧义不能作为阻断理由。正式交付中绝不得创建 GitLab Task work item，也绝不得运行第二个飞书入站消费者。

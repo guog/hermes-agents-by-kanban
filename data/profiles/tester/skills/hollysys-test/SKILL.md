@@ -1,7 +1,7 @@
 ---
-name: sdd-test
-description: 测试单 PRD 交付 MR 准确的当前头提交，并发布可复现的证据
-version: 0.3.0
+name: hollysys-test
+description: 当 Kanban 卡要求独立测试时，验证唯一交付 MR 的准确当前 head 并发布可复现证据。
+version: 0.4.0
 ---
 
 # 测试交付头提交

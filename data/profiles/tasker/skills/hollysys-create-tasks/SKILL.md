@@ -1,7 +1,7 @@
 ---
-name: sdd-create-tasks
-description: 在共享交付分支上编写完整且一一对应的 TASKS 集合
-version: 0.3.0
+name: hollysys-create-tasks
+description: 当 SPEC 与 PLAN 已批准时，为 Kanban 卡生成稳定、无环、可追溯的 TASKS DAG。
+version: 0.4.0
 ---
 
 # 创建 TASKS 集合

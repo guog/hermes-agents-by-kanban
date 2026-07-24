@@ -1,7 +1,7 @@
 ---
-name: sdd-review-spec
-description: 审查完整的 SPEC 集合，并在共享 MR 上发布绑定摘要的门禁
-version: 0.3.0
+name: hollysys-review-spec
+description: 当 Kanban 卡要求审查 SPEC 时，验证完整性与可测试性并发布绑定摘要的门禁。
+version: 0.4.0
 ---
 
 # 审查 SPEC 集合

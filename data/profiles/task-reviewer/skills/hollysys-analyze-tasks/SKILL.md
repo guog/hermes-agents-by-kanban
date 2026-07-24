@@ -1,7 +1,7 @@
 ---
-name: sdd-analyze-tasks
-description: 审查完整的 SPEC、PLAN、TASKS 映射并发布绑定摘要的门禁
-version: 0.3.0
+name: hollysys-analyze-tasks
+description: 当 Kanban 卡要求审查 TASKS 时，核对 SPEC/PLAN 映射、DAG、覆盖与验收并发布门禁。
+version: 0.4.0
 ---
 
 # 审查 TASKS 集合

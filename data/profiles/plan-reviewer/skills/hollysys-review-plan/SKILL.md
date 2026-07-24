@@ -1,7 +1,7 @@
 ---
-name: sdd-review-plan
-description: 审查完整的 PLAN 集合，并在共享 MR 上发布绑定摘要的门禁
-version: 0.3.0
+name: hollysys-review-plan
+description: 当 Kanban 卡要求审查 PLAN 时，核对 SPEC、仓库约束与可执行性并发布门禁。
+version: 0.4.0
 ---
 
 # 审查 PLAN 集合

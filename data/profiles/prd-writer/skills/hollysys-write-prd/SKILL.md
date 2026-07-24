@@ -1,7 +1,7 @@
 ---
-name: sdd-write-prd
-description: 在飞书中与人类协作并准备可审查的 PRD MR，但不启动交付
-version: 0.2.0
+name: hollysys-write-prd
+description: 当人类需要把业务输入整理为可审查 PRD 时，协作编写并提交 PRD MR，不启动交付。
+version: 0.3.0
 ---
 
 # 编写 PRD

@@ -1,7 +1,7 @@
 ---
-name: sdd-review-code
-description: 审查单 PRD 交付 MR 中经过测试的准确头提交，并发布正确性门禁
-version: 0.3.0
+name: hollysys-review-code
+description: 当 Kanban 卡要求代码审查时，审查已测试的准确 MR head 并发布正确性门禁。
+version: 0.4.0
 ---
 
 # 审查交付头提交

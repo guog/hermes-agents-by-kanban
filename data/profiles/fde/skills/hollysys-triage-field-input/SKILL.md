@@ -1,7 +1,7 @@
 ---
-name: sdd-triage-field-input
-description: 在飞书中协作，将现场证据分类、脱敏并记录为普通 GitLab Issue
-version: 0.2.0
+name: hollysys-triage-field-input
+description: 当收到现场缺陷、功能或环境反馈时，分类、脱敏并记录为普通 GitLab Issue。
+version: 0.3.0
 ---
 
 # 分诊现场输入

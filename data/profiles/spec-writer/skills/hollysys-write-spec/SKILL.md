@@ -1,7 +1,7 @@
 ---
-name: sdd-write-spec
-description: 在共享交付分支上为一个 PRD 编写或返工完整的 SPEC 集合
-version: 0.3.0
+name: hollysys-write-spec
+description: 当 Kanban 卡要求编写或返工 SPEC 时，在唯一共享 MR 生成完整可测试的 SPEC 集。
+version: 0.4.0
 ---
 
 # 编写 SPEC 集合

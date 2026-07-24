@@ -1,7 +1,7 @@
 ---
-name: sdd-implement
-description: 在唯一的共享 PRD 交付 MR 上实现或返工所有已批准的 TASKS
-version: 0.3.0
+name: hollysys-implement
+description: 当 Kanban 卡要求实现或返工时，在唯一共享 MR 完成已批准 TASKS 及测试。
+version: 0.4.0
 ---
 
 # 实现 PRD

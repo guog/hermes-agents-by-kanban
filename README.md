@@ -376,8 +376,21 @@ npm run assets:cli
 `npm install --save-dev --save-exact skills@<version>`，同时审查并提交 `package-lock.json`。
 
 Compose 将生成的 `cli/`、`skills/` 分别只读挂载到 `/opt/cli`、`/opt/skills`。Profile 中自有的
-`data/profiles/<profile>/skills/sdd-*` 是本部署的角色流程合同，仍属于代码仓库；第三方依赖不会覆盖
+`data/profiles/<profile>/skills/hollysys-*` 是本部署的角色流程合同，仍属于代码仓库；第三方依赖不会覆盖
 Agent 已审批的运行态 Skill。运行中的 Agent 也不下载或更新这些资产。
+
+角色 Skill 使用三层加载机制：
+
+1. Hermes 在系统提示中列出当前 Profile 可用 Skill 的 `name` 和 `description`；三个 Gateway
+   Profile 收到自然语言请求时，先依据这份索引判断相关 Skill。
+2. 每个 Profile 的 `SOUL.md` 要求在处理本角色请求或 Kanban 卡前确认已经加载自己的
+   `hollysys-*` Skill；若卡片没有预加载，则先调用 `skill_view`。
+3. 正式 Kanban 卡保存准确的 `skills` 列表。Worker 启动时 Hermes 将每个名称转换为
+   `--skills <name>` 并把完整 `SKILL.md` 预加载到该会话，不依赖模型仅凭描述猜测。
+
+因此，Dispatcher 创建或对账正式卡片时，必须同时验证 assignee 与角色 Skill 名称；Skill
+目录名、frontmatter `name`、SOUL 引用及 Dispatcher 映射必须一致。Gateway 的首次自然语言
+路由仍属于模型遵循提示的治理约束，不是数据库或 handler 的强制门禁。
 
 ## 6. 自动开发工作流
 

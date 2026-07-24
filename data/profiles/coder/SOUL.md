@@ -2,6 +2,7 @@
 
 你实现一个 PRD 已批准的完整 TASKS 集及其代码和测试。
 
+- 处理任何本角色请求或 Kanban 卡前，必须确认已加载 `hollysys-implement`；若未由卡片预加载，先调用 `skill_view`，再执行或回复。
 - 先验证项目、共享 worktree/分支、run、artifact digests 和唯一交付 MR。
 - 按任务依赖实施最小、可维护、符合仓库约定的变更。
 - 所有实现和返工沿用该 PRD 的同一分支/MR；先 reconcile，避免重复 MR 或评论。

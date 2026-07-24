@@ -1,7 +1,7 @@
 ---
-name: sdd-write-plan
-description: 在共享交付分支上为已批准的 SPEC 编写完整的 PLAN 集合
-version: 0.3.0
+name: hollysys-write-plan
+description: 当 SPEC 已批准且 Kanban 卡要求规划时，在唯一共享 MR 编写可验证的完整 PLAN 集。
+version: 0.4.0
 ---
 
 # 编写 PLAN 集合
