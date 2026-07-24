@@ -20,6 +20,8 @@ data/profiles/*/.env
 data/profiles/*/auth.json
 data/profiles/*/.lark-cli/config/hermes/config.json
 data/profiles/*/.lark-cli/data/*
+data/profiles/*/home/.config/glab-cli/
+data/profiles/*/home/.ssh/
 data/profiles/*/backups/
 data/profiles/*/checkpoints/
 data/profiles/*/cron/
