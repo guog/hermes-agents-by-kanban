@@ -1,7 +1,7 @@
 ---
 name: sdd-dispatch-kanban
 description: 在白名单 GitLab 项目中启动、恢复并合并单 PRD 单 MR 的交付运行
-version: 0.3.0
+version: 0.4.0
 ---
 
 # SDD Kanban 调度器
@@ -30,7 +30,7 @@ version: 0.3.0
    - 创建父目录。只有 checkout 不存在时才 clone。只有首次准备、ref 缺失、已证实发生分歧、push 被拒绝或明确要求实时对账时才 fetch。
    - 验证 `base_sha^{commit}`。只有现有 worktree 的分支准确等于预期分支时才复用；否则依次从已有本地分支、已跟踪的远端分支或基准 SHA 创建。
    - 使用 `hermes -p dispatcher kanban boards create <board>` 创建或对账看板，并将项目显示名称和 checkout 分别用作看板名称信息和默认 workdir。
-7. 使用稳定的消息/运行幂等键、`tenant=run_key`、`created_by=dispatcher`、准确的 assignee/skills 和 v2 卡片模板创建一张 `run-init` 卡片。保留 `message_id`、`chat_id`、`thread_id` 和发起人信息，以便恢复。
+7. 使用稳定的消息/运行幂等键、`tenant=run_key`、`created_by=dispatcher`、准确的 assignee/skills 和 v2 卡片模板创建一张 `run-init` 卡片。保留 `message_id`、`chat_id`、`thread_id`、`chat_type` 和发起人 open_id。按卡片模板为 `run-init` 建立并验证由 `dispatcher` Gateway 投递的原渠道订阅；订阅失败时不启动后续工作。
 
 ## 卡片和门禁对账
 
@@ -48,9 +48,10 @@ version: 0.3.0
 1. 推导 `transition_key = <run_key>:<next-stage>:<iteration>`。按准确的 `idempotency_key` 对账卡片；绝不根据标题文本推断身份。
 2. 创建或复用工作卡 `W`，其键为 `<transition_key>:work`，stage/assignee/Skills 必须准确，`created_by=dispatcher`，且 parent 等于当前 dispatcher 门禁。
 3. 创建或复用 dispatcher 续接卡 `C`，其键为 `<transition_key>:continue`，assignee 为 `dispatcher`，且 parent 等于 `W`。`C` 只记录预期的父卡片/阶段和 `live_reconcile_required=true`。
-4. 验证两张卡片及两条父子关系。只有完成验证后，才能使用 `next_card_ids=[W,C]` 完成当前门禁。如果任一卡片创建/链接失败，保持当前门禁为 running 或 blocked，并使用相同键重试；不得完成门禁。
+4. 将当前 gate 的 `origin.feishu` 原样复制到 `W` 和 `C`；为两张卡分别建立 `platform=feishu`、`notifier_profile=dispatcher` 的原 `chat_id/thread_id/user_id` 订阅，并通过 `notify-list` 验证。然后验证两张卡片及两条父子关系。只有全部完成，才能在退订当前 gate 后使用 `next_card_ids=[W,C]` 完成当前门禁。如果任一卡片创建、链接或订阅失败，保持当前门禁为 running 或按“阻塞的人类闭环”处理，并使用相同键重试；不得完成门禁。
 5. 完成当前门禁只会将 `W` 提升为 `ready`。完成 `W` 会将 `C` 提升为 `ready`。`C` 必须读取 `W` 的完成元数据，依据 schema 验证，然后重新读取 GitLab 的项目、分支、MR、评论、流水线、讨论和当前头提交，之后才能决定下一组卡片对。对于历史遗留的无效交接，不创建任何内容，只接受经过审计的 `kanban edit` 回填或新的审查/工作卡片对；绝不得推断缺失字段或批准 schema 例外。
 6. 绝不得把预测的 `head_sha`、`artifact_digest`、审查结果、流水线结果或合并结果写入 `C`。未知的实时事实在 `C` 运行前保持 null。重复消息、dispatcher 重启和 worker 重试必须复用同一组卡片对。
+7. `W` 的完成元数据若为 `outcome=blocked`，`C` 只在存在相同 `block_id` 的有效 `[human-block:v1]` 与 `[human-resolution:v1]` 评论时继续。它必须创建新的同阶段 retry pair，并把脱敏答案和验证证据写入新工作卡；不得把 blocked 尝试当作 pass，也不得复用已完成的 `W`。
 
 每次转换都使用同一协议：编写、独立审查、任何设计/代码返工、测试、代码审查和合并。合并工作卡分配给 `dispatcher`，其后接一张 `run-complete` 续接卡；只有基于已检查头提交的合并卡完成后，`run-complete` 才会变为 ready。
 
@@ -62,6 +63,15 @@ version: 0.3.0
 4. 使用返回的 `merge_commit_sha` 发布一条幂等 MR 评论，其中包含永久的 PRD/SPEC/PLAN/TASKS blob 链接。
 5. 不使用舰队辅助脚本进行清理：只能根据已验证的项目 ID、repo slug 和运行键重新推导 checkout/worktree；要求 checkout 仍是预期的 Git 仓库；要求交付 MR 已合并且 worktree 没有未提交变更；然后依次运行 `git -C <checkout> worktree remove <worktree>` 和 `git -C <checkout> worktree prune`。绝不得递归删除推导出的路径。
 6. 完成运行并通知原渠道/话题；在群聊/话题回复中 @ 发起人。
+
+## 阻塞的人类闭环
+
+1. 每张正式卡从创建到正常完成前都必须具有原渠道订阅；`kanban.auto_subscribe_on_create=false`，因此 Dispatcher 必须显式建立并验证订阅。正常完成前退订；`kanban_block` 前绝不退订。
+2. `dependency` 用父子依赖等待，缺陷用 `fail`/`scope_gap` 返工。只有 `needs_input`、`capability` 或需要人类确认重试时机的 `transient` 才按 `/opt/fleet/templates/kanban-card.md` 写 `[human-block:v1]` 并真正 block。
+3. 阻塞 reason 在群聊/话题中必须包含 `<at user_id="<initiator_open_id>"></at>`、一个问题/动作和 `处理阻塞 <run_key> <card-id> ...` 的回复格式；完整证据只放 Kanban 评论。Notifier 会使用订阅中的原 `chat_id/thread_id` 发送。
+4. 收到 `处理阻塞` 或对阻塞通知的自然语言答复时，先核对 sender、chat/thread、run、card、block_id 和当前状态。只有原发起人可以恢复；答复不满足 `resume_check` 时继续在原话题给出一个明确的下一步，不修改任务状态。
+5. 答复通过后写幂等 `[human-resolution:v1]` 评论。对有合法 continuation 的 worker 卡，退订并以 `outcome=blocked` 的完整 v2 handoff 完成旧尝试，让 continuation 创建新的 retry pair；对没有 continuation 的 blocked dispatcher gate，先创建并订阅稳定的 `<block-id>:resume` Dispatcher 恢复卡，再完成旧 gate 释放它。禁止直接盲目 `kanban_unblock`，也禁止更改旧证据。
+6. 在原话题 @ 发起人确认已记录内容、验证、恢复阶段和新卡；重复消息只返回现状。人类要求取消、扩大范围或修改已批准验收时，先明确影响并按取消/新 PRD 流程处理，不能伪装成普通恢复。
 
 创建的每张卡片都要设置准确的 assignee 和 Skill 列表：
 

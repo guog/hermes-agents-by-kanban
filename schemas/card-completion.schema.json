@@ -83,10 +83,54 @@
       "items": {"type": "string"},
       "uniqueItems": true
     },
+    "block_id": {
+      "type": "string",
+      "pattern": "^sdd-[a-z2-7]{20}:t_[A-Za-z0-9_-]+:[1-9][0-9]*$"
+    },
+    "block_kind": {
+      "type": "string",
+      "enum": ["needs_input", "capability", "transient"]
+    },
+    "human_resolution_message_id": {
+      "type": "string",
+      "pattern": "^om_[A-Za-z0-9_-]+$"
+    },
+    "human_resolution_by": {
+      "type": "string",
+      "pattern": "^ou_[A-Za-z0-9_-]+$"
+    },
     "retry_notes": {"type": ["string", "null"]},
     "residual_risk": {"type": "array", "items": {"type": "string"}}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {"const": "blocked"}
+        },
+        "required": ["outcome"]
+      },
+      "then": {
+        "$comment": "A blocked completion is the audited handoff after a human resolution, not the initial kanban_block call.",
+        "required": [
+          "block_id",
+          "block_kind",
+          "human_resolution_message_id",
+          "human_resolution_by",
+          "retry_notes",
+          "next_card_ids"
+        ],
+        "properties": {
+          "retry_notes": {"type": "string", "minLength": 1},
+          "next_card_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"},
+            "uniqueItems": true
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {

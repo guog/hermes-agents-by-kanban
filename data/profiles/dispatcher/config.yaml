@@ -37,6 +37,9 @@ kanban:
   dispatch_interval_seconds: 20
   failure_limit: 3
   auto_decompose: false
+  # Formal SDD cards manage subscriptions explicitly: subscribe while a card
+  # is in flight, remove before normal completion, retain on blocked.
+  auto_subscribe_on_create: false
   auto_promote_children: true
   orchestrator_profile: dispatcher
   default_assignee: dispatcher

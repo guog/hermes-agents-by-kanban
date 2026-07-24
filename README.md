@@ -170,7 +170,7 @@ chmod 600 data/profiles/dispatcher/.env
 
 ### 3.3 lark-cli
 
-三个 Gateway 使用 lark-cli 主动回复和发送完成/暂停通知。分别复制：
+三个 Gateway 使用 lark-cli 主动回复。正式 SDD 的 blocked/crash/timeout 首条通知由 Hermes 官方 Kanban notifier 按持久订阅投递，Dispatcher 的后续引导仍回到同一飞书会话；不启动第二个入站消费者。分别复制：
 
 ```bash
 cp \
@@ -363,6 +363,36 @@ G 只有在 W、C 和依赖都核对完成后才能结束。W 完成后 C 重新
 - Merge 必须使用 GitLab checked-head 参数 `sha=<checked_head>`。
 - completion metadata 按 `schemas/card-completion.schema.json` 自检；卡片正文不能代替顶层字段。
 
+### 6.6 Blocked 的原渠道人类闭环
+
+正式 SDD 卡不使用 Hermes 的“创建即自动订阅”；`dispatcher` 配置了 `kanban.auto_subscribe_on_create: false`，以避免每个正常阶段都向人类发送完成通知。Dispatcher 在释放一张新卡前，显式将该卡订阅到启动 run 的原飞书 `chat_id/thread_id`，并指定 `notifier_profile=dispatcher`。正常完成前退订；卡片 crash、超时或真正 blocked 时保留订阅。
+
+人类阻塞只用于三类情况：
+
+- `needs_input`：证据互相冲突，必须由发起人作出业务决定。
+- `capability`：缺少权限、凭据、环境或只能由人执行的动作。
+- `transient`：自动重试不再安全，需要人确认何时再试。
+
+普通依赖使用 Kanban 父子关系，缺陷使用 `fail`/`scope_gap` 返工，不能滥用 blocked。Worker 阻塞前先在卡片写入幂等 `[human-block:v1]` 评论，包含脱敏证据、一个问题/动作、可选答案和恢复校验条件；随后保留订阅并调用 typed `kanban_block`。飞书通知由官方 Gateway notifier 回到原聊天/话题，并在 reason 中使用发起人的 `open_id` 真实 mention：
+
+```text
+@发起人 自动交付在 <stage> 暂停：<一个问题或动作>。
+请回复本消息并 @dispatcher：
+处理阻塞 <run_key> <card-id> <答案/已完成动作>
+```
+
+Dispatcher 只接受原发起人在原 `chat_id/thread_id` 的答复。它会读取完整阻塞评论；答案不足时继续给出一个明确下一步，不改变 Kanban。答案或外部修复通过 `resume_check` 后，Dispatcher 写入 `[human-resolution:v1]` 审计评论，并通过已有 continuation 或一张稳定的 Dispatcher 恢复卡续跑。
+
+正式流程不直接盲目 `kanban_unblock` 同一卡：旧 blocked 尝试以 `outcome=blocked` 的完整 v2 handoff 结束，continuation 创建新的同阶段 retry pair。这样既保留每次尝试/人类答复，也避开官方同卡反复 unblock 后转入 `triage` 的循环保护。重复答复以 `block_id + message_id` 幂等返回现状；飞书里禁止发送 token、密码或原始敏感日志。
+
+部署后必须用真实飞书和 Kanban 做一次受控验收，不能用静态检查代替：
+
+1. 从 A 群 @dispatcher 启动 run，强制一张 worker 卡以 `needs_input` 阻塞。
+2. 确认通知只回到 A 群原话题、真实 @ 原发起人，且包含 run/card 和可执行回复格式。
+3. 用非发起人、错误话题和不完整答案分别回复，确认不会恢复。
+4. 由原发起人给出有效答案，确认形成一对 block/resolution 评论、旧尝试完成、新 retry pair 自动运行。
+5. 重放同一回复，确认不创建重复恢复卡；再验证 `capability`、Gateway 重启以及飞书临时发送失败后的恢复。
+
 ## 7. 官方镜像零修改的安全边界
 
 本部署保留业务流程，但不再包含原来的 Hermes 运行时补丁，因此必须客观区分配置约束和硬门禁：
@@ -378,8 +408,9 @@ G 只有在 W、C 和依赖都核对完成后才能结束。W 完成后 C 重新
 - dispatcher 只调度 `created_by=dispatcher` 卡片的 SQL 过滤。
 - CLI、Dashboard、Tool 对 completion metadata 的统一强制校验。
 - bundled/角色 Skill 的 fleet 定制不可变保护。
+- 正式卡必须订阅原渠道、blocked 前必须写结构化评论、只有原发起人可以恢复等人类闭环契约。
 
-因此，这是一套“官方镜像 + 配置/Skill 治理”的自动化流程，不应再宣称具备定制补丁提供的防恶意 Profile 硬隔离。Profile 不等于文件系统 sandbox；令牌最小权限、独立凭据、人工审批和 GitLab protected branch 仍是必要边界。
+官方 Gateway notifier 负责订阅游标、原 `chat_id/thread_id` 投递和终态事件去重；如果飞书适配器不可用，它会重试，但消息渠道持续故障、人工从 Dashboard 直接创建的未订阅卡、或不遵守 Skill 的 Profile 仍可能没有人类通知。因此，这是一套“官方镜像 + 配置/Skill 治理”的自动化流程，不应再宣称具备定制补丁提供的强制通知或防恶意 Profile 硬隔离。Profile 不等于文件系统 sandbox；令牌最小权限、独立凭据、人工审批、Gateway 监控和 GitLab protected branch 仍是必要边界。
 
 ## 8. 备份与旧部署迁移
 

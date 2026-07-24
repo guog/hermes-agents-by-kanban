@@ -9,7 +9,7 @@
 状态 <run_key>
 暂停 <run_key>
 继续 <run_key>
-重试 <kanban-card-id>
+处理阻塞 <run_key> <kanban-card-id> <答案或已完成动作>
 取消 <run_key>
 ```
 
@@ -45,13 +45,33 @@ branch=<branch> mr=<draft-mr-or-pending> stage=<stage>
 
 ## 需要人类
 
+Kanban notifier 的首条 reason 必须控制在 160 字符内，并在群聊/话题中真实 mention 发起人：
+
 ```text
-自动交付已暂停，需要人类处理。
-run=<run_key> stage=<stage> card=<card-id>
-原因=<concise-reason>
-需要=<specific-action>
-GitLab/Kanban=<url-or-command-hint>
+<at user_id="<initiator_open_id>"></at> 自动交付在 <stage> 暂停：<一个问题或动作>。
+请回复本消息并 @dispatcher：处理阻塞 <run_key> <card-id> <答案/已完成动作>
 ```
+
+单聊省略 `<at>`。不要要求人类在飞书中发送 token、密码或原始敏感日志。
+
+Dispatcher 收到答复并核对完整 `[human-block:v1]` 评论后，按需要逐项引导：
+
+```text
+<at user_id="<initiator_open_id>"></at> 我还不能安全恢复 <card-id>。
+还缺=<一个明确答案、动作或可验证条件>
+请回复=<精确回复示例>
+```
+
+答复已验证并完成持久交接后：
+
+```text
+<at user_id="<initiator_open_id>"></at> 已记录并恢复自动交付。
+run=<run_key> resolved=<blocked-card-id> stage=<stage> next=<new-card-id>
+验证=<short-verification>
+如果再次遇到人类阻塞，我会继续在本话题 @你。
+```
+
+只有原 `initiator_open_id` 在原 `chat_id/thread_id` 的答复可以恢复。其他成员的意见可记录为评论，但必须请原发起人确认；重复答复按 `block_id + message_id` 返回当前状态，不创建重复恢复卡。
 
 ## 全部完成
 
