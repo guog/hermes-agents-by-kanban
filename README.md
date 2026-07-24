@@ -111,7 +111,8 @@ chmod 600 .env
 
 - `PUID`、`PGID`：Ubuntu 部署用户的 UID/GID。
 - `HERMES_DASHBOARD_PORT`：Dashboard 在宿主机发布的端口，默认 `9119`。
-- 使用 API key 模型时需要的 provider key。
+- 默认 Codex OAuth 不需要填写 `OPENAI_API_KEY`。
+- 改用 OpenAI-compatible API 时填写 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`。
 
 Dashboard 通过 `0.0.0.0:${HERMES_DASHBOARD_PORT:-9119}` 发布。首次部署前，直接编辑
 `docker-compose.yaml` 中以下三个明文值：
@@ -186,13 +187,84 @@ chmod 600 data/profiles/dispatcher/.lark-cli/config/hermes/config.json
 
 `prd-writer` 和 `fde` 做同样处理。实际 `config.json` 已被 Git 忽略。
 
-### 3.4 模型和 Git identity
+### 3.4 模型、推理强度与认证
 
-按需要直接编辑每个 Profile 的 `config.yaml`：
+12 个 Profile 默认使用同一模型合同：
 
 ```yaml
-model: "provider/model"
+model:
+  provider: openai-codex
+  default: gpt-5.6-sol
+  base_url: https://chatgpt.com/backend-api/codex
+
+agent:
+  reasoning_effort: high
 ```
+
+`agent.reasoning_effort: high` 是 Agent 主模型的全局默认值，也由未显式设置推理强度的委派调用继承。它比 Hermes 未配置时的 `medium` 使用更多推理 token，并可能增加延迟和账户用量。该值不是不可覆盖的策略锁；会话内显式 `/reasoning` 的优先级更高。辅助任务保留各自的推理默认值。
+
+上游依据：[Hermes v2026.7.20 Reasoning Effort 文档](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/website/docs/user-guide/configuration.md#reasoning-effort)。
+
+#### 3.4.1 首选：Fleet 级 Codex OAuth
+
+先启动容器，再执行一次不带 `-p` 的根级设备码授权：
+
+```bash
+docker compose up -d
+docker compose exec -it hermes hermes auth add openai-codex
+```
+
+授权凭据写入容器 `/opt/data/auth.json`，对应宿主机 `data/auth.json`。该文件已被 Git 忽略，并随 `data/` 持久化。没有本地同 provider 凭据的 12 个 Profile 会读取这份全局凭据，因此不需要逐 Profile 登录。
+
+检查认证状态：
+
+```bash
+docker compose exec hermes hermes auth status openai-codex
+docker compose exec hermes hermes auth list openai-codex
+```
+
+首次授权或重新授权后重启容器，使三个 Gateway 从干净进程状态读取凭据：
+
+```bash
+docker compose restart hermes
+```
+
+全局登出会同时影响 12 个 Agent。`data/auth.json` 包含可刷新凭据，备份时必须加密或限制访问，禁止输出内容。若已有 `data/profiles/<profile>/auth.json`，其中的 Codex 凭据会覆盖该 Profile 的全局凭据；迁移时只检查认证状态，不打印 token，也不要未经确认自动删除已有凭据。
+
+上游依据：[Hermes v2026.7.20 AI Provider 文档](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/website/docs/integrations/providers.md#nous-portal)。
+
+#### 3.4.2 备用：OpenAI-compatible BaseURL + API Key
+
+API 模式是人工切换方案，不是 Codex 认证失败后的自动 fallback。先在实际根 `.env` 中填写：
+
+```dotenv
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_API_KEY=<实际 API Key>
+```
+
+再把全部 12 个 Profile 的 `model` 块统一切换；`agent.reasoning_effort: high` 保持不变：
+
+```yaml
+model:
+  provider: openai-api
+  default: deepseek-chat
+  base_url: ${OPENAI_BASE_URL}
+
+agent:
+  reasoning_effort: high
+```
+
+`deepseek-chat` 只是 OpenAI-compatible 示例，实际部署使用服务商提供的模型 ID。仅设置环境变量不会覆盖 Codex provider；必须统一修改 12 个 Profile，禁止不同 Profile 混用 OAuth 与 API Key。API Key 只写入被忽略的根 `.env`，不要写入 `config.yaml`、`docker-compose.yaml` 或文档。
+
+修改根 `.env` 后必须重建容器，`docker compose restart` 不会重新读取环境变量：
+
+```bash
+docker compose up -d --force-recreate hermes
+```
+
+如果兼容服务不接受 `high`，停止切换并报告兼容性问题，不要静默降低推理强度。
+
+#### 3.4.3 Git identity
 
 producer 的提交身份位于：
 
