@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "platform": "linux-amd64",
+  "skills": [
+    {
+      "id": "gitlab",
+      "group": "gitlab",
+      "repository": "https://gitlab.com/gitlab-org/ai/skills.git",
+      "revision": "933cee89fbbec511241cae0914e5112feda29ab2",
+      "skills": [
+        "glab"
+      ],
+      "licensePath": "LICENSE"
+    },
+    {
+      "id": "lark",
+      "group": "lark",
+      "repository": "https://github.com/larksuite/cli.git",
+      "revision": "d6cebd6723eb80e9e5761d34ccea9ab71e2f5a8d",
+      "skills": [
+        "lark-shared",
+        "lark-im"
+      ],
+      "licensePath": "LICENSE"
+    }
+  ],
+  "cli": [
+    {
+      "name": "glab",
+      "version": "1.108.0",
+      "url": "https://gitlab.com/gitlab-org/cli/-/releases/v1.108.0/downloads/glab_1.108.0_linux_amd64.tar.gz",
+      "format": "tar.gz",
+      "archiveSha256": "cb3eb9d6b05eedef24a028b52354f12fb9a07ecfa0b5581eb161176585bc8213",
+      "binaryName": "glab",
+      "installAs": "glab",
+      "binarySha256": "4be20481e18489e59c966206df09e3c1f61988a1d5bab76d2490f67312cd6e7f",
+      "licenseUrl": "https://gitlab.com/gitlab-org/cli/-/raw/v1.108.0/LICENSE"
+    },
+    {
+      "name": "lark-cli",
+      "version": "1.0.72",
+      "url": "https://github.com/larksuite/cli/releases/download/v1.0.72/lark-cli-1.0.72-linux-amd64.tar.gz",
+      "format": "tar.gz",
+      "archiveSha256": "395e6b7e99e106afe5de77750f65b6d40421c8fec8e885b7a971cdf7c5d39d02",
+      "binaryName": "lark-cli",
+      "installAs": "lark-cli",
+      "binarySha256": "0ef7e817c4bf5f3cdaf12a15169c7a076df3af63c6cd67e3c793dd159ec27305",
+      "licenseUrl": "https://raw.githubusercontent.com/larksuite/cli/d6cebd6723eb80e9e5761d34ccea9ab71e2f5a8d/LICENSE"
+    }
+  ]
+}

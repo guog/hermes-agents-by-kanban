@@ -1,0 +1,14 @@
+{
+  "name": "hermes-agents-by-kanban-assets",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Reproducible external Skill and CLI installation for the Hermes Kanban fleet",
+  "scripts": {
+    "assets:install": "node scripts/install-external-assets.mjs",
+    "assets:skills": "node scripts/install-external-assets.mjs --skills-only",
+    "assets:cli": "node scripts/install-external-assets.mjs --cli-only"
+  },
+  "devDependencies": {
+    "skills": "1.5.20"
+  }
+}

@@ -1,6 +1,6 @@
 # Hermes Kanban SDD Agent Fleet
 
-这是一套面向 Ubuntu Linux/AMD64 的 Hermes Agent 0.19.0 多 Agent 部署包。部署只运行官方 Hermes 镜像，通过 `docker-compose.yaml` 挂载本地目录；不构建定制镜像，不修改 `/opt/hermes`，不执行 fleet 初始化、运行时补丁或自动同步。部署管理员只在启动前手动运行外部资产下载脚本。
+这是一套面向 Ubuntu Linux/AMD64 的 Hermes Agent 0.19.0 多 Agent 部署包。部署只运行官方 Hermes 镜像，通过 `docker-compose.yaml` 挂载本地目录；不构建定制镜像，不修改 `/opt/hermes`，不执行 fleet 初始化、运行时补丁或自动同步。部署管理员只在启动前安装锁定的外部依赖。
 
 人类通过飞书启动一次正式交付，之后由 Hermes Kanban 持久调度：
 
@@ -27,6 +27,9 @@ Compose 只有一个 `hermes` service：
 .
 ├── docker-compose.yaml
 ├── .env.example
+├── external-assets.json        # 第三方 Skills 与 CLI 的唯一依赖清单
+├── package.json
+├── package-lock.json           # 锁定 skills CLI 及其 npm 依赖
 ├── data/                       # Hermes 的完整可写 /opt/data
 │   └── profiles/
 │       └── <profile>/
@@ -41,7 +44,7 @@ Compose 只有一个 `hermes` service：
 ├── cli/                        # 下载生成，不进 Git；Linux AMD64 CLI
 ├── skills/                     # 下载生成，不进 Git；GitLab/Lark 官方 Skills
 ├── scripts/
-│   └── fetch-external-assets.sh
+│   └── install-external-assets.mjs
 ├── templates/                  # 中文 SDD、MR、评论、Kanban card 模板
 └── schemas/                    # Agent 自检用 completion metadata schema
 ```
@@ -216,10 +219,12 @@ Dashboard 左侧 Profile 切换器决定当前查看哪个 Agent。选择 Profil
 
 ## 4. 启动与运维
 
-每次部署或升级前，先手动下载并校验外部 Skills 与 CLI，再启动：
+部署机需要 Node.js 22.20+、npm、git 和 tar；以后声明 ZIP 格式 CLI 时还需要 unzip。首次部署或
+`external-assets.json`、`package-lock.json` 发生变化后，先安装并校验外部 Skills 与 CLI，再启动：
 
 ```bash
-./scripts/fetch-external-assets.sh
+npm ci
+npm run assets:install
 docker compose up -d
 ```
 
@@ -257,27 +262,50 @@ docker compose exec hermes hermes -p dispatcher gateway start
 
 官方 Gateway 生命周期会把新的 desired state 写回本地目录。
 
-## 5. 锁定的外部 Skills 与 CLI
+## 5. 声明式外部 Skills 与 CLI
 
-Git 仓库不保存外部 Skills、CLI 二进制或其许可证副本。`scripts/fetch-external-assets.sh` 在部署机联网下载下列锁定版本：
+Git 仓库不保存第三方 Skill、CLI 二进制或许可证副本。所有第三方依赖只在
+`external-assets.json` 声明；通用安装器读取清单，在临时目录完成安装和校验后才整体替换本地
+`skills/` 或 `cli/`。
+
+当前锁定：
 
 | 工具 | 版本 |
 | --- | --- |
 | `glab` | 1.108.0 Linux AMD64 |
 | `lark-cli` | 1.0.72 Linux AMD64 |
-| GitLab `glab` Skill | revision `933cee89...` |
-| Lark `lark-shared`、`lark-im` Skills | revision `d6cebd67...` |
+| GitLab `glab` Skill | commit `933cee89...` |
+| Lark `lark-shared`、`lark-im` Skills | commit `d6cebd67...` |
 
-脚本执行过程：
+Skill 安装复用 [skills CLI](https://github.com/vercel-labs/skills)：
 
-1. 下载 Linux AMD64 的 `glab` 与 `lark-cli`，校验锁定 SHA-256。
-2. 按固定 commit 拉取 GitLab `glab` Skill 与 Lark `lark-shared`、`lark-im` Skills。
-3. 在临时目录完成全部校验后，整体替换仓库本地的 `cli/` 与 `skills/`。
-4. 生成本地 `MANIFEST.txt` 和许可证副本；这两个目录由 `.gitignore` 排除。
+1. 安装器按清单中的完整 commit SHA checkout 来源，避免部署时把可变分支当作锁。
+2. `skills@1.5.20` 从精确 checkout 发现并选择清单指定的 Skill，以 Universal、copy、非交互模式安装。
+3. 生成 `/opt/skills/<group>/<skill>/SKILL.md` 所需的标准目录；来源 commit 与安装器版本均由 Git 中的清单锁定。
 
-Compose 将 `cli/`、`skills/` 分别只读挂载到 `/opt/cli`、`/opt/skills`。Profile 中自有的 `data/profiles/<profile>/skills/sdd-*` 是本部署的角色流程合同，仍属于代码仓库；下载目录只承载两个第三方 Skill 来源。
+CLI 使用同一份清单的通用条目；每项声明版本、Linux AMD64 下载 URL、归档格式、归档与二进制
+SHA-256、安装名和许可证 URL。安装器目前支持 `tar.gz`、ZIP 和直接二进制，不再为某个工具编写专用下载逻辑。
 
-升级版本或 revision 时，必须同时更新脚本中的锁定值与校验值，人工审查上游变更后再部署。运行中的 Agent 不下载或更新这些资产。
+只更新一类依赖时可以运行：
+
+```bash
+npm run assets:skills
+npm run assets:cli
+```
+
+引入新的第三方 Skill：
+
+1. 先用 `npm exec skills -- add <source> --list` 查看上游可安装项并人工审查。
+2. 在 `external-assets.json.skills` 增加来源、完整 commit SHA、分组、Skill 名和许可证路径。
+3. 运行 `npm run assets:skills`；不修改安装器代码。
+
+引入新的 CLI 时，只在 `external-assets.json.cli` 增加一个通用条目并运行
+`npm run assets:cli`。升级 skills CLI 本身时使用
+`npm install --save-dev --save-exact skills@<version>`，同时审查并提交 `package-lock.json`。
+
+Compose 将生成的 `cli/`、`skills/` 分别只读挂载到 `/opt/cli`、`/opt/skills`。Profile 中自有的
+`data/profiles/<profile>/skills/sdd-*` 是本部署的角色流程合同，仍属于代码仓库；第三方依赖不会覆盖
+Agent 已审批的运行态 Skill。运行中的 Agent 也不下载或更新这些资产。
 
 ## 6. 自动开发工作流
 
@@ -419,7 +447,7 @@ Dispatcher 只接受原发起人在原 `chat_id/thread_id` 的答复。它会读
 - 完整 `data/`：Kanban DB、profiles、sessions、memories、skills、pending approval、Gateway 和 lark-cli 状态。
 - 完整 `projects/`：checkout、共享 worktree 和本地未推送状态。
 - 根 `.env` 和各 Profile `.env` 应进入单独的秘密备份，不进入 Git。
-- `cli/` 与 `skills/` 是可重建下载物，不需要备份；恢复时重新运行下载脚本。
+- `cli/` 与 `skills/` 是可重建下载物，不需要备份；恢复时运行 `npm ci && npm run assets:install`。
 
 从旧脚本式部署迁移：
 
@@ -427,7 +455,7 @@ Dispatcher 只接受原发起人在原 `chat_id/thread_id` 的答复。它会读
 2. 将旧 `HERMES_DATA_DIR` 内容复制到新的 `data/`，保留现有 `.env`、Memory、Skill、session、pending 和 Kanban 数据。
 3. 将旧 `PROJECTS_DIR` 作为新的 `PROJECTS_DIR`，或复制到 `projects/`。
 4. 用本部署的 `config.yaml`、SOUL/角色 Skill 逐项人工合并，不覆盖已经批准的运行态 Memory/Skill。
-5. 不迁移旧 tooling named volume 或仓库内二进制；运行 `./scripts/fetch-external-assets.sh` 生成新的 `cli/` 与 `skills/`。
+5. 不迁移旧 tooling named volume 或仓库内二进制；运行 `npm ci && npm run assets:install` 生成新的 `cli/` 与 `skills/`。
 6. 启动新 Compose。旧补丁位于旧容器镜像可写层，不会进入新官方镜像容器。
 
-本仓库不提供自动迁移、运行时同步或部署验证脚本；只提供需要管理员主动执行的外部资产下载与校验脚本。
+本仓库不提供自动迁移、运行时同步或部署验证脚本；只提供管理员主动执行的声明式外部依赖安装器。
