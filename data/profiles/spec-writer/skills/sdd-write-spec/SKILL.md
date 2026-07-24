@@ -1,20 +1,20 @@
 ---
 name: sdd-write-spec
-description: Write or rework the complete SPEC set for one PRD on its shared delivery branch
+description: 在共享交付分支上为一个 PRD 编写或返工完整的 SPEC 集合
 version: 0.2.1
 ---
 
-# Write SPEC set
+# 编写 SPEC 集合
 
-## Fleet-wide execution rules
+## 全体 Agent 执行规则
 
-- Perform GitLab project, repository-metadata, MR, pipeline, discussion and comment operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal `git` commands explicitly required by this Skill remain allowed for worktree inspection, commit and push.
-- The card's designated Hermes shared `worktree` is the only editable working copy of the Agent-owned delivery branch. Do not run routine `git fetch origin` or pull loops after dispatcher reconciliation. Fetch only to recover missing refs/worktree, investigate a proven local/remote head mismatch or rejected push, or satisfy `live_reconcile_required`; record the reason. Use local `git rev-parse`/`git status` for worktree state and `glab` for current MR state.
-- A PRD omission or ambiguity is not by itself `needs_input`. Decide from explicit acceptance/constraints, current repository behavior and conventions, approved upstream artifacts, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. Before first MR creation, put every handed-off pre-MR decision and every critical SPEC decision directly in the `## 关键自主决策` section of `/opt/fleet/templates/mr-description.md`; on SPEC rework update that same section instead of posting an initial decision comment. Record non-critical assumptions in the SPEC or completion evidence. Escalate only contradictory evidence with no safe acceptance-preserving choice, or a genuine permission, credential or capability failure.
+- GitLab 项目、仓库元数据、MR、流水线、讨论和评论操作只能通过锁定版本的 `glab` CLI 或已安装的官方 `glab` Skill 完成。不得改用原始 HTTP/`curl`、临时 SDK、浏览器或人工 UI 操作。本 Skill 为检查 worktree、commit 和 push 而明确要求的常规 `git` 命令仍可使用。
+- 卡片指定的 Hermes 共享 `worktree` 是 Agent 所属交付分支唯一可编辑的工作副本。dispatcher 完成对账后，不要例行运行 `git fetch origin` 或循环拉取。只有在恢复缺失的 ref/worktree、调查已证实的本地/远端头提交不一致或 push 被拒绝，或满足 `live_reconcile_required` 时才能 fetch，并记录原因。使用本地 `git rev-parse`/`git status` 判断 worktree 状态，使用 `glab` 获取当前 MR 状态。
+- PRD 存在遗漏或歧义，本身不等于 `needs_input`。应依次根据明确的验收条件/约束、当前仓库行为和约定、已批准的上游产物、兼容性/安全性作出判断，并选择最小且可逆的范围。若决策影响用户可见的范围/验收、公共接口、数据/迁移、安全/权限、兼容性、恢复/回滚或必需的测试/门禁，则属于关键决策。首次创建 MR 前，将交接过来的所有 MR 创建前决策和每项关键 SPEC 决策直接写入 `/opt/fleet/templates/mr-description.md` 的 `## 关键自主决策` 章节；SPEC 返工时更新同一章节，不要发布初始决策评论。非关键假设记录在 SPEC 或完成证据中。只有当证据互相矛盾且不存在能保留验收语义的安全选择，或确实缺少权限、凭据或能力时，才上报。
 
-1. Call `kanban_show()` and require `created_by=dispatcher`; verify project ID/path, shared worktree/branch, exact PRD path/commit/MR and run key against GitLab. Never discover or clone another repository.
-2. Read the PRD at the exact commit. Split only into independently understandable and testable business scopes; define ordered keys, dependencies and a full PRD coverage matrix.
-3. Write every `docs/prds/<prd-basename>/specs/spec-<key>.md` from the Chinese `/opt/fleet/templates/spec-template.md`. Keys are stable lowercase kebab-case. Replace every placeholder, retain all mandatory sections and the PRD coverage matrix, and exclude implementation choices.
-4. On rework, change only evidence-backed SPEC files and preserve keys unless the finding requires a set change. Do not write PLAN/TASKS/code.
-5. Commit the smallest coherent SPEC change with the repository's conventional commit rules and push the shared branch. After the first valid SPEC commit, reconcile, populate the MR description including `## 关键自主决策` (`无` when none), then create exactly one `Draft: [PRD] <prd-basename>.md` MR using `/opt/fleet/templates/mr-description.md`; otherwise update that MR and its decision section.
-6. Complete with sorted SPEC paths/blob SHAs, commit/head, MR IID/URL, coverage and residual risk. Pass one flat v2 metadata object conforming to `/opt/fleet/schemas/card-completion.schema.json`; repeat every required project/workspace/source field from the card at the top level, using schema-allowed nulls/empty arrays without omitting keys. Include the MR URL in `gitlab_urls` as the critical-decision audit location. Do not review, mark ready or merge.
+1. 调用 `kanban_show()` 并要求 `created_by=dispatcher`；对照 GitLab 验证项目 ID/path、共享 worktree/分支、准确的 PRD path/commit/MR 以及运行键。绝不得发现或克隆另一个仓库。
+2. 读取准确 commit 上的 PRD。只按可以独立理解和测试的业务范围拆分；定义有序的键、依赖关系和完整的 PRD 覆盖矩阵。
+3. 基于中文模板 `/opt/fleet/templates/spec-template.md` 编写每个 `docs/prds/<prd-basename>/specs/spec-<key>.md`。键必须是稳定的小写 kebab-case。替换所有占位符，保留所有必需章节和 PRD 覆盖矩阵，并排除实现选择。
+4. 返工时，只修改有证据支持的 SPEC 文件；除非问题要求变更集合，否则保留原有键。不得编写 PLAN/TASKS/代码。
+5. 按仓库的约定式提交规则 commit 最小且连贯的 SPEC 变更，并 push 到共享分支。首次有效 SPEC commit 后，先对账，再填充 MR 描述（包括 `## 关键自主决策`；没有时填写 `无`），然后使用 `/opt/fleet/templates/mr-description.md` 创建且只创建一个 `Draft: [PRD] <prd-basename>.md` MR；此后只更新该 MR 及其决策章节。
+6. 完成时提供排序后的 SPEC 路径/blob SHA、commit/头提交、MR IID/URL、覆盖情况和剩余风险。传入一个符合 `/opt/fleet/schemas/card-completion.schema.json` 的扁平 v2 元数据对象；在顶层重复卡片中所有必需的 project/workspace/source 字段，允许使用 schema 规定的 null/空数组，但不得省略键。将 MR URL 写入 `gitlab_urls`，作为关键决策的审计位置。不得审查、标记 ready 或合并。

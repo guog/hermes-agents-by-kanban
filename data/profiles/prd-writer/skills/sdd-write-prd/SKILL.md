@@ -1,19 +1,19 @@
 ---
 name: sdd-write-prd
-description: Collaborate with a human in Feishu and prepare a reviewable PRD MR without starting delivery
+description: 在飞书中与人类协作并准备可审查的 PRD MR，但不启动交付
 version: 0.2.0
 ---
 
-# Write PRD
+# 编写 PRD
 
-## Fleet-wide execution rules
+## 全体 Agent 执行规则
 
-- Perform GitLab project, repository-metadata, file, branch, MR, discussion and comment operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal `git` commands explicitly required by this Skill remain allowed for branch inspection, commit and push.
-- A missing or ambiguous product detail is not by itself a reason to interrupt the human. Decide from explicit goals/acceptance/constraints, supplied evidence, current repository behavior and conventions, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. After the PRD MR exists, reconcile one idempotent MR comment containing every critical decision made in this PRD-writing turn using `/opt/fleet/templates/decision-comment.md`; include the comment URL in the original-channel result. Do not post an empty comment when none was made. Ask only when evidence is contradictory and no safe acceptance-preserving choice exists, or required project identity, permission, credential or capability is missing.
+- GitLab 项目、仓库元数据、文件、分支、MR、讨论和评论操作只能通过锁定版本的 `glab` CLI 或已安装的官方 `glab` Skill 完成。不得改用原始 HTTP/`curl`、临时 SDK、浏览器或人工 UI 操作。本 Skill 为检查分支、commit 和 push 而明确要求的常规 `git` 命令仍可使用。
+- 产品细节缺失或存在歧义，本身不是打断人类的理由。应依次根据明确的目标/验收条件/约束、已提供的证据、当前仓库行为和约定、兼容性/安全性作出判断，并选择最小且可逆的范围。若决策影响用户可见的范围/验收、公共接口、数据/迁移、安全/权限、兼容性、恢复/回滚或必需的测试/门禁，则属于关键决策。PRD MR 存在后，使用 `/opt/fleet/templates/decision-comment.md` 对账一条幂等 MR 评论，其中包含本次 PRD 编写过程中作出的每项关键决策；在原渠道结果中包含该评论 URL。若没有关键决策，不要发布空评论。只有当证据互相矛盾且不存在能保留验收语义的安全选择，或缺少必需的项目身份、权限、凭据或能力时，才向人类提问。
 
-1. Reply in the original Feishu chat/topic; @ the initiator in group/topic replies. Require an explicit allowlisted GitLab project and verify `archived=false`; never guess a repository from a display name.
-2. Read referenced intake/evidence and repository PRD conventions. Separate facts, assumptions and unresolved questions; resolve ordinary ambiguity with the hierarchy above instead of repeatedly asking the human.
-3. Write `docs/prds/prd-<semantic-key>.md` with goals, users, scope, rules, edge cases, non-goals, acceptance and traceable sources; omit implementation design.
-4. Reconcile the stable PRD branch/MR before writing, use repository conventions and the official `glab` Skill, and keep commits minimal.
-5. Verify the PRD is self-contained. Create/update the PRD MR for human review, then reply in the original channel with path, commit and MR URL.
-6. Never merge the PRD, start a formal Kanban run, create a delivery Task work item or impersonate dispatcher.
+1. 在原飞书聊天/话题中回复；在群聊/话题回复中 @ 发起人。必须提供明确的白名单 GitLab 项目，并验证 `archived=false`；绝不根据显示名称猜测仓库。
+2. 阅读引用的输入/证据和仓库的 PRD 约定。区分事实、假设和未解决问题；按上述层级解决一般性歧义，不要反复询问人类。
+3. 编写 `docs/prds/prd-<semantic-key>.md`，包含目标、用户、范围、规则、边界情况、非目标、验收条件和可追溯来源；不写实现设计。
+4. 写入前对账稳定的 PRD 分支/MR，遵循仓库约定并使用官方 `glab` Skill，保持 commit 最小化。
+5. 验证 PRD 内容自洽完整。创建/更新供人类审查的 PRD MR，然后在原渠道回复路径、commit 和 MR URL。
+6. 绝不得合并 PRD、启动正式 Kanban 运行、创建交付 Task work item 或冒充 dispatcher。

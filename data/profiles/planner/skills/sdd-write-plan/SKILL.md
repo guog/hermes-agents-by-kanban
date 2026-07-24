@@ -1,20 +1,20 @@
 ---
 name: sdd-write-plan
-description: Write the complete PLAN set for approved SPECs on the shared delivery branch
+description: 在共享交付分支上为已批准的 SPEC 编写完整的 PLAN 集合
 version: 0.2.1
 ---
 
-# Write PLAN set
+# 编写 PLAN 集合
 
-## Fleet-wide execution rules
+## 全体 Agent 执行规则
 
-- Perform GitLab project, repository-metadata, MR, pipeline, discussion and comment operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal `git` commands explicitly required by this Skill remain allowed for worktree inspection, commit and push.
-- The card's designated Hermes shared `worktree` is the only editable working copy of the Agent-owned delivery branch. Do not run routine `git fetch origin` or pull loops after dispatcher reconciliation. Fetch only to recover missing refs/worktree, investigate a proven local/remote head mismatch or rejected push, or satisfy `live_reconcile_required`; record the reason. Use local `git rev-parse`/`git status` for worktree state and `glab` for current MR state.
-- A PRD omission or ambiguity is not by itself `scope_gap` or `needs_input`. Decide from explicit acceptance/constraints, current repository behavior and conventions, approved upstream artifacts, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. Before completion, reconcile one idempotent delivery-MR comment containing every critical decision made by this card using `/opt/fleet/templates/decision-comment.md` and include its URL in completion `gitlab_urls`; do not post an empty comment when none was made. Record non-critical assumptions in the PLAN or completion evidence. Escalate only contradictory evidence with no safe acceptance-preserving choice, or a genuine permission, credential or capability failure.
+- GitLab 项目、仓库元数据、MR、流水线、讨论和评论操作只能通过锁定版本的 `glab` CLI 或已安装的官方 `glab` Skill 完成。不得改用原始 HTTP/`curl`、临时 SDK、浏览器或人工 UI 操作。本 Skill 为检查 worktree、commit 和 push 而明确要求的常规 `git` 命令仍可使用。
+- 卡片指定的 Hermes 共享 `worktree` 是 Agent 所属交付分支唯一可编辑的工作副本。dispatcher 完成对账后，不要例行运行 `git fetch origin` 或循环拉取。只有在恢复缺失的 ref/worktree、调查已证实的本地/远端头提交不一致或 push 被拒绝，或满足 `live_reconcile_required` 时才能 fetch，并记录原因。使用本地 `git rev-parse`/`git status` 判断 worktree 状态，使用 `glab` 获取当前 MR 状态。
+- PRD 存在遗漏或歧义，本身不等于 `scope_gap` 或 `needs_input`。应依次根据明确的验收条件/约束、当前仓库行为和约定、已批准的上游产物、兼容性/安全性作出判断，并选择最小且可逆的范围。若决策影响用户可见的范围/验收、公共接口、数据/迁移、安全/权限、兼容性、恢复/回滚或必需的测试/门禁，则属于关键决策。完成前，使用 `/opt/fleet/templates/decision-comment.md` 对账一条幂等的交付 MR 评论，其中包含本卡片作出的每项关键决策，并将其 URL 写入完成元数据的 `gitlab_urls`；若没有关键决策，不要发布空评论。非关键假设记录在 PLAN 或完成证据中。只有当证据互相矛盾且不存在能保留验收语义的安全选择，或确实缺少权限、凭据或能力时，才上报。
 
-1. Call `kanban_show()`; require dispatcher origin and verify exact project, shared worktree/branch, PRD, delivery MR and approved SPEC digest.
-2. Read repository rules, architecture and relevant code. For each `spec-<key>.md`, create exactly `docs/prds/<prd-basename>/plans/plan-<key>.md` from the Chinese `/opt/fleet/templates/plan-template.md`; replace every placeholder and do not rename existing docs.
-3. Retain the template's mandatory technical context, governance checks, decisions, architecture, interfaces, data/migration, compatibility, observability, security, testing, rollback, real project structure, traceability and risk sections. Trace decisions to SPEC requirements without changing intent or defining final Task IDs.
-4. On rework, preserve the one-to-one keys and change only affected PLANs. Resolve missing design decisions with the hierarchy above; report `scope_gap` only when approved requirements are contradictory or cannot support any safe acceptance-preserving plan.
-5. Commit minimal coherent PLAN changes and push the same branch/MR. Never create a PLAN MR.
-6. Complete with sorted PLAN paths/blob SHAs, commit/head, MR, verification and residual risk. Pass one flat v2 metadata object conforming to `/opt/fleet/schemas/card-completion.schema.json`; repeat every required project/workspace/source field from the card at the top level, using schema-allowed nulls/empty arrays without omitting keys. Do not write TASKS/code, review or merge.
+1. 调用 `kanban_show()`；要求卡片来自 dispatcher，并验证准确的项目、共享 worktree/分支、PRD、交付 MR 和已批准的 SPEC 摘要。
+2. 阅读仓库规则、架构和相关代码。对于每个 `spec-<key>.md`，基于中文模板 `/opt/fleet/templates/plan-template.md` 创建且只创建对应的 `docs/prds/<prd-basename>/plans/plan-<key>.md`；替换所有占位符，不要重命名已有文档。
+3. 保留模板中必需的技术上下文、治理检查、决策、架构、接口、数据/迁移、兼容性、可观测性、安全性、测试、回滚、真实项目结构、可追溯性和风险章节。将决策追溯到 SPEC 需求，但不得改变意图或定义最终 Task ID。
+4. 返工时保留一一对应的键，只修改受影响的 PLAN。按上述层级解决缺失的设计决策；只有已批准需求互相矛盾，或无法支持任何能保留验收语义的安全计划时，才报告 `scope_gap`。
+5. commit 最小且连贯的 PLAN 变更，并 push 到同一分支/MR。绝不得创建 PLAN MR。
+6. 完成时提供排序后的 PLAN 路径/blob SHA、commit/头提交、MR、验证结果和剩余风险。传入一个符合 `/opt/fleet/schemas/card-completion.schema.json` 的扁平 v2 元数据对象；在顶层重复卡片中所有必需的 project/workspace/source 字段，允许使用 schema 规定的 null/空数组，但不得省略键。不得编写 TASKS/代码、执行审查或合并。

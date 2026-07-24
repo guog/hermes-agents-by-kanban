@@ -1,20 +1,20 @@
 ---
 name: sdd-review-code
-description: Review the exact tested head of the one PRD delivery MR and post a correctness gate
+description: 审查单 PRD 交付 MR 中经过测试的准确头提交，并发布正确性门禁
 version: 0.2.0
 ---
 
-# Review delivery head
+# 审查交付头提交
 
-## Fleet-wide execution rules
+## 全体 Agent 执行规则
 
-- Perform GitLab project, repository-metadata, MR, pipeline, discussion and comment operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal read-only `git` commands explicitly required by this Skill remain allowed.
-- The card's designated Hermes shared `worktree` is the working copy of the Agent-owned delivery branch. Do not run routine `git fetch origin` or pull loops after dispatcher reconciliation. Fetch only to recover missing refs/worktree, investigate a proven local/remote head mismatch, or satisfy `live_reconcile_required`; record the reason. Use local `git rev-parse`/`git status` for reviewed code state and `glab` for current MR/pipeline/discussion state.
-- A PRD omission or ambiguity is not by itself a blocking finding. Decide from explicit acceptance/constraints, current repository behavior and conventions, approved upstream artifacts, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. Put every critical decision in the idempotent gate MR comment's `## 关键自主决策` section and include that comment URL in completion `gitlab_urls`; use `无` in the existing gate comment when none was made, without posting a separate empty comment. Escalate only contradictory evidence with no safe acceptance-preserving interpretation, or a genuine permission, credential or capability failure.
+- GitLab 项目、仓库元数据、MR、流水线、讨论和评论操作只能通过锁定版本的 `glab` CLI 或已安装的官方 `glab` Skill 完成。不得改用原始 HTTP/`curl`、临时 SDK、浏览器或人工 UI 操作。本 Skill 明确要求的常规只读 `git` 命令仍可使用。
+- 卡片指定的 Hermes 共享 `worktree` 是 Agent 所属交付分支的工作副本。dispatcher 完成对账后，不要例行运行 `git fetch origin` 或循环拉取。只有在恢复缺失的 ref/worktree、调查已证实的本地/远端头提交不一致，或满足 `live_reconcile_required` 时才能 fetch，并记录原因。使用本地 `git rev-parse`/`git status` 判断待审代码状态，使用 `glab` 获取当前 MR、流水线和讨论状态。
+- PRD 存在遗漏或歧义，本身不构成阻断性问题。应依次根据明确的验收条件/约束、当前仓库行为和约定、已批准的上游产物、兼容性/安全性作出判断，并选择最小且可逆的范围。若决策影响用户可见的范围/验收、公共接口、数据/迁移、安全/权限、兼容性、恢复/回滚或必需的测试/门禁，则属于关键决策。将每项关键决策写入幂等门禁 MR 评论的 `## 关键自主决策` 章节，并把该评论 URL 写入完成元数据的 `gitlab_urls`；如果没有关键决策，在已有门禁评论中填写 `无`，不要另外发布空评论。只有当证据互相矛盾且不存在能保留验收语义的安全解释，或确实缺少权限、凭据或能力时，才上报。
 
-1. Call `kanban_show()`; require dispatcher origin and verify project/run/worktree/branch/MR, approved artifacts, current MR head and tester pass all target the same full SHA.
-2. Review the complete diff for correctness, requirement/task coverage, regression, error paths, security, transactions/concurrency, migration, compatibility and maintainability. Query pipeline and unresolved discussions.
-3. Use inline discussions for actionable findings. Use `fail` for code defects and `scope_gap` only for an evidenced upstream artifact deficiency.
-4. Re-read MR head immediately before posting. If it changed or no matching tester pass exists, post no pass and block for fresh test/review.
-5. Post one idempotent v2 `code-review` gate bound to the exact `head_sha`, with precise locations, evidence and residual risk.
-6. Complete pass/fail/scope_gap with one flat v2 metadata object conforming to `/opt/fleet/schemas/card-completion.schema.json`; repeat every required project/workspace/source field from the card at the top level. A pass must bind `head_sha`, `mr_iid` and `mr_url` to the reviewed current head. Never edit code, push, resolve your own blocking findings, create another MR or merge.
+1. 调用 `kanban_show()`；要求卡片来自 dispatcher，并验证项目、运行、worktree、分支、MR、已批准产物、当前 MR 头提交和 tester 的通过结论都指向同一个完整 SHA。
+2. 审查完整 diff，检查正确性、需求/任务覆盖、回归、错误路径、安全性、事务/并发、迁移、兼容性和可维护性。查询流水线及尚未解决的讨论。
+3. 对可执行的问题使用行内讨论。代码缺陷使用 `fail`；只有存在证据表明上游产物有缺陷时才使用 `scope_gap`。
+4. 发布结论前立即重新读取 MR 头提交。若头提交已变化，或不存在与之匹配的 tester 通过结论，则不得发布通过结论，并阻断流程以等待重新测试/审查。
+5. 发布一条幂等的 v2 `code-review` 门禁，使其绑定准确的 `head_sha`，并包含精确位置、证据和剩余风险。
+6. 使用一个符合 `/opt/fleet/schemas/card-completion.schema.json` 的扁平 v2 元数据对象完成 pass/fail/scope_gap；在顶层重复卡片中所有必需的 project/workspace/source 字段。通过结论必须将 `head_sha`、`mr_iid` 和 `mr_url` 绑定到当前已审查的头提交。绝不得修改代码、push、解决自己提出的阻断问题、创建另一个 MR 或执行合并。

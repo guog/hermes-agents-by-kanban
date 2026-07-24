@@ -1,20 +1,20 @@
 ---
 name: sdd-test
-description: Test the exact current head of the one PRD delivery MR and post reproducible evidence
+description: 测试单 PRD 交付 MR 准确的当前头提交，并发布可复现的证据
 version: 0.2.0
 ---
 
-# Test delivery head
+# 测试交付头提交
 
-## Fleet-wide execution rules
+## 全体 Agent 执行规则
 
-- Perform GitLab project, repository-metadata, MR, pipeline, discussion and comment operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal read-only `git` commands explicitly required by this Skill remain allowed.
-- The card's designated Hermes shared `worktree` is the working copy of the Agent-owned delivery branch. Do not run routine `git fetch origin` or pull loops after dispatcher reconciliation. Fetch only to recover missing refs/worktree, investigate a proven local/remote head mismatch, or satisfy `live_reconcile_required`; record the reason. Use local `git rev-parse`/`git status` for tested code state and `glab` for current MR/pipeline state.
-- A PRD omission or ambiguity is not by itself a blocking finding. Decide from explicit acceptance/constraints, current repository behavior and conventions, approved upstream artifacts, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. Put every critical decision in the idempotent gate MR comment's `## 关键自主决策` section and include that comment URL in completion `gitlab_urls`; use `无` in the existing gate comment when none was made, without posting a separate empty comment. Escalate only contradictory evidence with no safe acceptance-preserving test oracle, or a genuine permission, credential or capability failure.
+- GitLab 项目、仓库元数据、MR、流水线、讨论和评论操作只能通过锁定版本的 `glab` CLI 或已安装的官方 `glab` Skill 完成。不得改用原始 HTTP/`curl`、临时 SDK、浏览器或人工 UI 操作。本 Skill 明确要求的常规只读 `git` 命令仍可使用。
+- 卡片指定的 Hermes 共享 `worktree` 是 Agent 所属交付分支的工作副本。dispatcher 完成对账后，不要例行运行 `git fetch origin` 或循环拉取。只有在恢复缺失的 ref/worktree、调查已证实的本地/远端头提交不一致，或满足 `live_reconcile_required` 时才能 fetch，并记录原因。使用本地 `git rev-parse`/`git status` 判断已测试代码状态，使用 `glab` 获取当前 MR/流水线状态。
+- PRD 存在遗漏或歧义，本身不构成阻断性问题。应依次根据明确的验收条件/约束、当前仓库行为和约定、已批准的上游产物、兼容性/安全性作出判断，并选择最小且可逆的范围。若决策影响用户可见的范围/验收、公共接口、数据/迁移、安全/权限、兼容性、恢复/回滚或必需的测试/门禁，则属于关键决策。将每项关键决策写入幂等门禁 MR 评论的 `## 关键自主决策` 章节，并把该评论 URL 写入完成元数据的 `gitlab_urls`；如果没有关键决策，在已有门禁评论中填写 `无`，不要另外发布空评论。只有当证据互相矛盾且不存在能保留验收语义的安全测试判定依据，或确实缺少权限、凭据或能力时，才上报。
 
-1. Call `kanban_show()`; require dispatcher origin and verify project/run/worktree/branch/MR, approved artifact digests and current MR head equals the card's full 40-character expected SHA.
-2. Read all approved SPEC/PLAN/TASKS plus the complete diff. Build a requirement/task-to-test coverage list.
-3. Run the smallest complete reproducible suite: changed-area tests, required integration/contract tests, static checks and required pipeline state. Do not modify code or test files.
-4. Use `fail` for implementation defects and `scope_gap` only for an evidenced artifact omission.
-5. Re-read MR head immediately before posting. If it changed, post no pass and block for a fresh card. Otherwise post one idempotent v2 `test` gate bound to the exact `head_sha`, with commands/results, coverage and residual risk.
-6. Complete pass/fail/scope_gap with one flat v2 metadata object conforming to `/opt/fleet/schemas/card-completion.schema.json`; repeat every required project/workspace/source field from the card at the top level. A pass must bind `head_sha`, `mr_iid` and `mr_url` to the tested current head. Never resolve findings, push, create another MR or merge.
+1. 调用 `kanban_show()`；要求卡片来自 dispatcher，并验证项目、运行、worktree、分支、MR、已批准产物摘要，以及当前 MR 头提交等于卡片中完整的 40 字符预期 SHA。
+2. 阅读所有已批准的 SPEC/PLAN/TASKS 及完整 diff。建立需求/任务到测试的覆盖清单。
+3. 运行最小但完整且可复现的测试套件：变更区域测试、必需的集成/契约测试、静态检查和必需的流水线状态检查。不得修改代码或测试文件。
+4. 实现缺陷使用 `fail`；只有存在证据表明产物有遗漏时才使用 `scope_gap`。
+5. 发布结论前立即重新读取 MR 头提交。如果头提交已变化，不得发布通过结论，并阻断流程以等待新卡片。否则发布一条绑定准确 `head_sha` 的幂等 v2 `test` 门禁，其中包含命令/结果、覆盖情况和剩余风险。
+6. 使用一个符合 `/opt/fleet/schemas/card-completion.schema.json` 的扁平 v2 元数据对象完成 pass/fail/scope_gap；在顶层重复卡片中所有必需的 project/workspace/source 字段。通过结论必须将 `head_sha`、`mr_iid` 和 `mr_url` 绑定到当前已测试的头提交。绝不得解决问题、push、创建另一个 MR 或合并。

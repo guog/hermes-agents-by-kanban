@@ -1,71 +1,71 @@
 ---
 name: sdd-dispatch-kanban
-description: Start, recover and merge one-PRD one-MR delivery runs across allowlisted GitLab projects
+description: 在白名单 GitLab 项目中启动、恢复并合并单 PRD 单 MR 的交付运行
 version: 0.3.0
 ---
 
-# SDD Kanban dispatcher
+# SDD Kanban 调度器
 
-Use this Skill only for formal run intake, deterministic stage transitions, recovery, checked-head merge, status and original-channel notification. Never write professional SPEC/PLAN/TASKS/code or their reviews.
+本 Skill 仅用于正式运行的受理、确定性的阶段转换、恢复、基于已检查头提交的合并、状态查询和原渠道通知。绝不得编写专业的 SPEC/PLAN/TASKS/代码或其审查内容。
 
-## Fleet-wide execution rules
+## 全体 Agent 执行规则
 
-- Perform GitLab project, repository-metadata, MR, pipeline, discussion, comment and merge operations only through the locked `glab` CLI or the installed official `glab` Skill. Do not substitute raw HTTP/`curl`, an ad-hoc SDK, a browser or manual UI work. Normal `git` commands explicitly required by this Skill remain allowed for checkout/worktree preparation, inspection, commit and push.
-- The card's designated Hermes shared `worktree` is the only editable working copy of the Agent-owned delivery branch. After initial preparation/recovery, do not run routine `git fetch origin` or pull loops between stages. Fetch only to create/recover missing refs or a worktree, investigate a proven local/remote head mismatch or rejected push, or satisfy `live_reconcile_required`; record the reason. Use local `git rev-parse`/`git status` for worktree state and `glab` for current MR, pipeline and discussion state.
-- A PRD omission or ambiguity is not by itself `needs_input`. Decide from explicit acceptance/constraints, current repository behavior and conventions, approved upstream artifacts, compatibility/security, then the smallest reversible scope. A decision is critical when it affects user-visible scope/acceptance, a public interface, data/migration, security/permissions, compatibility, recovery/rollback or a required test/gate. If the delivery MR exists, reconcile one idempotent MR comment containing all critical decisions made by this card using `/opt/fleet/templates/decision-comment.md` and include its URL in completion `gitlab_urls`. Before the first MR exists, carry those decisions explicitly into the spec-writer card so it can put them in the initial MR description. Do not post an empty comment when no critical decision was made. Ask a human only when evidence is contradictory and no safe choice preserves acceptance, or a permission, credential or capability is genuinely missing.
+- GitLab 项目、仓库元数据、MR、流水线、讨论、评论和合并操作只能通过锁定版本的 `glab` CLI 或已安装的官方 `glab` Skill 完成。不得改用原始 HTTP/`curl`、临时 SDK、浏览器或人工 UI 操作。本 Skill 为准备和检查 checkout/worktree、commit 和 push 而明确要求的常规 `git` 命令仍可使用。
+- 卡片指定的 Hermes 共享 `worktree` 是 Agent 所属交付分支唯一可编辑的工作副本。完成首次准备/恢复后，不要在阶段之间例行运行 `git fetch origin` 或循环拉取。只有在创建/恢复缺失的 ref 或 worktree、调查已证实的本地/远端头提交不一致或 push 被拒绝，或满足 `live_reconcile_required` 时才能 fetch，并记录原因。使用本地 `git rev-parse`/`git status` 判断 worktree 状态，使用 `glab` 获取当前 MR、流水线和讨论状态。
+- PRD 存在遗漏或歧义，本身不等于 `needs_input`。应依次根据明确的验收条件/约束、当前仓库行为和约定、已批准的上游产物、兼容性/安全性作出判断，并选择最小且可逆的范围。若决策影响用户可见的范围/验收、公共接口、数据/迁移、安全/权限、兼容性、恢复/回滚或必需的测试/门禁，则属于关键决策。如果交付 MR 已存在，使用 `/opt/fleet/templates/decision-comment.md` 对账一条幂等 MR 评论，其中包含本卡片作出的全部关键决策，并将其 URL 写入完成元数据的 `gitlab_urls`。首个 MR 创建前，要将这些决策明确写入 spec-writer 卡片，使其能够放入初始 MR 描述。若没有关键决策，不要发布空评论。只有当证据互相矛盾且不存在能保留验收语义的安全选择，或确实缺少权限、凭据或能力时，才询问人类。
 
-## Intake
+## 受理
 
-1. Accept only `实现 PRD <exact blob/raw URL> <merged PRD MR URL>`. If either URL is missing, their host/project IDs differ, or repository identity is ambiguous, ask only for the missing/correct value in the original Feishu channel and do not create a card.
-2. In order, query GitLab for: allowed host/group; readable project; PRD path; `archived=false`; MR merged to current `default_branch`; PRD included in that merged revision; current default-branch PRD still equals that effective version. Do not call an unreadable project “文件不存在”.
-3. Use `project_id` and `path_with_namespace` as identity. Project description Chinese text is display-only.
-4. Derive `run_key = sdd-<base32(sha256(host|project_id|prd_path|prd_commit_sha))[0:20]>`. Query Kanban and GitLab before creating anything: resume an active run, return a merged result, or start only a new PRD commit.
-5. Read the current `default_branch` HEAD as the run base SHA. Select the repository's branch convention; otherwise use `feature/<prd-basename>-<prd_sha8>`. Derive:
+1. 只接受 `实现 PRD <exact blob/raw URL> <merged PRD MR URL>`。该命令中的两个英文占位符属于固定协议，不翻译。如果缺少任一 URL、两者的 host/project ID 不一致，或仓库身份不明确，则只在原飞书渠道询问缺失/正确的值，不要创建卡片。
+2. 按顺序查询 GitLab 并确认：host/group 在白名单中；项目可读；PRD 路径存在；`archived=false`；MR 已合并到当前 `default_branch`；该合并版本包含 PRD；当前默认分支上的 PRD 仍等于该生效版本。不得把不可读的项目称为“文件不存在”。
+3. 使用 `project_id` 和 `path_with_namespace` 作为身份标识。项目描述中的中文文本仅用于显示。
+4. 推导 `run_key = sdd-<base32(sha256(host|project_id|prd_path|prd_commit_sha))[0:20]>`。创建任何内容前查询 Kanban 和 GitLab：恢复活动中的运行、返回已合并结果，或者只为新的 PRD commit 启动运行。
+5. 读取当前 `default_branch` 的 HEAD 作为运行基准 SHA。优先选择仓库的分支约定；否则使用 `feature/<prd-basename>-<prd_sha8>`。推导：
    - checkout: `/workspace/projects/p<project_id>-<repo-slug>`
    - worktree: `/workspace/projects/worktrees/p<project_id>/<run_key>`
    - board: `gitlab-p<project_id>`
-6. Prepare the workspace with standard `git` and `hermes` commands, without a fleet helper script:
-   - Require a positive numeric project ID, a lowercase filesystem-safe repo slug, a valid `run_key`, a full lowercase base SHA and a branch accepted by `git check-ref-format --branch`.
-   - Require the token-free clone URL and any existing `origin` to equal the validated `https://<GITLAB_HOST>/<path_with_namespace>[.git]`; require the project to remain inside `GITLAB_ALLOWED_GROUPS`.
-   - Create the parent directories. Clone only when the checkout is absent. Fetch only for first preparation, missing refs, proven divergence, rejected push or explicit live reconciliation.
-   - Verify `base_sha^{commit}`. Reuse an existing worktree only when its branch is exactly the expected branch; otherwise create it from the existing local branch, tracked remote branch or base SHA, in that order.
-   - Create or reconcile the board with `hermes -p dispatcher kanban boards create <board>`, using the project display name and checkout as its default workdir.
-7. Create one `run-init` card with a stable message/run idempotency key, `tenant=run_key`, `created_by=dispatcher`, exact assignee/skills and the v2 card template. Preserve `message_id`, `chat_id`, `thread_id` and initiator for recovery.
+6. 使用标准 `git` 和 `hermes` 命令准备工作区，不使用舰队辅助脚本：
+   - 要求项目 ID 为正整数，repo slug 为小写且适合文件系统，`run_key` 有效，基准 SHA 为完整小写形式，且分支能通过 `git check-ref-format --branch`。
+   - 要求不含 token 的 clone URL 和任何已有 `origin` 都等于已验证的 `https://<GITLAB_HOST>/<path_with_namespace>[.git]`；要求项目始终位于 `GITLAB_ALLOWED_GROUPS` 内。
+   - 创建父目录。只有 checkout 不存在时才 clone。只有首次准备、ref 缺失、已证实发生分歧、push 被拒绝或明确要求实时对账时才 fetch。
+   - 验证 `base_sha^{commit}`。只有现有 worktree 的分支准确等于预期分支时才复用；否则依次从已有本地分支、已跟踪的远端分支或基准 SHA 创建。
+   - 使用 `hermes -p dispatcher kanban boards create <board>` 创建或对账看板，并将项目显示名称和 checkout 分别用作看板名称信息和默认 workdir。
+7. 使用稳定的消息/运行幂等键、`tenant=run_key`、`created_by=dispatcher`、准确的 assignee/skills 和 v2 卡片模板创建一张 `run-init` 卡片。保留 `message_id`、`chat_id`、`thread_id` 和发起人信息，以便恢复。
 
-## Card and gate reconciliation
+## 卡片和门禁对账
 
-1. Call `kanban_show()`; validate the single flat completion metadata object against `/opt/fleet/schemas/card-completion.schema.json`. Card-body `identity`/`workspace`/`source`/`delivery` sections and comments do not fill missing completion fields. Refuse any next card whose stored or returned `created_by` is not exactly `dispatcher`.
-2. Every card must repeat project ID/path/display name, checkout/worktree, shared branch/target, PRD path/commit/MR, run, delivery MR and expected head. Reconcile GitLab live state before every write.
-3. Advance only through the worker/continuation pair protocol below. Fleet policy reserves `kanban_create` and `kanban_link` for dispatcher and forbids delegating graph shaping. The unmodified official Hermes runtime does not enforce this policy in a patched handler, so always re-check `created_by=dispatcher` before trusting a card.
-4. Artifact gates use sorted path/blob-SHA digest plus reviewer identity and `review_commit_sha`. Recompute the stage path set at every transition. A changed approved artifact invalidates that gate and every downstream gate; later PLAN/code additions do not invalidate an unchanged SPEC digest.
-5. `fail` returns to the owning producer. `scope_gap` routes by evidence to TASKS, PLAN or SPEC; never allow coder to expand scope. Design rework is limited to 3 iterations per stage; code rework is limited to 5 total.
-6. Tester and code-reviewer gates must be separate comments by allowed identities and bind the same current MR `head_sha`. Any push invalidates both.
+1. 调用 `kanban_show()`；依据 `/opt/fleet/schemas/card-completion.schema.json` 验证唯一且扁平的完成元数据对象。卡片正文的 `identity`/`workspace`/`source`/`delivery` 章节和评论不能补齐缺失的完成字段。若下一张卡片存储或返回的 `created_by` 不准确等于 `dispatcher`，则拒绝该卡片。
+2. 每张卡片都必须重复项目 ID/path/显示名称、checkout/worktree、共享分支/目标分支、PRD path/commit/MR、运行、交付 MR 和预期头提交。每次写入前都要对账 GitLab 实时状态。
+3. 只能通过下述“工作卡/续接卡成对协议”推进。舰队策略把 `kanban_create` 和 `kanban_link` 保留给 dispatcher，并禁止委派图结构塑造。未经修改的官方 Hermes 运行时并未通过打补丁的 handler 强制执行此策略，因此信任卡片前始终重新检查 `created_by=dispatcher`。
+4. 产物门禁使用排序后的 path/blob-SHA 摘要、审查者身份和 `review_commit_sha`。每次转换时重新计算本阶段的路径集合。已批准产物发生变化会使该门禁及所有下游门禁失效；之后新增 PLAN/代码不会使内容未变的 SPEC 摘要失效。
+5. `fail` 返回负责的生产者。`scope_gap` 按证据路由到 TASKS、PLAN 或 SPEC；绝不允许 coder 扩大范围。设计返工每阶段最多 3 次；代码返工总计最多 5 次。
+6. tester 和 code-reviewer 门禁必须由允许的身份分别发布为独立评论，并绑定同一个当前 MR `head_sha`。任何 push 都会使两者失效。
 
-### Worker/continuation pair protocol
+### 工作卡/续接卡成对协议
 
-Every dispatcher gate, including `run-init` and every resumed dispatcher continuation, creates one logical pair before it completes:
+每个 dispatcher 门禁（包括 `run-init` 和每张恢复执行的 dispatcher 续接卡）都必须在完成前创建一组逻辑卡片对：
 
-1. Derive `transition_key = <run_key>:<next-stage>:<iteration>`. Reconcile cards by exact `idempotency_key`; never infer identity from title text.
-2. Create or reuse work card `W` with key `<transition_key>:work`, exact stage/assignee/Skills, `created_by=dispatcher`, and parent equal to the current dispatcher gate.
-3. Create or reuse dispatcher continuation card `C` with key `<transition_key>:continue`, assignee `dispatcher`, and parent equal to `W`. `C` records only the expected parent card/stage and `live_reconcile_required=true`.
-4. Verify both cards and both parent relationships. Only then complete the current gate with `next_card_ids=[W,C]`. If either create/link fails, leave the current gate running or blocked and retry the same keys; do not complete it.
-5. Completing the current gate promotes only `W` to `ready`. Completing `W` promotes `C` to `ready`. `C` must read `W` completion metadata, validate it against the schema, then re-read GitLab project/branch/MR/comments/pipeline/discussions/current head before deciding the next pair. For a historical invalid handoff, create nothing and accept only an audited `kanban edit` backfill or a fresh review/work pair; never infer missing fields or approve a schema exception.
-6. Never put a predicted `head_sha`, `artifact_digest`, review result, pipeline result or merge result into `C`. Unknown live facts stay null until `C` runs. Duplicate messages, dispatcher restarts and worker retries must reuse the same pair.
+1. 推导 `transition_key = <run_key>:<next-stage>:<iteration>`。按准确的 `idempotency_key` 对账卡片；绝不根据标题文本推断身份。
+2. 创建或复用工作卡 `W`，其键为 `<transition_key>:work`，stage/assignee/Skills 必须准确，`created_by=dispatcher`，且 parent 等于当前 dispatcher 门禁。
+3. 创建或复用 dispatcher 续接卡 `C`，其键为 `<transition_key>:continue`，assignee 为 `dispatcher`，且 parent 等于 `W`。`C` 只记录预期的父卡片/阶段和 `live_reconcile_required=true`。
+4. 验证两张卡片及两条父子关系。只有完成验证后，才能使用 `next_card_ids=[W,C]` 完成当前门禁。如果任一卡片创建/链接失败，保持当前门禁为 running 或 blocked，并使用相同键重试；不得完成门禁。
+5. 完成当前门禁只会将 `W` 提升为 `ready`。完成 `W` 会将 `C` 提升为 `ready`。`C` 必须读取 `W` 的完成元数据，依据 schema 验证，然后重新读取 GitLab 的项目、分支、MR、评论、流水线、讨论和当前头提交，之后才能决定下一组卡片对。对于历史遗留的无效交接，不创建任何内容，只接受经过审计的 `kanban edit` 回填或新的审查/工作卡片对；绝不得推断缺失字段或批准 schema 例外。
+6. 绝不得把预测的 `head_sha`、`artifact_digest`、审查结果、流水线结果或合并结果写入 `C`。未知的实时事实在 `C` 运行前保持 null。重复消息、dispatcher 重启和 worker 重试必须复用同一组卡片对。
 
-Use the same protocol for every transition: write, independent review, any design/code rework, test, code review and merge. The merge work card is assigned to `dispatcher` and is followed by a `run-complete` continuation; `run-complete` becomes ready only after the checked-head merge card completes.
+每次转换都使用同一协议：编写、独立审查、任何设计/代码返工、测试、代码审查和合并。合并工作卡分配给 `dispatcher`，其后接一张 `run-complete` 续接卡；只有基于已检查头提交的合并卡完成后，`run-complete` 才会变为 ready。
 
-## Single MR lifecycle and merge
+## 单 MR 生命周期和合并
 
-1. spec-writer creates exactly one `Draft: [PRD] <prd-basename>.md` MR after the first valid SPEC commit. Every later producer updates that branch/MR; every reviewer/tester comments there. Coder marks it ready after implementation and self-test.
-2. Before merge require ready, mergeable, required pipeline successful, blocking discussions resolved, current artifact digests approved, and tester/code-reviewer pass on one `checked_head`.
-3. The merge work card and its completion metadata must carry `head_sha=<checked_head>` and `checked_head=<checked_head>`. Merge through GitLab with `sha=<checked_head>`. On SHA mismatch create fresh test/review pairs; never retry with an unchecked SHA.
-4. Use returned `merge_commit_sha` to post one idempotent MR comment with permanent PRD/SPEC/PLAN/TASKS blob links.
-5. Clean up without a fleet helper script: derive the checkout/worktree again only from the validated project ID, repo slug and run key; require the checkout to remain the expected Git repository; require the delivery MR to be merged and the worktree to have no uncommitted changes; then run `git -C <checkout> worktree remove <worktree>` followed by `git -C <checkout> worktree prune`. Never recursively delete a derived path.
-6. Complete the run and notify the original channel/thread; @ the initiator in group/topic replies.
+1. spec-writer 在首次有效 SPEC commit 后创建且只创建一个 `Draft: [PRD] <prd-basename>.md` MR。此后的每个生产者都更新该分支/MR；每个 reviewer/tester 都在该 MR 中评论。coder 在实现和自测完成后将其标记为 ready。
+2. 合并前要求：MR 已 ready、可以合并、必需的流水线成功、阻断性讨论已解决、当前产物摘要已批准，并且 tester/code-reviewer 在同一个 `checked_head` 上通过。
+3. 合并工作卡及其完成元数据必须包含 `head_sha=<checked_head>` 和 `checked_head=<checked_head>`。通过 GitLab 使用 `sha=<checked_head>` 合并。如果 SHA 不匹配，则创建新的测试/审查卡片对；绝不得使用未经检查的 SHA 重试。
+4. 使用返回的 `merge_commit_sha` 发布一条幂等 MR 评论，其中包含永久的 PRD/SPEC/PLAN/TASKS blob 链接。
+5. 不使用舰队辅助脚本进行清理：只能根据已验证的项目 ID、repo slug 和运行键重新推导 checkout/worktree；要求 checkout 仍是预期的 Git 仓库；要求交付 MR 已合并且 worktree 没有未提交变更；然后依次运行 `git -C <checkout> worktree remove <worktree>` 和 `git -C <checkout> worktree prune`。绝不得递归删除推导出的路径。
+6. 完成运行并通知原渠道/话题；在群聊/话题回复中 @ 发起人。
 
-Every created card sets the exact assignee and Skill list:
+创建的每张卡片都要设置准确的 assignee 和 Skill 列表：
 
-| Assignee | Skills |
+| 承担者（Assignee） | Skills |
 | --- | --- |
 | dispatcher | `sdd-dispatch-kanban`, `glab`, `lark-shared`, `lark-im` |
 | spec-writer | `sdd-write-spec`, `glab` |
@@ -78,4 +78,4 @@ Every created card sets the exact assignee and Skill list:
 | tester | `sdd-test`, `glab` |
 | code-reviewer | `sdd-review-code`, `glab` |
 
-Block with a concrete human action only for missing required intake identity, contradictory requirements with no safe acceptance-preserving choice, `capability`, credential/environment failure or exhausted budget. PRD ambiguity alone is not a reason to block. Never create a GitLab Task work item for formal delivery and never run a second Feishu inbound consumer.
+只有在缺少必需的受理身份、需求互相矛盾且不存在能保留验收语义的安全选择、发生 `capability`/凭据/环境故障，或预算耗尽时，才能阻断流程，并给出明确的人类操作。仅有 PRD 歧义不能作为阻断理由。正式交付中绝不得创建 GitLab Task work item，也绝不得运行第二个飞书入站消费者。
