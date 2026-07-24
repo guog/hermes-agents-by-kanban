@@ -24,7 +24,51 @@ curator:
 dashboard:
   show_token_analytics: true
 skills:
-  disabled: [ascii-video, comfyui, manim-video, touchdesigner-mcp, hyperframes, kanban-video-orchestrator, blender-mcp, gif-search, youtube-content, songwriting-and-ai-music, heartmula, songsee, audiocraft-audio-generation, openhue, minecraft-modpack-server, pokemon-player]
+  disabled:
+    - airtable
+    - architecture-diagram
+    - arxiv
+    - ascii-art
+    - ascii-video
+    - audiocraft-audio-generation
+    - blender-mcp
+    - blogwatcher
+    - claude-design
+    - evaluating-llms-harness
+    - github-auth
+    - github-code-review
+    - github-issues
+    - github-pr-workflow
+    - github-repo-management
+    - google-workspace
+    - heartmula
+    - himalaya
+    - huggingface-hub
+    - hyperframes
+    - jupyter-live-kernel
+    - kanban-video-orchestrator
+    - llama-cpp
+    - manim-video
+    - maps
+    - minecraft-modpack-server
+    - notion
+    - obsidian
+    - openhue
+    - p5js
+    - petdex
+    - pokemon-player
+    - polymarket
+    - research-paper-writing
+    - segment-anything-model
+    - serving-llms-vllm
+    - songsee
+    - songwriting-and-ai-music
+    - spike
+    - teams-meeting-pipeline
+    - touchdesigner-mcp
+    - weights-and-biases
+    - youtube-content
+    - yuanbao
   external_dirs:
     - /opt/skills/gitlab
     - /opt/skills/lark
