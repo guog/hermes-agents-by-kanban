@@ -32,6 +32,8 @@ data/profiles/*/*.db
 data/profiles/*/*.jsonl
 projects/*
 !projects/.gitkeep
+/cli/
+/skills/
 *.log
 __pycache__/
 *.pyc

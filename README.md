@@ -1,6 +1,6 @@
 # Hermes Kanban SDD Agent Fleet
 
-这是一套面向 Ubuntu Linux/AMD64 的 Hermes Agent 0.19.0 多 Agent 部署包。部署只运行官方 Hermes 镜像，通过 `docker-compose.yaml` 挂载本地目录；不构建定制镜像，不修改 `/opt/hermes`，不执行 fleet 初始化、补丁、同步或验证脚本。
+这是一套面向 Ubuntu Linux/AMD64 的 Hermes Agent 0.19.0 多 Agent 部署包。部署只运行官方 Hermes 镜像，通过 `docker-compose.yaml` 挂载本地目录；不构建定制镜像，不修改 `/opt/hermes`，不执行 fleet 初始化、运行时补丁或自动同步。部署管理员只在启动前手动运行外部资产下载脚本。
 
 人类通过飞书启动一次正式交付，之后由 Hermes Kanban 持久调度：
 
@@ -38,8 +38,11 @@ Compose 只有一个 `hermes` service：
 │           ├── skills/
 │           └── home/.gitconfig
 ├── projects/                   # clone、共享 checkout 和 run worktree
-├── tooling/                    # 预置的 Linux AMD64 CLI 与官方 Skills
-├── templates/                  # MR、评论、Kanban card 模板
+├── cli/                        # 下载生成，不进 Git；Linux AMD64 CLI
+├── skills/                     # 下载生成，不进 Git；GitLab/Lark 官方 Skills
+├── scripts/
+│   └── fetch-external-assets.sh
+├── templates/                  # 中文 SDD、MR、评论、Kanban card 模板
 └── schemas/                    # Agent 自检用 completion metadata schema
 ```
 
@@ -49,7 +52,8 @@ Compose 只有一个 `hermes` service：
 | --- | --- | --- |
 | `${HERMES_DATA_DIR:-./data}` | `/opt/data` | 可写 |
 | `${PROJECTS_DIR:-./projects}` | `/workspace/projects` | 可写 |
-| `./tooling` | `/opt/tooling` | 只读 |
+| `./cli` | `/opt/cli` | 只读 |
+| `./skills` | `/opt/skills` | 只读 |
 | `./templates` | `/opt/fleet/templates` | 只读 |
 | `./schemas` | `/opt/fleet/schemas` | 只读 |
 
@@ -195,11 +199,27 @@ data/profiles/{prd-writer,spec-writer,planner,tasker,coder}/home/.gitconfig
 
 默认 `.invalid` 邮箱明确标识自动化提交。如果 GitLab 要求已验证提交邮箱，部署前换成管理员创建的已验证 bot alias。
 
+### 3.5 Dashboard Token 分析
+
+12 个 Profile 的 `config.yaml` 均已启用：
+
+```yaml
+dashboard:
+  show_token_analytics: true
+```
+
+Dashboard 左侧 Profile 切换器决定当前查看哪个 Agent。选择 Profile 后，在 Analytics 页面查看该 Profile 的会话数、输入/输出 token、缓存命中、按日和按模型分解。
+
+这些数字来自 Hermes 本地会话历史，只统计返回了可用 usage 的成功主 Agent 响应，是本地统计下限，不是供应商账单。辅助调用、供应商重试、fallback、缺失 usage 的调用及部分缓存数据可能不计入。
+
+上游依据：[Hermes v2026.7.20 Dashboard Analytics 文档](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/website/docs/user-guide/features/web-dashboard.md#analytics)；[同版本 `show_token_analytics` 配置定义](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/hermes_cli/config.py#L2052-L2074)。
+
 ## 4. 启动与运维
 
-启动：
+每次部署或升级前，先手动下载并校验外部 Skills 与 CLI，再启动：
 
 ```bash
+./scripts/fetch-external-assets.sh
 docker compose up -d
 ```
 
@@ -237,9 +257,9 @@ docker compose exec hermes hermes -p dispatcher gateway start
 
 官方 Gateway 生命周期会把新的 desired state 写回本地目录。
 
-## 5. 锁定工具
+## 5. 锁定的外部 Skills 与 CLI
 
-部署包预置：
+Git 仓库不保存外部 Skills、CLI 二进制或其许可证副本。`scripts/fetch-external-assets.sh` 在部署机联网下载下列锁定版本：
 
 | 工具 | 版本 |
 | --- | --- |
@@ -248,11 +268,38 @@ docker compose exec hermes hermes -p dispatcher gateway start
 | GitLab `glab` Skill | revision `933cee89...` |
 | Lark `lark-shared`、`lark-im` Skills | revision `d6cebd67...` |
 
-来源和 SHA-256 记录在 `tooling/manifest.yaml`，随附许可证位于 `tooling/licenses/`。目标机不下载、不安装、不同步工具。升级工具时由维护者在发布包中整体替换并人工审查 manifest；运行中的 Agent 只读挂载 `tooling/`。
+脚本执行过程：
+
+1. 下载 Linux AMD64 的 `glab` 与 `lark-cli`，校验锁定 SHA-256。
+2. 按固定 commit 拉取 GitLab `glab` Skill 与 Lark `lark-shared`、`lark-im` Skills。
+3. 在临时目录完成全部校验后，整体替换仓库本地的 `cli/` 与 `skills/`。
+4. 生成本地 `MANIFEST.txt` 和许可证副本；这两个目录由 `.gitignore` 排除。
+
+Compose 将 `cli/`、`skills/` 分别只读挂载到 `/opt/cli`、`/opt/skills`。Profile 中自有的 `data/profiles/<profile>/skills/sdd-*` 是本部署的角色流程合同，仍属于代码仓库；下载目录只承载两个第三方 Skill 来源。
+
+升级版本或 revision 时，必须同时更新脚本中的锁定值与校验值，人工审查上游变更后再部署。运行中的 Agent 不下载或更新这些资产。
 
 ## 6. 自动开发工作流
 
-### 6.1 启动协议
+### 6.1 中文 SPEC、PLAN、TASKS 模板
+
+三个模板分别位于：
+
+- `templates/spec-template.md`
+- `templates/plan-template.md`
+- `templates/tasks-template.md`
+
+模板参考 GitHub Spec Kit `main` 提交 `4d3a4281bc63bd2af9f2515bb1036fc38da1294e` 的最新 `spec-template.md`、`plan-template.md`、`tasks-template.md`，并中文化适配当前合同：
+
+- SPEC 按优先级描述可独立验证的用户故事、验收场景、功能需求、成功标准、假设及 PRD 覆盖。
+- PLAN 写技术上下文、治理检查、调研决策、接口/数据/安全/测试/回滚设计、真实项目结构和 SPEC 追溯。
+- TASKS 使用在完整 PRD TASKS 集内全局唯一且稳定的 `T001` 编号、严格 checklist 行、精确文件路径、显式 `depends_on`、验收/测试、执行波次、无环 DAG 和覆盖矩阵。
+
+producer 必须从对应模板生成工件；reviewer 只把实质性缺项作为问题，不因纯排版差异阻塞交付。
+
+上游模板：[SPEC](https://github.com/github/spec-kit/blob/4d3a4281bc63bd2af9f2515bb1036fc38da1294e/templates/spec-template.md)、[PLAN](https://github.com/github/spec-kit/blob/4d3a4281bc63bd2af9f2515bb1036fc38da1294e/templates/plan-template.md)、[TASKS](https://github.com/github/spec-kit/blob/4d3a4281bc63bd2af9f2515bb1036fc38da1294e/templates/tasks-template.md)。
+
+### 6.2 启动协议
 
 向 `dispatcher` 发送：
 
@@ -270,7 +317,7 @@ host + project_id + prd_path + prd_commit_sha
 
 重复消息恢复现有 run；已完成则返回结果；同一路径的新 PRD commit 创建新 run。
 
-### 6.2 共享 checkout、分支和 MR
+### 6.3 共享 checkout、分支和 MR
 
 路径固定为：
 
@@ -288,7 +335,7 @@ feature/<prd-basename>-<prd_sha8>
 
 Dispatcher Skill 使用标准 `git`、`glab` 和 `hermes kanban` 命令幂等准备与清理 worktree，不调用 fleet 脚本。所有 producer 共用该分支、worktree 和 MR；reviewer/tester 只评论，不修改产物。
 
-### 6.3 Worker/continuation 双卡
+### 6.4 Worker/continuation 双卡
 
 每个 dispatcher gate 创建：
 
@@ -307,7 +354,7 @@ dispatcher gate G
 
 G 只有在 W、C 和依赖都核对完成后才能结束。W 完成后 C 重新读取 completion metadata 及 GitLab live state，再创建下一对卡。任何未知 `head_sha`、digest、review、pipeline 或 merge 结论在 live reconcile 前保持为空。
 
-### 6.4 门禁
+### 6.5 门禁
 
 - SPEC、PLAN、TASKS 分别使用排序后的 `path + blob_sha` digest 和 reviewer 实际读取的 commit。
 - 修改上游产物会作废对应门禁及全部下游门禁。
@@ -341,6 +388,7 @@ G 只有在 W、C 和依赖都核对完成后才能结束。W 完成后 C 重新
 - 完整 `data/`：Kanban DB、profiles、sessions、memories、skills、pending approval、Gateway 和 lark-cli 状态。
 - 完整 `projects/`：checkout、共享 worktree 和本地未推送状态。
 - 根 `.env` 和各 Profile `.env` 应进入单独的秘密备份，不进入 Git。
+- `cli/` 与 `skills/` 是可重建下载物，不需要备份；恢复时重新运行下载脚本。
 
 从旧脚本式部署迁移：
 
@@ -348,7 +396,7 @@ G 只有在 W、C 和依赖都核对完成后才能结束。W 完成后 C 重新
 2. 将旧 `HERMES_DATA_DIR` 内容复制到新的 `data/`，保留现有 `.env`、Memory、Skill、session、pending 和 Kanban 数据。
 3. 将旧 `PROJECTS_DIR` 作为新的 `PROJECTS_DIR`，或复制到 `projects/`。
 4. 用本部署的 `config.yaml`、SOUL/角色 Skill 逐项人工合并，不覆盖已经批准的运行态 Memory/Skill。
-5. 不迁移旧 tooling named volume；使用本包 `tooling/`。
+5. 不迁移旧 tooling named volume 或仓库内二进制；运行 `./scripts/fetch-external-assets.sh` 生成新的 `cli/` 与 `skills/`。
 6. 启动新 Compose。旧补丁位于旧容器镜像可写层，不会进入新官方镜像容器。
 
-本仓库不提供自动迁移或验证脚本。
+本仓库不提供自动迁移、运行时同步或部署验证脚本；只提供需要管理员主动执行的外部资产下载与校验脚本。

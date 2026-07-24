@@ -16,11 +16,13 @@ memory:
   write_approval: true
 curator:
   prune_builtins: false
+dashboard:
+  show_token_analytics: true
 skills:
   disabled: [ascii-video, comfyui, manim-video, touchdesigner-mcp, hyperframes, kanban-video-orchestrator, blender-mcp, gif-search, youtube-content, songwriting-and-ai-music, heartmula, songsee, audiocraft-audio-generation, openhue, minecraft-modpack-server, pokemon-player]
   external_dirs:
-    - /opt/tooling/gitlab/skills
-    - /opt/tooling/lark/skills
+    - /opt/skills/gitlab
+    - /opt/skills/lark
   template_vars: true
   inline_shell: false
   guard_agent_created: true

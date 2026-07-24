@@ -25,8 +25,8 @@ curator:
 skills:
   disabled: [ascii-video, comfyui, manim-video, touchdesigner-mcp, hyperframes, kanban-video-orchestrator, blender-mcp, gif-search, youtube-content, songwriting-and-ai-music, heartmula, songsee, audiocraft-audio-generation, openhue, minecraft-modpack-server, pokemon-player]
   external_dirs:
-    - /opt/tooling/gitlab/skills
-    - /opt/tooling/lark/skills
+    - /opt/skills/gitlab
+    - /opt/skills/lark
   template_vars: true
   inline_shell: false
   guard_agent_created: true
@@ -44,6 +44,7 @@ kanban:
   max_in_progress_per_profile: 1
 
 dashboard:
+  show_token_analytics: true
   kanban:
     lane_by_profile: true
     include_archived_by_default: false
