@@ -8,11 +8,11 @@ services:
     environment:
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: "0.0.0.0"
-      # Change these three values before deployment. Rotate PASSWORD and SECRET
-      # together later so existing dashboard sessions are invalidated.
+      # Rotate PASSWORD and SECRET together later so existing dashboard
+      # sessions are invalidated.
       HERMES_DASHBOARD_BASIC_AUTH_USERNAME: "admin"
-      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: "CHANGE_ME_BEFORE_DEPLOYMENT"
-      HERMES_DASHBOARD_BASIC_AUTH_SECRET: "CHANGE_ME_TO_A_RANDOM_SECRET_OF_AT_LEAST_32_BYTES"
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: "Hollysys#1234"
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: "3b36252ea83117b615c8a79933f7c603934606d8fdd60bef247513b479cee8c4"
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       PATH: /opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
