@@ -15,6 +15,13 @@ terminal:
   backend: local
   cwd: /workspace/projects
   home_mode: profile
+  env_passthrough:
+    - GITLAB_HOST
+    - GITLAB_TOKEN
+    - LARKSUITE_CLI_CONFIG_DIR
+    - LARKSUITE_CLI_DATA_DIR
+    - LARKSUITE_CLI_NO_UPDATE_NOTIFIER
+    - LARKSUITE_CLI_NO_SKILLS_NOTIFIER
 
 approvals:
   mode: off

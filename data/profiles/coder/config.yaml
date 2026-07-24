@@ -10,6 +10,9 @@ terminal:
   backend: local
   cwd: /workspace/projects
   home_mode: profile
+  env_passthrough:
+    - GITLAB_HOST
+    - GITLAB_TOKEN
 approvals:
   mode: off
 memory:
