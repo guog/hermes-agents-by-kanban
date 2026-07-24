@@ -1,6 +1,6 @@
 services:
   hermes:
-    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40}
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}
     pull_policy: missing
     container_name: hermes-sdd
     restart: unless-stopped
