@@ -1,7 +1,7 @@
 # Hermes Kanban Hollysys Delivery Agent Fleet
 
 这是一套面向可信内部网络和 Ubuntu Linux/AMD64 的 Hermes Agent 0.19.0 多 Agent 部署包。
-部署运行 digest 锁定的官方 Hermes 镜像，通过只读挂载加载无 LLM 的 Python Hollysys
+部署运行固定版本 tag 的官方 Hermes 镜像，通过只读挂载加载无 LLM 的 Python Hollysys
 Controller、国内软件源配置和启动检查脚本；不构建定制镜像、不修改 `/opt/hermes`。
 
 人类通过飞书 Dispatcher 启动一次正式交付；Dispatcher 是唯一命令、状态和异常入口，
@@ -24,7 +24,7 @@ Controller、国内软件源配置和启动检查脚本；不构建定制镜像�
 
 Compose 只有一个 `hermes` service：
 
-- 使用 Linux AMD64 manifest digest 固定的官方 `nousresearch/hermes-agent:v2026.7.20`。
+- 使用官方Docker镜像 `nousresearch/hermes-agent:v2026.7.20`。
 - 以挂载的 s6 root 初始化脚本先检查 .NET SDK 8，再由官方 wrapper 降权，以 `python -m hollysys_controller.daemon` 作为容器前台主进程；Controller 退出会触发容器重启，Gateway 和 Dashboard 仍由官方 s6 监督。
 - Dashboard 发布到宿主机所有网卡，局域网用户使用同一组固定账号访问。
 - 首次缺少镜像时由 Compose 自动拉取，不执行构建。
@@ -146,7 +146,8 @@ ChromeDriver、Electron、Sharp 或 Prisma 后，应在目标仓库实际执行�
 安装成功后卸载仓库配置、删除 Microsoft APT 索引，使后续 apt/apt-get 仍只使用挂载的
 阿里 Debian 源。
 APT 安装写入容器可写层：普通 stop/start 会复用并跳过，`docker compose up
---force-recreate` 或删除容器后会重新检测并安装；官方镜像和 digest 始终不变。
+--force-recreate` 或删除容器后会重新检测并安装；镜像版本由 `HERMES_IMAGE` 明确配置。
+目标机已有该版本时可使用 `docker compose up -d --pull never hermes`，避免再次拉取。
 `dotnet restore` 继续服从目标仓库的 `NuGet.Config`；要求完全内网化时必须由企业提供
 NuGet 代理地址，不能把不存在的阿里公共地址写入全局配置。
 
@@ -158,7 +159,7 @@ NuGet 代理地址，不能把不存在的阿里公共地址写入全局配置�
 
 | Profile | 职责 | GitLab 权限建议 | Feishu Gateway |
 | --- | --- | --- | --- |
-| `dispatcher` | 飞书命令解析、`hollysysctl` 状态展示、异常交互 | Reporter | 是 |
+| `dispatcher` | 飞书命令解析、`hollysysctl` 状态展示、异常交互 | Maintainer（Dispatcher 只读使用，Controller 复用） | 是 |
 | `prd-writer` | 与人类编写并合入 PRD | Developer | 是 |
 | `fde` | 整理现场反馈并创建普通 Issue | Reporter | 是 |
 | `spec-writer` | 生成完整 SPEC 集并创建唯一 Draft MR | Developer | 否 |
@@ -171,8 +172,9 @@ NuGet 代理地址，不能把不存在的阿里公共地址写入全局配置�
 | `tester` | 对精确 MR head 独立测试 | Reporter | 否 |
 | `code-reviewer` | 对同一 MR head 独立审查代码 | Reporter | 否 |
 
-Controller 不是 Agent Profile。它使用独立 Maintainer token，独占正式卡创建、GitLab
-门禁复核和 `sha=<checked_head>` 合并权限。
+Controller 不是 Agent Profile。它复用 Dispatcher 的群组级 Maintainer token，并独占
+正式卡创建、GitLab 门禁复核和 `sha=<checked_head>` 合并动作；Dispatcher 自身仍只读使用
+该身份。
 
 每个 Profile 已直接位于 Hermes 官方运行态目录。`SOUL.md`、Memory 和角色 Skill 不需要复制或安装。Memory 与 Skill 写入继续使用：
 
@@ -268,22 +270,24 @@ chmod 600 data/profiles/dispatcher/.env
 - `FEISHU_APP_SECRET`
 - `API_SERVER_PORT`，默认分别为 `8642`、`8643`、`8644`
 
-不要把 Agent 的 GitLab 或 Feishu 凭据放入根 `.env`。Dispatcher 的 token 必须是只读
-Reporter；`terminal.home_mode: profile` 使各 Agent 使用独立凭据。
+不要把 Agent 的 GitLab 或 Feishu 凭据放入根 `.env`。Dispatcher 配置群组级 Maintainer
+token，但自身只读使用；Controller 复用同一 token 执行受控写入和 checked-head merge。
+`terminal.home_mode: profile` 使其余 Agent 使用各自独立凭据。
 
 ### 3.2.1 Controller Maintainer 凭据
 
-Controller token 不进入环境变量、Profile 或 Git。创建：
+Controller 启动时从独立文件读取 token；该文件复用
+`data/profiles/dispatcher/.env` 中的 `GITLAB_TOKEN`，但不进入根环境变量或 Git。部署时写入：
 
 ```bash
 mkdir -p data/controller
 install -m 600 /dev/null data/controller/gitlab-token
-# 用安全编辑器写入一个作用域受限的 GitLab Maintainer token
+# 用安全编辑器写入与 dispatcher/.env 相同的群组级 Maintainer token
 ```
 
-Controller 启动时拒绝 group/other 可读的 token 文件。该身份只供 `glab api` 和受控
-Git workspace 准备使用。五类 identity 白名单可填写 GitLab numeric user id、username
-或显示名，用逗号分隔；留空会使对应 gate 必然失败。
+Controller 启动时拒绝 group/other 可读的 token 文件。Dispatcher 不使用该权限写评论、
+改 MR 或合并；受控写入只由 Controller 执行。五类 identity 白名单可填写 GitLab numeric
+user id、username 或显示名，用逗号分隔；留空会使对应 gate 必然失败。
 
 ### 3.3 lark-cli
 
@@ -712,7 +716,8 @@ Dispatcher 不能直接恢复。它把真实 sender/chat/thread/message/answer �
 - Controller 只认 `managed_cards` 中的 ID，并回读核对 `created_by=hollysys-controller`、
   idempotency、parent、assignee、Skill 和严格 card JSON。
 - completion schema 由 worker 自检、Controller 强制验证；非法 done 卡不能推进。
-- Controller Maintainer token 独占 checked-head merge；Dispatcher 是 Reporter。
+- Controller 与 Dispatcher 复用群组级 Maintainer token；checked-head merge 只由
+  Controller 执行，Dispatcher 的角色合同仍禁止 GitLab 写操作。此隔离是应用级而非凭据级。
 - Memory/Skill 修改仍经过 Hermes 官方 write approval。
 
 仍需客观看待的边界：

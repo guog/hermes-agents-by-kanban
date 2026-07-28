@@ -15,7 +15,7 @@ version: 2.0.0
 - 不调用 `hermes kanban create/link/promote/unblock/complete` 塑造或推进正式流程。
 - 不创建 continuation、gate、merge 或恢复卡。
 - 不凭 MR 评论、聊天记忆或卡片标题自行判断下一阶段。
-- 不使用 Dispatcher GitLab Reporter 身份写评论、改 MR 或合并。
+- 不使用 Dispatcher 的群组级 Maintainer token 写评论、改 MR 或合并；同一 token 的受控写入只由 Controller 执行。
 - 不绕过 Controller 直接向 worker 发任务。
 
 ## 启动

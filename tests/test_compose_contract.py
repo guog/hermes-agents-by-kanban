@@ -29,10 +29,14 @@ class ComposeContractTests(unittest.TestCase):
             ["${HERMES_DASHBOARD_PORT:-9119}:9119"],
         )
 
-    def test_image_is_digest_pinned_for_linux_amd64(self) -> None:
+    def test_image_uses_selected_release_tag_for_linux_amd64(self) -> None:
         service = self.compose["services"]["hermes"]
         self.assertEqual(service["platform"], "linux/amd64")
-        self.assertIn("@sha256:", service["image"])
+        self.assertEqual(
+            service["image"],
+            "${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}",
+        )
+        self.assertEqual(service["pull_policy"], "missing")
 
 if __name__ == "__main__":
     unittest.main()
