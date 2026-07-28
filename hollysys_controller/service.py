@@ -36,6 +36,7 @@ from .models import (
     StartRequest,
     TestDisposition,
     WorkMode,
+    validate_persisted_completion_metadata,
 )
 from .notifier import LarkNotifier
 from .store import ControllerStore, ManagedCard
@@ -455,6 +456,116 @@ class ControllerService:
                 "repository_base_sha": run.workspace.repository_base_sha,
             }
 
+    def status_summary(self, run_key: str) -> dict:
+        """Return the authoritative local workflow snapshot without GitLab I/O."""
+        protocol_version = self._run_protocol_version(run_key)
+        if protocol_version != "hollysys-controller/v2":
+            return {
+                **self._historical_status(run_key, protocol_version),
+                "snapshot": {
+                    "authority": "controller-store+kanban",
+                    "gitlab_audit": "not_requested",
+                },
+            }
+
+        history, run = self._history(run_key)
+        active = [item for item in history if item.task.status in ACTIVE_STATUSES]
+        current = active[-1] if active else None
+        current_record = (
+            parse_card_body(current.task.body)
+            if current and current.managed.purpose == "work"
+            else None
+        )
+        attempts = self._attempts_by_stage(history)
+        document_review_attempts = self._review_attempts_by_stage(history)
+        protocol_failures = self._protocol_failures_by_stage(history)
+        review_stages = {
+            Phase.SPEC: Stage.SPEC_REVIEW,
+            Phase.PLAN: Stage.PLAN_REVIEW,
+            Phase.TASKS: Stage.TASKS_REVIEW,
+        }
+        review_attempts = {
+            phase.value: document_review_attempts.get(stage, 0)
+            for phase, stage in review_stages.items()
+        }
+        review_remaining = {
+            phase: max(0, self.config.document_review_limit - count)
+            for phase, count in review_attempts.items()
+        }
+        blocked_comment = None
+        if current and current.task.status in {"blocked", "triage"}:
+            blocked_comment = next(
+                (
+                    comment["body"]
+                    for comment in reversed(current.task.comments)
+                    if "[human-block:v1]" in comment["body"]
+                ),
+                current.task.latest_summary,
+            )
+            if blocked_comment is None and current.managed.purpose == "exception":
+                blocked_comment = current.task.body
+
+        exact_stage = current.managed.stage if current else "reconciling"
+        phase = (
+            PHASE_FOR_STAGE[Stage(current.managed.stage)].value
+            if current and current.managed.purpose == "work"
+            else "exception"
+            if current
+            else "reconciling"
+        )
+        code_modifications = self._code_modification_count(history)
+        store_health = self.store.health()
+        controller_cursor = int(
+            store_health["event_cursors"].get(run.workspace.board, 0)
+        )
+        kanban_max_event_id = self.reader.max_event_id(run.workspace.board)
+
+        return {
+            "run_key": run_key,
+            "phase": phase,
+            "stage": exact_stage,
+            "active_card": (
+                {
+                    "id": current.task.id,
+                    "stage": current.managed.stage,
+                    "iteration": current.managed.iteration,
+                    "mode": current_record.mode.value if current_record else None,
+                    "agent": current.task.assignee,
+                    "status": current.task.status,
+                    "purpose": current.managed.purpose,
+                }
+                if current
+                else None
+            ),
+            "attempts": {stage.value: count for stage, count in attempts.items()},
+            "review_attempts": review_attempts,
+            "review_remaining": review_remaining,
+            "code_modifications": {
+                "used": code_modifications,
+                "remaining": max(
+                    0,
+                    self.config.code_modification_limit - code_modifications,
+                ),
+                "limit": self.config.code_modification_limit,
+            },
+            "protocol_failures": {
+                stage.value: count for stage, count in protocol_failures.items()
+            },
+            "blocked": blocked_comment,
+            "board": run.workspace.board,
+            "worktree": run.workspace.worktree,
+            "repository_base_sha": run.workspace.repository_base_sha,
+            "snapshot": {
+                "authority": "controller-store+kanban",
+                "gitlab_audit": "not_requested",
+                "controller_event_cursor": controller_cursor,
+                "kanban_max_event_id": kanban_max_event_id,
+                "event_lag": max(0, kanban_max_event_id - controller_cursor),
+                "outbox_pending": store_health["outbox_pending"],
+                "failed_operations": store_health["failed_operations"],
+            },
+        }
+
     def resolve(self, raw: dict) -> dict:
         request = ResolveRequest.model_validate(raw)
         key = f"resolve:{request.block_id}:{request.message_id}"
@@ -773,7 +884,9 @@ class ControllerService:
         if latest.task.status != "done":
             return
         try:
-            metadata = CompletionMetadata.model_validate(latest.task.latest_metadata)
+            metadata = validate_persisted_completion_metadata(
+                latest.task.latest_metadata
+            )
             self._validate_completion_context(run, latest, metadata)
             self._validate_finalization_context(history, latest, metadata)
         except (ValidationError, ValueError, TypeError) as exc:
@@ -1403,7 +1516,7 @@ class ControllerService:
             ):
                 continue
             try:
-                metadata = CompletionMetadata.model_validate(
+                metadata = validate_persisted_completion_metadata(
                     item.task.latest_metadata
                 )
                 self._validate_completion_context(
@@ -1451,7 +1564,7 @@ class ControllerService:
                 if item.managed.stage not in {producer.value, reviewer.value}:
                     continue
                 try:
-                    metadata = CompletionMetadata.model_validate(
+                    metadata = validate_persisted_completion_metadata(
                         item.task.latest_metadata
                     )
                     self._validate_completion_context(run, item, metadata)
@@ -1686,7 +1799,7 @@ class ControllerService:
         )
         if review_item is None:
             raise ValueError("finalization source review card was not found")
-        review_metadata = CompletionMetadata.model_validate(
+        review_metadata = validate_persisted_completion_metadata(
             review_item.task.latest_metadata
         )
         expected_review_stage = DOCUMENT_REVIEW_FOR_PRODUCER[metadata.stage]
@@ -1857,7 +1970,9 @@ class ControllerService:
             if item.managed.stage != stage.value or item.task.status != "done":
                 continue
             try:
-                metadata = CompletionMetadata.model_validate(item.task.latest_metadata)
+                metadata = validate_persisted_completion_metadata(
+                    item.task.latest_metadata
+                )
                 self._validate_completion_context(
                     parse_card_body(item.task.body).run,
                     item,
@@ -1879,7 +1994,7 @@ class ControllerService:
             ):
                 continue
             try:
-                metadata = CompletionMetadata.model_validate(
+                metadata = validate_persisted_completion_metadata(
                     item.task.latest_metadata
                 )
                 self._validate_completion_context(
@@ -2157,5 +2272,6 @@ class ControllerService:
             return json.dumps(
                 error.errors(include_input=False, include_url=False),
                 ensure_ascii=False,
+                default=str,
             )
         return str(error)

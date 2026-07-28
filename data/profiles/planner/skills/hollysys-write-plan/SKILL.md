@@ -1,7 +1,7 @@
 ---
 name: hollysys-write-plan
 description: 当 SPEC 已冻结且 Kanban 卡要求规划时，在唯一共享 MR 编写可验证的完整 PLAN 集。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 编写 PLAN 集合
@@ -28,3 +28,9 @@ version: 2.0.0
    `repository_evidence`。不得因业务缺口 fail。finalization 按 forced-advance
    模板发布决策评论并提交完整最终基线、决策和风险证据后 pass。不得创建下一卡、
    审查或合并。
+7. 调用完成工具前，必须重新读取当前卡片并逐项原样复制 Controller 上下文：
+   `checkout` 取 `run.workspace.checkout`（不是 worktree、终端 cwd 或历史路径），
+   `iteration` 取当前卡片 iteration（不是 review 次数）。不得复用父卡或前一次
+   metadata。`repository_evidence.inspected_paths` 只允许
+   `repository_base_sha` 上已存在的精确路径；逐项执行
+   `git cat-file -e "$repository_base_sha:$path"`，不得把本轮新增工件路径列入其中。

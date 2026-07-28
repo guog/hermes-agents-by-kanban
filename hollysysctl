@@ -1,2 +1,2 @@
 #!/bin/sh
-exec python -m hollysys_controller.cli "$@"
+exec /opt/hermes/.venv/bin/python -m hollysys_controller.cli "$@"

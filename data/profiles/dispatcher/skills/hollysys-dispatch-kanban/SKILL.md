@@ -47,20 +47,37 @@ active_card、board 和 worktree 精简展示给原会话。命令失败时原�
 
 ## 状态
 
-收到 `状态 <run_key>` 时执行：
+收到 `状态 <run_key>`，以及“当前阶段”“某个 Review 是否完成”“是否已进入下一阶段”
+等流程进度问题时，必须先且只执行：
+
+```bash
+hollysysctl status-summary --run-key '<run_key>'
+```
+
+展示 `phase`、精确 `stage`、active card/mode/status、review 次数与剩余次数、
+CODE `code_modifications.used/remaining/limit`、
+run 的 `repository_base_sha`、blocked 摘要，以及
+`snapshot.controller_event_cursor/kanban_max_event_id/event_lag`。明确说明这是
+Controller store + Kanban 的权威流程快照，`gitlab_audit=not_requested` 表示本次
+没有复查 MR/head/gates，并不表示门禁失败。若
+`state=historical_read_only`，说明这是未迁移的 v1 历史；active v1 必须先结束，
+不得尝试续跑。
+Controller 返回 `reconciling` 时明确说正在基于 Kanban+GitLab复算，不猜下一阶段。
+
+只有人类明确要求“复查 GitLab MR/head/gates”“完整门禁审计”或工件冻结有效性时，
+才在快速摘要之后执行一次：
 
 ```bash
 hollysysctl status --run-key '<run_key>'
 ```
 
-展示 `phase`、精确 `stage`、active card/mode/status、review 次数与剩余次数、
-CODE `code_modifications.used/remaining/limit`、
-run 的 `repository_base_sha`、`frozen_artifacts` 的
-`reviewed|forced_after_review_limit`、MR/head、gates、
-`key_decisions`、unresolved findings、residual risks 和 blocked 摘要。若
-`state=historical_read_only`，说明这是未迁移的 v1 历史；active v1 必须先结束，
-不得尝试续跑。
-Controller 返回 `reconciling` 时明确说正在基于 Kanban+GitLab复算，不猜下一阶段。
+展示 `frozen_artifacts` 的 `reviewed|forced_after_review_limit`、MR/head、gates、
+`key_decisions`、unresolved findings 和 residual risks。完整查询超时时，立即回退
+到 `status-summary`：报告流程快照，并说明 GitLab 完整审计繁忙。若 `health` 正常、
+`event_lag` 没有持续增加且 active card 仍在变化，不得建议重启 Controller。
+不得把“SPEC/PLAN/TASKS Review 是否完成”理解成完整 GitLab 审计；阶段是否完成以
+快速摘要中的当前 `phase/stage/active_card` 为准。流程已经进入后续 phase 时，可以
+据此确认上游 phase 已由 Controller 推进完成。
 
 解释工件时说明它们是基于 `repository_base_sha` 的现有企业 MES 定制，不是绿地开发；
 不要把“新增功能”误解为新建独立系统。
@@ -97,7 +114,7 @@ hollysysctl resolve \
   --answer '<answer>'
 ```
 
-`block_id` 必须来自 `hollysysctl status` 返回的阻塞事实或 Controller 异常提示；不得
+`block_id` 必须来自 `hollysysctl status-summary` 返回的阻塞事实或 Controller 异常提示；不得
 根据 run/card 自行编造。Controller 会验证 root origin、匹配的
 `[human-block:v1]` 评论、消息幂等和卡片状态，再创建新的同阶段 attempt。命令拒绝
 错误 sender/chat/thread、重复或不匹配的 block 时，只解释拒绝原因，不直接改 Kanban。
@@ -108,9 +125,10 @@ Controller 不可用或出现 Controller exception 时先执行：
 
 ```bash
 hollysysctl health
-hollysysctl status --run-key '<run_key>'
+hollysysctl status-summary --run-key '<run_key>'
 ```
 
-只报告返回的事件游标、最近对账、outbox、GitLab/Kanban 连通性和异常卡。若需要
-管理员动作，给出一个最小、可验证的动作；修复后重新查询状态。不得用人工创建下一卡
-代替恢复 Controller。
+只报告返回的事件游标、最近对账、outbox、GitLab/Kanban 连通性和异常卡。只有
+Controller socket 缺失、`health` 失败、事件 lag 持续增加且 active card 长时间不变，
+或失败操作累积时，才建议管理员重启。若需要管理员动作，给出一个最小、可验证的动作；
+修复后重新查询状态。不得用人工创建下一卡代替恢复 Controller。

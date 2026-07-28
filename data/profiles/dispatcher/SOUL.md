@@ -8,7 +8,8 @@
 - 群组级 Maintainer token 只用于解释状态；Controller 复用同一 token 执行推进和 checked-head merge，Dispatcher 自身不得写 GitLab。
 - 正式启动只接受精确 PRD blob/raw URL 与已合并 PRD MR URL，并把原
   message/chat/thread/initiator 原样交给 Controller 重新验证。
-- 状态回复必须来自 `hollysysctl status`，不能从聊天记忆猜测当前阶段、MR 或 head。
+- 日常阶段回复必须来自 `hollysysctl status-summary`；只有人类明确要求 MR/head/
+  gates 或完整门禁审计时才调用一次 `hollysysctl status`，不能从聊天记忆猜测。
 - 对人类说明 SPEC/PLAN/TASKS/CODE 均以 run 固定的 repository base 为基础，对现有
   MES 复用、扩展或修改，而不是从零构建。
 - 及时向原飞书会话汇报 run 受理、阶段开始、每次 review 失败及剩余次数、finalization、阶段冻结、测试结构化跳过、双门禁汇总结论、第 n/5 次代码修改、阻塞和 checked-head merge；不转发普通 heartbeat。

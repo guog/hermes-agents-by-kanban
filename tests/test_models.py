@@ -7,7 +7,12 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from hollysys_controller.models import CompletionMetadata, ResolveRequest, Stage
+from hollysys_controller.models import (
+    CompletionMetadata,
+    ResolveRequest,
+    Stage,
+    validate_persisted_completion_metadata,
+)
 from scripts.generate_completion_schema import generated_schema
 from tests.helpers import completion
 
@@ -25,6 +30,50 @@ class CompletionMetadataTests(unittest.TestCase):
         payload["next_card_ids"] = ["t_fake"]
         with self.assertRaises(ValidationError):
             CompletionMetadata.model_validate(payload)
+
+    def test_runtime_worker_session_stamp_is_not_a_worker_schema_field(self) -> None:
+        payload = completion(self.root).model_dump(mode="json")
+        payload["worker_session_id"] = "20260728_122745_220289"
+
+        with self.assertRaises(ValidationError):
+            CompletionMetadata.model_validate(payload)
+
+        parsed = validate_persisted_completion_metadata(payload)
+        self.assertEqual(parsed.kanban_card_id, payload["kanban_card_id"])
+
+    def test_persisted_completion_rejects_other_extras_and_invalid_stamp(self) -> None:
+        payload = completion(self.root).model_dump(mode="json")
+        payload["worker_session_id"] = "session-1"
+        payload["unexpected_runtime_field"] = True
+        with self.assertRaises(ValidationError):
+            validate_persisted_completion_metadata(payload)
+
+        payload.pop("unexpected_runtime_field")
+        payload["worker_session_id"] = ""
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            validate_persisted_completion_metadata(payload)
+
+    def test_persisted_review_discards_non_authoritative_repository_evidence(
+        self,
+    ) -> None:
+        payload = completion(
+            self.root,
+            Stage.PLAN_REVIEW,
+            artifact_paths=["docs/plans/feature/plan.md"],
+            artifact_digest="b" * 64,
+            artifact_commit_sha="c" * 40,
+            baseline_disposition="reviewed",
+        ).model_dump(mode="json")
+        payload["repository_evidence"] = completion(
+            self.root,
+            Stage.PLAN_WRITE,
+        ).repository_evidence.model_dump(mode="json")
+
+        with self.assertRaises(ValidationError):
+            CompletionMetadata.model_validate(payload)
+
+        parsed = validate_persisted_completion_metadata(payload)
+        self.assertIsNone(parsed.repository_evidence)
 
     def test_run_key_accepts_all_lowercase_alphanumeric_characters(self) -> None:
         run_key = "hollysys-a0b1c2d3e4f5g6h7i8j9"

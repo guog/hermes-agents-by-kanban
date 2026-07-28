@@ -1,7 +1,7 @@
 ---
 name: hollysys-analyze-tasks
 description: 当 Kanban 卡要求审查 TASKS 时，核对 SPEC/PLAN 映射、DAG、覆盖与验收并发布门禁。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 审查 TASKS 集合
@@ -21,3 +21,6 @@ version: 2.0.0
 3. 在审查 commit 上计算完整 TASKS path/blob 摘要，发布包含路径、digest、`artifact_commit_sha`、card ID 和评论 URL 的幂等 v5 gate。
 4. 阻塞性任务缺陷使用 `fail` 并给 tasker 可在 TASKS 内完成的动作；不得跨阶段回退。
 5. 使用 v2 normal metadata；pass/fail 都绑定 paths/digest/artifact commit 和 gate URL，pass 填 `baseline_disposition=reviewed`，fail 给非空 issues，并把门禁评论中的关键自主决策摘要写入 `key_decisions`。不得编辑产物、实现、push、创建卡片或合并。
+   审查必须核实仓库证据，但 completion metadata 不得包含仅 authoring pass 可用的
+   `repository_evidence`；仓库核查结果写入 gate 评论、`verification` 和
+   `key_decisions`。

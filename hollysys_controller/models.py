@@ -428,6 +428,38 @@ class CompletionMetadata(StrictModel):
         return self
 
 
+def validate_persisted_completion_metadata(raw: object) -> CompletionMetadata:
+    """Validate metadata after removing known non-authoritative extras.
+
+    Hermes v2026.7.20 appends ``worker_session_id`` after a scoped worker calls
+    ``kanban_complete``.  It is runtime provenance, not part of the worker's
+    strict business completion contract.
+
+    Review/test agents have also been observed copying ``repository_evidence``
+    into their persisted result after inspecting the repository.  That field
+    can authorize nothing for those stages and the Controller independently
+    validates their gate evidence, so this temporary compatibility boundary
+    discards it.  The public worker schema remains strict and rejects both
+    fields; every other extra still reaches ``CompletionMetadata``.
+    """
+    if not isinstance(raw, dict):
+        return CompletionMetadata.model_validate(raw)
+    payload = dict(raw)
+    if "worker_session_id" in payload:
+        worker_session_id = payload.pop("worker_session_id")
+        if not isinstance(worker_session_id, str) or not worker_session_id.strip():
+            raise ValueError("worker_session_id must be a non-empty string")
+    if payload.get("stage") in {
+        Stage.SPEC_REVIEW,
+        Stage.PLAN_REVIEW,
+        Stage.TASKS_REVIEW,
+        Stage.TEST,
+        Stage.CODE_REVIEW,
+    }:
+        payload.pop("repository_evidence", None)
+    return CompletionMetadata.model_validate(payload)
+
+
 class StartRequest(StrictModel):
     prd_blob_url: AnyHttpUrl
     prd_mr_url: AnyHttpUrl

@@ -6,6 +6,8 @@ import threading
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from hollysys_controller.kanban import (
     EventRecord,
     LEGACY_RUN_MARKER,
@@ -1167,6 +1169,44 @@ class ServiceRecoveryTests(unittest.TestCase):
             {"used": 0, "remaining": 5, "limit": 5},
         )
 
+        service.gitlab = type(
+            "UnexpectedGitLab",
+            (),
+            {
+                "__getattr__": lambda self, name: (_ for _ in ()).throw(
+                    AssertionError(f"status-summary called GitLab: {name}")
+                )
+            },
+        )()
+        service.store = type(
+            "SummaryStore",
+            (),
+            {
+                "health": staticmethod(
+                    lambda: {
+                        "event_cursors": {self.run.workspace.board: 17},
+                        "outbox_pending": 0,
+                        "failed_operations": 0,
+                    }
+                )
+            },
+        )()
+        service.reader = type(
+            "SummaryReader",
+            (),
+            {"max_event_id": staticmethod(lambda board: 20)},
+        )()
+
+        summary = service.status_summary(self.run.run_key)
+
+        self.assertEqual(summary["phase"], "plan")
+        self.assertEqual(summary["stage"], "plan-write")
+        self.assertEqual(summary["active_card"]["agent"], "planner")
+        self.assertEqual(summary["snapshot"]["gitlab_audit"], "not_requested")
+        self.assertEqual(summary["snapshot"]["event_lag"], 3)
+        self.assertNotIn("mr", summary)
+        self.assertNotIn("gates", summary)
+
     def test_frozen_violation_repairs_in_current_phase(self) -> None:
         service = object.__new__(ControllerService)
         service.store = ControllerStore(self.root / "controller.db")
@@ -1241,6 +1281,32 @@ class ServiceRecoveryTests(unittest.TestCase):
             service._protocol_failures_by_stage(history),
             {Stage.SPEC_WRITE: 1},
         )
+
+    def test_validation_error_text_serializes_model_validator_context(self) -> None:
+        review = completion(
+            self.root,
+            Stage.SPEC_REVIEW,
+            outcome="fail",
+            issues=["review finding"],
+            artifact_paths=["docs/spec.md"],
+            artifact_digest="a" * 64,
+            artifact_commit_sha="b" * 40,
+        ).model_dump(mode="json")
+        review["repository_evidence"] = completion(
+            self.root, Stage.SPEC_WRITE
+        ).repository_evidence.model_dump(mode="json")
+
+        with self.assertRaises(ValidationError) as caught:
+            CompletionMetadata.model_validate(review)
+
+        rendered = ControllerService._error_text(caught.exception)
+        details = json.loads(rendered)
+        self.assertEqual(details[0]["type"], "value_error")
+        self.assertIn(
+            "repository_evidence is only valid for an authoring pass",
+            details[0]["msg"],
+        )
+        self.assertIsInstance(details[0]["ctx"]["error"], str)
 
     def test_cancelled_review_does_not_consume_review_limit(self) -> None:
         card = CardRecord(

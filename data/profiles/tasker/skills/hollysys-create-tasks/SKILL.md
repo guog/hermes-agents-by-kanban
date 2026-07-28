@@ -1,7 +1,7 @@
 ---
 name: hollysys-create-tasks
 description: 当 SPEC 与 PLAN 已冻结时，为 Kanban 卡生成稳定、无环、可追溯的 TASKS DAG。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 创建 TASKS 集合
@@ -29,3 +29,9 @@ version: 2.0.0
 6. normal 卡用 v2 pass metadata，并提交严格 v6 `repository_evidence`；
    finalization 发布 forced-advance 评论及完整最终基线、决策和风险证据。不得以
    业务缺口 fail，不得实现、审查、创建卡片或合并。
+7. 调用完成工具前，必须重新读取当前卡片并逐项原样复制 Controller 上下文：
+   `checkout` 取 `run.workspace.checkout`（不是 worktree、终端 cwd 或历史路径），
+   `iteration` 取当前卡片 iteration（不是 review 次数）。不得复用父卡或前一次
+   metadata。`repository_evidence.inspected_paths` 只允许
+   `repository_base_sha` 上已存在的精确路径；逐项执行
+   `git cat-file -e "$repository_base_sha:$path"`，不得把本轮新增工件路径列入其中。

@@ -1,7 +1,7 @@
 ---
 name: hollysys-review-code
 description: 当 Kanban 卡要求代码审查时，独立审查 tester 刚检查的准确 MR head 并发布正确性门禁。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 审查交付头提交
@@ -25,4 +25,6 @@ version: 2.0.0
 6. 发布一条绑定准确 `head_sha` 和当前 card ID 的幂等 v5 `code-review` 评论，marker 的 `test=na`，并包含精确位置、证据和剩余风险。
 7. 使用严格 v6 metadata 完成，pass/fail 都必须将 `head_sha`、`mr_iid`、`mr_url`
    绑定到当前已审头，fail 给非空 issues。Controller 汇总两份结论后才决定合并或
-   第 N/5 次 coder 修改。绝不得修改代码、push、创建卡片/MR 或合并。
+   第 N/5 次 coder 修改。completion metadata 不得包含仅 authoring pass 可用的
+   `repository_evidence`；仓库核查证据写入 gate 评论和 `verification`。
+   绝不得修改代码、push、创建卡片/MR 或合并。

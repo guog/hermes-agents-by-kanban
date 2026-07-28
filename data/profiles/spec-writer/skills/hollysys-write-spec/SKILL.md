@@ -1,7 +1,7 @@
 ---
 name: hollysys-write-spec
 description: 当普通、重写或 finalization 卡要求编写 SPEC 时，在唯一共享 MR 生成可测试的 SPEC 集并遵守冻结基线。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 编写 SPEC 集合
@@ -34,3 +34,9 @@ version: 2.0.0
    SPEC 中记录最终取舍，并按 `/opt/fleet/templates/forced-advance-comment.md`
    发布唯一幂等评论；计算最终工件证据并填写完整 `forced_advance` 后 pass。
    不得创建下一卡、审查或合并。
+7. 调用完成工具前，必须重新读取当前卡片并逐项原样复制 Controller 上下文：
+   `checkout` 取 `run.workspace.checkout`（不是 worktree、终端 cwd 或历史路径），
+   `iteration` 取当前卡片 iteration（不是 review 次数）。不得复用父卡或前一次
+   metadata。`repository_evidence.inspected_paths` 只允许
+   `repository_base_sha` 上已存在的精确路径；逐项执行
+   `git cat-file -e "$repository_base_sha:$path"`，不得把本轮新增工件路径列入其中。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,14 @@ class StoreTests(unittest.TestCase):
         self.store.set_cursor("b", 9)
         self.store.set_cursor("b", 3)
         self.assertEqual(self.store.cursor("b"), 9)
+
+    def test_read_only_store_can_query_but_cannot_mutate(self) -> None:
+        self.store.set_cursor("b", 9)
+        read_only = ControllerStore(self.store.path, read_only=True)
+
+        self.assertEqual(read_only.cursor("b"), 9)
+        with self.assertRaises(sqlite3.OperationalError):
+            read_only.set_cursor("b", 10)
 
     def test_managed_card_upsert_does_not_create_business_state(self) -> None:
         self.store.add_managed_card(

@@ -4,8 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from hollysys_controller.cli import (
+    build_parser,
+    controller_snapshot_config,
+    params_for,
+)
 from hollysys_controller.models import RpcRequest
 from hollysys_controller.rpc import RpcServer, rpc_call
+from tests.helpers import config
 
 
 class RpcTests(unittest.IsolatedAsyncioTestCase):
@@ -30,6 +36,38 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(response.ok)
         self.assertEqual(response.result, {"method": "health", "probe": True})
+
+    def test_status_summary_is_a_local_cli_command(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "status-summary",
+                "--run-key",
+                "hollysys-abcdefghijklmnopqrst",
+            ]
+        )
+
+        self.assertEqual(
+            params_for(args),
+            (
+                "status-summary",
+                {"run_key": "hollysys-abcdefghijklmnopqrst"},
+            ),
+        )
+
+    def test_status_summary_ignores_the_agent_profile_home(self) -> None:
+        controller_config = config(Path(self.temp.name)).model_copy(
+            update={
+                "hermes_home": Path(self.temp.name) / "profiles" / "dispatcher",
+                "state_dir": Path(self.temp.name) / "data" / "controller",
+            }
+        )
+
+        snapshot_config = controller_snapshot_config(controller_config)
+
+        self.assertEqual(
+            snapshot_config.hermes_home,
+            Path(self.temp.name) / "data",
+        )
 
 
 if __name__ == "__main__":

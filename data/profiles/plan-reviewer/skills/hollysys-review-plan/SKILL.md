@@ -1,7 +1,7 @@
 ---
 name: hollysys-review-plan
 description: 当 Kanban 卡要求审查 PLAN 时，核对 SPEC、仓库约束与可执行性并发布门禁。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 审查 PLAN 集合
@@ -21,3 +21,6 @@ version: 2.0.0
 3. 在审查 commit 上计算 path/blob 摘要，发布包含完整路径、digest、`artifact_commit_sha`、card ID 和评论 URL 的幂等 v5 `plan-review` 评论。
 4. PLAN 阻塞缺陷使用 `fail` 并给 planner 可在 PLAN 内执行的动作；不得使用跨阶段结果，纯样式和可延后改进写 residual risk。
 5. 使用 v2 normal metadata；pass/fail 都绑定路径、digest、artifact commit 和 gate URL，pass 填 `baseline_disposition=reviewed`，fail 给非空 issues，并把门禁评论中的关键自主决策摘要写入 `key_decisions`。不得编辑 PLAN、创建 TASKS/卡片、push 或合并。
+   审查必须核实仓库证据，但 completion metadata 不得包含仅 authoring pass 可用的
+   `repository_evidence`；仓库核查结果写入 gate 评论、`verification` 和
+   `key_decisions`。

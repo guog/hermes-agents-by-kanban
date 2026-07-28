@@ -10,6 +10,7 @@ class ComposeContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         root = Path(__file__).resolve().parent.parent
+        cls.root = root
         cls.compose = yaml.safe_load(
             (root / "docker-compose.yaml").read_text(encoding="utf-8")
         )
@@ -37,6 +38,14 @@ class ComposeContractTests(unittest.TestCase):
             "${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}",
         )
         self.assertEqual(service["pull_policy"], "missing")
+
+    def test_hollysysctl_uses_the_managed_python_environment(self) -> None:
+        wrapper = (self.root / "hollysysctl").read_text(encoding="utf-8")
+        self.assertIn(
+            "exec /opt/hermes/.venv/bin/python -m hollysys_controller.cli",
+            wrapper,
+        )
+        self.assertNotIn("exec python -m hollysys_controller.cli", wrapper)
 
 if __name__ == "__main__":
     unittest.main()

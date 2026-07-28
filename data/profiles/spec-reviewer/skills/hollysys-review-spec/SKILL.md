@@ -1,7 +1,7 @@
 ---
 name: hollysys-review-spec
 description: 当 Kanban 卡要求审查 SPEC 时，验证完整性与可测试性并发布绑定摘要的门禁。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 审查 SPEC 集合
@@ -22,3 +22,6 @@ version: 2.0.0
 3. 在审查 commit 上计算排序后的 path/blob 摘要，使用 gate 模板发布幂等 v5 评论，包含完整路径、`artifact_digest`、`artifact_commit_sha`、当前 card ID 和本评论 URL。
 4. 阻塞性 SPEC 缺陷使用 `fail` 并给出 writer 可在 SPEC 内完成的精确动作；第几次 review 以卡片 iteration/历史为准，不自行决定回退。纯格式和可延后改进不得 fail。
 5. 使用 `protocol_version=hollysys-controller/v2,mode=normal` 的严格 v6 metadata 完成。pass 和 fail 都绑定 paths/digest/artifact commit；pass 填 `baseline_disposition=reviewed`，fail 必须给非空 issues；两者都把 gate URL 写入 `gitlab_urls`，并将门禁评论中的关键自主决策摘要写入 `key_decisions`。不得编辑产物、push、创建卡片或合并。
+   审查必须核实仓库证据，但 completion metadata 不得包含仅 authoring pass 可用的
+   `repository_evidence`；仓库核查结果写入 gate 评论、`verification` 和
+   `key_decisions`。

@@ -1,7 +1,7 @@
 ---
 name: hollysys-test
 description: 当 Kanban 卡要求独立测试时，验证唯一交付 MR 的准确当前 head 并发布可复现证据。
-version: 2.0.0
+version: 2.0.1
 ---
 
 # 测试交付头提交
@@ -22,4 +22,6 @@ version: 2.0.0
 7. 使用严格 v6 metadata 完成，必含完整上下文；pass/fail 都必须将 `head_sha`、
    `mr_iid`、`mr_url` 绑定到当前已测试头，fail 给非空 issues。Controller 会继续让
    code-reviewer 独立审查同一 head，再汇总两份结论；tester 不自行退回 coder。
+   completion metadata 不得包含仅 authoring pass 可用的 `repository_evidence`；
+   仓库与测试证据写入 gate 评论和 `verification`。
    不得解决问题、push、创建卡片/MR 或合并。

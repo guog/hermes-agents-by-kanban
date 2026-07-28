@@ -85,19 +85,32 @@ class ManagedCard:
 
 
 class ControllerStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = path
+        self.read_only = read_only
+        if read_only:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=10)
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"file:{self.path}?mode=ro",
+                uri=True,
+                timeout=10,
+            )
+        else:
+            conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
-            conn.commit()
+            if not self.read_only:
+                conn.commit()
         finally:
             conn.close()
 

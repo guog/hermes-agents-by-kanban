@@ -21,6 +21,9 @@ class RepositoryFirstContractTests(unittest.TestCase):
                 self.assertIn("repository_base_sha", text)
                 self.assertIn("repository_evidence", text)
                 self.assertIn("现有", text)
+                self.assertIn("run.workspace.checkout", text)
+                self.assertIn("当前卡片 iteration", text)
+                self.assertIn("git cat-file -e", text)
 
     def test_reviewers_reject_greenfield_assumptions(self) -> None:
         skills = (

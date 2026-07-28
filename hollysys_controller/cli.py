@@ -8,8 +8,18 @@ import sys
 import uuid
 from pathlib import Path
 
+from .config import ControllerConfig
 from .models import RpcRequest
 from .rpc import rpc_call
+from .service import ControllerService
+from .store import ControllerStore
+
+
+def controller_snapshot_config(config: ControllerConfig) -> ControllerConfig:
+    """Use the Controller data root even when an Agent has a profile home."""
+    return config.model_copy(
+        update={"hermes_home": config.state_dir.parent},
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status")
     status.add_argument("--run-key", required=True)
+
+    status_summary = sub.add_parser("status-summary")
+    status_summary.add_argument("--run-key", required=True)
 
     resolve = sub.add_parser("resolve")
     resolve.add_argument("--run-key", required=True)
@@ -67,6 +80,17 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
 
 async def _run(args: argparse.Namespace) -> int:
     method, params = params_for(args)
+    if method == "status-summary":
+        config = controller_snapshot_config(ControllerConfig.load())
+        store = ControllerStore(
+            config.state_dir / "controller.db",
+            read_only=True,
+        )
+        result = ControllerService(config, store=store).status_summary(
+            str(params["run_key"])
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     request = RpcRequest(id=str(uuid.uuid4()), method=method, params=params)
     response = await rpc_call(Path(args.socket), request)
     if not response.ok:
