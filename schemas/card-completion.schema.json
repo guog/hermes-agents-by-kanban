@@ -30,7 +30,7 @@
   ],
   "properties": {
     "schema_version": {"const": 2},
-    "run_key": {"type": "string", "pattern": "^sdd-[a-z2-7]{20}$"},
+    "run_key": {"type": "string", "pattern": "^sdd-[A-Za-z0-9]{20}$"},
     "stage": {
       "type": "string",
       "enum": [
@@ -85,7 +85,7 @@
     },
     "block_id": {
       "type": "string",
-      "pattern": "^sdd-[a-z2-7]{20}:t_[A-Za-z0-9_-]+:[1-9][0-9]*$"
+      "pattern": "^sdd-[A-Za-z0-9]{20}:t_[A-Za-z0-9_-]+:[1-9][0-9]*$"
     },
     "block_kind": {
       "type": "string",
