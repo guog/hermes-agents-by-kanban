@@ -6,49 +6,24 @@ services:
     container_name: hermes
     restart: unless-stopped
     command: ["python", "-m", "hollysys_controller.daemon"]
+    # .env is both the Compose interpolation file and the container environment
+    # file. User settings and mirror addresses live there to keep this file small.
+    env_file:
+      - .env
     environment:
       HERMES_DASHBOARD: "1"
-      # Bind inside the container so Docker can forward it, but publish only
-      # on host loopback below. Plugin REST routes are therefore not on LAN.
       HERMES_DASHBOARD_HOST: "0.0.0.0"
-      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-admin}
-      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:?set HERMES_DASHBOARD_BASIC_AUTH_PASSWORD in .env}
-      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${HERMES_DASHBOARD_BASIC_AUTH_SECRET:?set HERMES_DASHBOARD_BASIC_AUTH_SECRET in .env}
       HERMES_HOME: /opt/data
       PYTHONPATH: /opt/hollysys-controller-src
       HOLLYSYS_CONTROLLER_CONFIG: /opt/hollysys-controller/config.yaml
       HOLLYSYS_CONTROLLER_STATE_DIR: /opt/data/controller
       HOLLYSYS_CONTROLLER_SOCKET: /opt/data/controller/controller.sock
       HOLLYSYS_GITLAB_TOKEN_FILE: /opt/data/controller/gitlab-token
-      HOLLYSYS_GITLAB_HOST: ${HOLLYSYS_GITLAB_HOST:-}
-      HOLLYSYS_GITLAB_ALLOWED_GROUPS: ${HOLLYSYS_GITLAB_ALLOWED_GROUPS:-}
-      HOLLYSYS_SPEC_REVIEWER_IDENTITIES: ${HOLLYSYS_SPEC_REVIEWER_IDENTITIES:-}
-      HOLLYSYS_PLAN_REVIEWER_IDENTITIES: ${HOLLYSYS_PLAN_REVIEWER_IDENTITIES:-}
-      HOLLYSYS_TASKS_REVIEWER_IDENTITIES: ${HOLLYSYS_TASKS_REVIEWER_IDENTITIES:-}
-      HOLLYSYS_TESTER_IDENTITIES: ${HOLLYSYS_TESTER_IDENTITIES:-}
-      HOLLYSYS_CODE_REVIEWER_IDENTITIES: ${HOLLYSYS_CODE_REVIEWER_IDENTITIES:-}
-      PUID: ${PUID:-1000}
-      PGID: ${PGID:-1000}
       PATH: /opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.dotnet:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       PIP_CONFIG_FILE: /etc/pip.conf
-      PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
-      PIP_EXTRA_INDEX_URL: ""
-      UV_DEFAULT_INDEX: https://mirrors.aliyun.com/pypi/simple/
-      UV_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
-      UV_EXTRA_INDEX_URL: ""
-      NPM_CONFIG_REGISTRY: https://registry.npmmirror.com/
-      npm_config_registry: https://registry.npmmirror.com/
       NPM_CONFIG_USERCONFIG: /opt/fleet/container/mirrors/npmrc
-      COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
-      PNPM_CONFIG_REGISTRY: https://registry.npmmirror.com/
-      YARN_NPM_REGISTRY_SERVER: https://registry.npmmirror.com/
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      NOUS_API_KEY: ${NOUS_API_KEY:-}
     ports:
-      - "127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}:9119"
+      - "${HERMES_DASHBOARD_PORT:-9119}:9119"
     volumes:
       - ${HERMES_DATA_DIR:-./data}:/opt/data
       - ${PROJECTS_DIR:-./projects}:/workspace/projects

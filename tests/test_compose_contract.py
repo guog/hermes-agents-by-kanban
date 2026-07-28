@@ -22,10 +22,11 @@ class ComposeContractTests(unittest.TestCase):
         )
         self.assertEqual(service["restart"], "unless-stopped")
 
-    def test_dashboard_is_localhost_only(self) -> None:
+    def test_dashboard_is_published_on_configured_port(self) -> None:
         service = self.compose["services"]["hermes"]
-        self.assertTrue(
-            all(str(port).startswith("127.0.0.1:") for port in service["ports"])
+        self.assertEqual(
+            service["ports"],
+            ["${HERMES_DASHBOARD_PORT:-9119}:9119"],
         )
 
     def test_image_is_digest_pinned_for_linux_amd64(self) -> None:

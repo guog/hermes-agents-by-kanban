@@ -1,6 +1,8 @@
 # Hermes Kanban Hollysys Delivery Agent Fleet
 
-这是一套面向 Ubuntu Linux/AMD64 的 Hermes Agent 0.19.0 多 Agent 部署包。部署运行 digest 锁定的官方 Hermes 镜像，通过只读挂载加载无 LLM 的 Python Hollysys Controller、国内软件源配置和启动检查脚本；不构建定制镜像、不修改 `/opt/hermes`。
+这是一套面向可信内部网络和 Ubuntu Linux/AMD64 的 Hermes Agent 0.19.0 多 Agent 部署包。
+部署运行 digest 锁定的官方 Hermes 镜像，通过只读挂载加载无 LLM 的 Python Hollysys
+Controller、国内软件源配置和启动检查脚本；不构建定制镜像、不修改 `/opt/hermes`。
 
 人类通过飞书 Dispatcher 启动一次正式交付；Dispatcher 是唯一命令、状态和异常入口，
 并通过飞书汇报阶段事件。Controller 独立于 Dispatcher/Gateway 会话，持续监听 Kanban
@@ -24,11 +26,12 @@ Compose 只有一个 `hermes` service：
 
 - 使用 Linux AMD64 manifest digest 固定的官方 `nousresearch/hermes-agent:v2026.7.20`。
 - 以挂载的 s6 root 初始化脚本先检查 .NET SDK 8，再由官方 wrapper 降权，以 `python -m hollysys_controller.daemon` 作为容器前台主进程；Controller 退出会触发容器重启，Gateway 和 Dashboard 仍由官方 s6 监督。
-- Dashboard 只发布到宿主机 `127.0.0.1`，远程访问使用 SSH 隧道。
+- Dashboard 发布到宿主机所有网卡，局域网用户使用同一组固定账号访问。
 - 首次缺少镜像时由 Compose 自动拉取，不执行构建。
 - 不覆盖镜像 entrypoint，不修改 `/opt/hermes`；只向 `/etc/cont-init.d` 挂载一份
   root 初始化脚本，避免官方 main wrapper 降权后无法执行 APT。
-- APT/apt-get、pip、uv、npm、pnpm 和 Yarn 默认使用挂载或环境变量指定的阿里系镜像。
+- APT/apt-get、pip、uv、npm、pnpm、Yarn 和常见大型二进制下载默认使用挂载或环境变量
+  指定的阿里系镜像。
 
 宿主机目录：
 
@@ -90,7 +93,8 @@ Compose 只有一个 `hermes` service：
 
 ### 1.1 国内软件源与 .NET SDK 8 启动检查
 
-Compose 同时用标准配置文件挂载和显式环境变量设置软件源：
+Compose 同时用标准配置文件挂载和根 `.env` 中的容器环境变量设置软件源；`.env` 通过
+`env_file` 直接传入容器：
 
 - Debian 13 `trixie`、`trixie-updates` 和 `trixie-security` 使用
   `https://mirrors.aliyun.com/debian` 与
@@ -102,6 +106,33 @@ Compose 同时用标准配置文件挂载和显式环境变量设置软件源：
   `container/mirrors/npmrc`；其中启用 `replace-registry-host=always`，使普通 npm
   lockfile 中的官方 registry host 随配置替换。项目显式写死的直链、私有仓库或命令行
   `--index/--registry` 仍具有更高优先级，不会被 Compose 猜测性改写。
+
+根 `.env` 还为明确支持自定义下载地址的常见工具设置
+`https://npmmirror.com/mirrors` 下的二进制镜像：
+
+| 类别 | 工具或下载物 | `.env` 配置 | npmmirror 目录 |
+| --- | --- | --- | --- |
+| Node | nvm、n、node-gyp headers | `NVM_NODEJS_ORG_MIRROR`、`N_NODE_MIRROR`、新旧 node-gyp dist URL | `node` |
+| 浏览器测试 | Cypress | `CYPRESS_DOWNLOAD_MIRROR` 和匹配 npmmirror 静态目录的 `CYPRESS_DOWNLOAD_PATH_TEMPLATE` | `cypress` |
+| 浏览器测试 | Playwright Chromium | `PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST` | `playwright` |
+| 浏览器测试 | 现代 Puppeteer 的 Chrome/Chrome Headless Shell | 两个 `PUPPETEER_*_DOWNLOAD_BASE_URL` | `chrome-for-testing` |
+| 浏览器测试 | Puppeteer 旧版 Chromium | `PUPPETEER_DOWNLOAD_HOST` | `chromium-browser-snapshots` |
+| 浏览器测试 | `chromedriver` npm 包 | 现代 binary URL 和旧版 CDN URL；元数据仍使用该包默认地址 | `chrome-for-testing`、`chromedriver` |
+| 桌面构建 | Electron、electron-builder 工具 | `ELECTRON_MIRROR`、新旧 electron-builder mirror 环境变量 | `electron`、`electron-builder-binaries` |
+| 原生依赖 | Sharp 0.32 及更早版本的 libvips、已停止维护的 node-sass | `npm_config_sharp_libvips_binary_host`、`SASS_BINARY_SITE` | `sharp-libvips`、`node-sass` |
+| 其他工具 | Prisma engines、Sentry CLI | `PRISMA_ENGINES_MIRROR`、`SENTRYCLI_CDNURL` | `prisma`、`sentry-cli` |
+
+现代 Sharp 把平台预编译包作为 npm optional dependencies 发布，已经由
+`registry.npmmirror.com` 覆盖，不再使用旧的 `sharp-libvips` 下载变量。Playwright 只设置
+Chromium 专用镜像，因为当前 Debian 13 所需的 Firefox/WebKit 文件在 npmmirror 中不完整；
+其余浏览器继续使用 Playwright 默认源。未设置 uv managed Python 的
+`UV_PYTHON_INSTALL_MIRROR`：npmmirror 的入口重定向会丢失文件名中编码后的 `%2B`，实际下载
+会返回 404。没有公开、兼容且由客户端正式支持的镜像变量时保持工具默认值，不会仅因
+npmmirror 上存在同名目录就写入猜测性配置。
+
+这些 `.env` 变量是容器级默认值，目标项目显式设置的环境变量、配置文件或命令行参数可以覆盖。
+镜像目录和客户端 URL 规则都可能独立变化；升级 Cypress、Playwright、Puppeteer、
+ChromeDriver、Electron、Sharp 或 Prisma 后，应在目标仓库实际执行一次对应的安装命令。
 
 每次容器启动时，`container/ensure-dotnet8.sh` 使用 `dotnet --list-sdks` 检查是否存在
 任一 8.x SDK。存在即跳过；不存在时才按 Debian 13 官方流程安装 `dotnet-sdk-8.0`，
@@ -175,40 +206,39 @@ chmod 600 .env
 
 - `PUID`、`PGID`：Ubuntu 部署用户的 UID/GID。
 - `HERMES_DASHBOARD_PORT`：Dashboard 在宿主机发布的端口，默认 `9119`。
-- `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` 与至少 32 字节随机
-  `HERMES_DASHBOARD_BASIC_AUTH_SECRET`。
 - `HOLLYSYS_GITLAB_HOST`、`HOLLYSYS_GITLAB_ALLOWED_GROUPS` 和五类 reviewer/tester
   GitLab identity 白名单。
 - 默认 Codex OAuth 不需要填写 `OPENAI_API_KEY`。
 - 改用 OpenAI-compatible API 时填写 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`。
 
-Dashboard 通过宿主机 `127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}` 发布。认证值只写入
-被忽略且 mode 600 的根 `.env`：
+根 `.env` 既提供 Compose 插值，也通过 `env_file` 传入容器。为避免
+`docker-compose.yaml` 堆积大量条目，Dashboard、Controller、模型服务和软件镜像等可配置
+环境变量均集中在该文件；固定的容器内部路径仍保留在 Compose。
 
-```yaml
+Dashboard 通过宿主机所有网卡的 `${HERMES_DASHBOARD_PORT:-9119}` 端口发布。本部署假设运行
+在可信内部网络，局域网用户共用以下明文账号，`.env.example` 和实际 `.env` 保持一致：
+
+```dotenv
 HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
-HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=<strong-password>
-HERMES_DASHBOARD_BASIC_AUTH_SECRET=<random-at-least-32-bytes>
+HERMES_DASHBOARD_BASIC_AUTH_PASSWORD='Hollysys#1234'
+HERMES_DASHBOARD_BASIC_AUTH_SECRET=HollysysInternalDashboardSessionSecret2026
 ```
 
-- `SECRET` 是 Dashboard 会话签名密钥，不是登录密码。
-- 不把真实凭据写入 Compose、Profile、文档或 Git。
+`SECRET` 只是 Hermes 要求的 Dashboard 会话签名值。此处的 Dashboard 账号、密码和
+session secret 有意明文保存，不作为生产秘密管理；模型 API Key、GitLab token 和飞书
+凭据仍按各自章节处理。
 
-远程访问：
+内网访问：
 
 ```text
-ssh -L 9119:127.0.0.1:9119 <user>@<host>
-# 浏览器打开 http://127.0.0.1:9119
+# 浏览器打开 http://<部署机内网地址>:9119
 ```
 
-Hermes Kanban plugin REST 路由不受 Dashboard Basic Auth 保护，因此禁止把 Dashboard
-端口改为 LAN/公网发布；Basic Auth 不能替代宿主机 loopback 边界。
+Hermes Kanban plugin REST 路由不受 Dashboard Basic Auth 保护。对于本项目约定的可信内部
+网络，这是接受的部署取舍，不额外要求 loopback、SSH 隧道或逐客户端访问控制。本配置不面向
+互联网直接部署。
 
-部署运行一段时间后需要修改用户名或密码时：
-
-1. 编辑根 `.env` 中的用户名和密码。
-2. 同时把 `HERMES_DASHBOARD_BASIC_AUTH_SECRET` 换成新的随机字符串，使此前签发的登录会话立即失效。
-3. 重建 Hermes 容器以加载新的环境变量：
+修改根 `.env` 中的任何容器环境变量后，重建 Hermes 容器以加载：
 
 ```bash
 docker compose up -d --force-recreate hermes
@@ -694,10 +724,11 @@ Dispatcher 不能直接恢复。它把真实 sender/chat/thread/message/answer �
 - Profile 不等于文件系统 sandbox；Developer/Reporter token、protected branch 和独立
   GitLab 身份仍是权限边界。
 
-Dashboard plugin REST 路由绕过 Basic Auth，安全性依赖宿主机 loopback 发布。Controller
-不调用 Dashboard REST/WebSocket，只读 SQLite 事件并通过官方 CLI 写入。Controller
-outbox 统一负责阶段进度、blocked、最终成功、工作卡失败熔断和控制器级故障，均使用
-稳定事件 key 与 lark-cli idempotency key 去重。
+Dashboard plugin REST 路由绕过 Basic Auth，且当前端口有意发布到宿主机所有网卡。本部署
+以可信内部网络为前提，接受局域网成员可访问 Dashboard 与 plugin REST 的取舍，不围绕公网
+攻击模型增加额外配置。Controller 不调用 Dashboard REST/WebSocket，只读 SQLite 事件并通过
+官方 CLI 写入。Controller outbox 统一负责阶段进度、blocked、最终成功、工作卡失败熔断和
+控制器级故障，均使用稳定事件 key 与 lark-cli idempotency key 去重。
 
 ## 8. 部署、回滚与不迁移约束
 
