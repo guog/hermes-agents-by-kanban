@@ -21,6 +21,19 @@ run_as_root() {
   fi
 }
 
+remove_microsoft_feed() {
+  run_as_root env DEBIAN_FRONTEND=noninteractive \
+    dpkg --purge packages-microsoft-prod >/dev/null 2>&1 || true
+  if [ -d /var/lib/apt/lists ]; then
+    run_as_root find /var/lib/apt/lists \
+      -type f -name '*packages.microsoft.com*' -delete
+  fi
+}
+
+# Always repair a feed left by an interrupted earlier start before deciding
+# whether the already-installed SDK allows this start to skip installation.
+remove_microsoft_feed
+
 if has_dotnet8; then
   log ".NET SDK 8 already exists; installation skipped"
   dotnet --list-sdks
@@ -45,8 +58,7 @@ repo_added=0
 
 cleanup() {
   if [ "${repo_added}" -eq 1 ]; then
-    run_as_root env DEBIAN_FRONTEND=noninteractive \
-      dpkg --purge packages-microsoft-prod >/dev/null 2>&1 || true
+    remove_microsoft_feed
   fi
   rm -rf "${work_dir}"
 }
@@ -54,10 +66,6 @@ trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
 
 log ".NET SDK 8 is missing; installing it for Debian 13"
-# Remove a partial repository setup left by an interrupted prior start before
-# the first apt update, so the steady-state source set remains deterministic.
-run_as_root env DEBIAN_FRONTEND=noninteractive \
-  dpkg --purge packages-microsoft-prod >/dev/null 2>&1 || true
 run_as_root env DEBIAN_FRONTEND=noninteractive \
   apt-get update
 run_as_root env DEBIAN_FRONTEND=noninteractive \
@@ -83,8 +91,7 @@ fi
 
 # The Microsoft feed is needed only for the SDK bootstrap. Remove it so later
 # apt/apt-get operations use only the mounted Alibaba Debian mirrors.
-run_as_root env DEBIAN_FRONTEND=noninteractive \
-  dpkg --purge packages-microsoft-prod >/dev/null
+remove_microsoft_feed
 repo_added=0
 run_as_root apt-get clean
 

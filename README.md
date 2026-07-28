@@ -98,9 +98,10 @@ Compose 同时用标准配置文件挂载和显式环境变量设置软件源：
   被空文件覆盖，避免与镜像内旧源混用。
 - pip 和 uv 使用 `https://mirrors.aliyun.com/pypi/simple/`，并清空默认的
   extra index；npm、Corepack、pnpm 和 Yarn 使用 `https://registry.npmmirror.com/`。
-- npm 配置启用 `replace-registry-host=always`，使普通 npm lockfile 中的官方
-  registry host 随配置替换。项目显式写死的直链、私有仓库或命令行 `--index/--registry`
-  仍具有更高优先级，不会被 Compose 猜测性改写。
+- `NPM_CONFIG_USERCONFIG` 指向随 `./container` 一并只读挂载的
+  `container/mirrors/npmrc`；其中启用 `replace-registry-host=always`，使普通 npm
+  lockfile 中的官方 registry host 随配置替换。项目显式写死的直链、私有仓库或命令行
+  `--index/--registry` 仍具有更高优先级，不会被 Compose 猜测性改写。
 
 每次容器启动时，`container/ensure-dotnet8.sh` 使用 `dotnet --list-sdks` 检查是否存在
 任一 8.x SDK。存在即跳过；不存在时才按 Debian 13 官方流程安装 `dotnet-sdk-8.0`，
@@ -111,7 +112,8 @@ Compose 同时用标准配置文件挂载和显式环境变量设置软件源：
 
 阿里公共镜像站没有 Microsoft Debian 13 `microsoft-prod` 或 NuGet 公共仓库，因此首次安装 SDK
 必须临时访问 `packages.microsoft.com`。脚本无论成功或失败都会清除临时目录，并在
-安装成功后卸载仓库配置，使后续 apt/apt-get 仍只使用挂载的阿里 Debian 源。
+安装成功后卸载仓库配置、删除 Microsoft APT 索引，使后续 apt/apt-get 仍只使用挂载的
+阿里 Debian 源。
 APT 安装写入容器可写层：普通 stop/start 会复用并跳过，`docker compose up
 --force-recreate` 或删除容器后会重新检测并安装；官方镜像和 digest 始终不变。
 `dotnet restore` 继续服从目标仓库的 `NuGet.Config`；要求完全内网化时必须由企业提供
