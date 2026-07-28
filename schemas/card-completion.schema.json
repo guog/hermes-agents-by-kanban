@@ -1,17 +1,230 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.invalid/schemas/card-completion.schema.json",
-  "title": "Hermes SDD Kanban Card Completion v2",
-  "type": "object",
-  "additionalProperties": true,
+  "$id": "https://hollysys.example/schemas/card-completion-v3.json",
+  "$defs": {
+    "Outcome": {
+      "enum": [
+        "pass",
+        "fail",
+        "scope_gap",
+        "cancelled"
+      ],
+      "title": "Outcome",
+      "type": "string"
+    },
+    "Stage": {
+      "enum": [
+        "spec-write",
+        "spec-review",
+        "plan-write",
+        "plan-review",
+        "tasks-write",
+        "tasks-review",
+        "implement",
+        "test",
+        "code-review"
+      ],
+      "title": "Stage",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "const": "hollysys-controller/v1",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "run_key": {
+      "pattern": "^hollysys-[a-z0-9]{20}$",
+      "title": "Run Key",
+      "type": "string"
+    },
+    "stage": {
+      "$ref": "#/$defs/Stage"
+    },
+    "iteration": {
+      "minimum": 1,
+      "title": "Iteration",
+      "type": "integer"
+    },
+    "outcome": {
+      "$ref": "#/$defs/Outcome"
+    },
+    "project_id": {
+      "exclusiveMinimum": 0,
+      "title": "Project Id",
+      "type": "integer"
+    },
+    "project_path": {
+      "title": "Project Path",
+      "type": "string"
+    },
+    "checkout": {
+      "title": "Checkout",
+      "type": "string"
+    },
+    "worktree": {
+      "title": "Worktree",
+      "type": "string"
+    },
+    "branch": {
+      "title": "Branch",
+      "type": "string"
+    },
+    "target_branch": {
+      "title": "Target Branch",
+      "type": "string"
+    },
+    "prd_path": {
+      "title": "Prd Path",
+      "type": "string"
+    },
+    "prd_commit_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Prd Commit Sha",
+      "type": "string"
+    },
+    "prd_mr_url": {
+      "format": "uri",
+      "minLength": 1,
+      "title": "Prd Mr Url",
+      "type": "string"
+    },
+    "kanban_card_id": {
+      "pattern": "^t_[A-Za-z0-9_-]+$",
+      "title": "Kanban Card Id",
+      "type": "string"
+    },
+    "mr_iid": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mr Iid"
+    },
+    "mr_url": {
+      "anyOf": [
+        {
+          "format": "uri",
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mr Url"
+    },
+    "head_sha": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Head Sha"
+    },
+    "review_commit_sha": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Review Commit Sha"
+    },
+    "artifact_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Artifact Digest"
+    },
+    "artifact_paths": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Artifact Paths",
+      "type": "array"
+    },
+    "verification": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Verification",
+      "type": "array"
+    },
+    "gitlab_urls": {
+      "items": {
+        "format": "uri",
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Gitlab Urls",
+      "type": "array"
+    },
+    "issues": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Issues",
+      "type": "array"
+    },
+    "scope_gap_target": {
+      "anyOf": [
+        {
+          "enum": [
+            "spec-write",
+            "plan-write",
+            "tasks-write"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Scope Gap Target"
+    },
+    "residual_risk": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Residual Risk",
+      "type": "array"
+    }
+  },
   "required": [
-    "schema_version",
+    "protocol_version",
     "run_key",
     "stage",
+    "iteration",
     "outcome",
     "project_id",
     "project_path",
-    "project_display_name",
     "checkout",
     "worktree",
     "branch",
@@ -19,114 +232,38 @@
     "prd_path",
     "prd_commit_sha",
     "prd_mr_url",
-    "kanban_card_id",
-    "mr_iid",
-    "mr_url",
-    "head_sha",
-    "artifact_paths",
-    "artifact_digest",
-    "verification",
-    "residual_risk"
+    "kanban_card_id"
   ],
-  "properties": {
-    "schema_version": {"const": 2},
-    "run_key": {"type": "string", "pattern": "^sdd-[A-Za-z0-9]{20}$"},
-    "stage": {
-      "type": "string",
-      "enum": [
-        "run-init", "spec-write", "spec-review", "spec-gate", "spec-rework",
-        "plan-write", "plan-review", "plan-gate", "plan-rework",
-        "tasks-write", "tasks-review", "tasks-gate", "tasks-rework",
-        "implement", "test", "test-gate", "code-review", "code-gate",
-        "code-rework", "merge", "run-complete", "human-decision"
-      ]
-    },
-    "outcome": {
-      "type": "string",
-      "enum": ["pass", "fail", "scope_gap", "blocked", "cancelled"]
-    },
-    "project_id": {"type": "integer", "minimum": 1},
-    "project_path": {"type": "string", "pattern": "^[^/]+/.+$"},
-    "project_display_name": {"type": "string", "minLength": 1},
-    "checkout": {"type": "string", "pattern": "^/workspace/projects/p[1-9][0-9]*-"},
-    "worktree": {"type": "string", "pattern": "^/workspace/projects/worktrees/p[1-9][0-9]*/sdd-"},
-    "branch": {"type": "string", "minLength": 3},
-    "target_branch": {"type": "string", "minLength": 1},
-    "prd_path": {"type": "string", "pattern": "^docs/prds/prd-[a-z0-9]+(?:-[a-z0-9]+)*\\.md$"},
-    "prd_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "prd_mr_url": {"type": "string", "format": "uri"},
-    "iteration": {"type": "integer", "minimum": 1},
-    "kanban_card_id": {"type": "string", "pattern": "^t_[A-Za-z0-9_-]+$"},
-    "mr_iid": {"type": ["integer", "null"], "minimum": 1},
-    "mr_url": {"type": ["string", "null"], "format": "uri"},
-    "head_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
-    "review_commit_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
-    "checked_head": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
-    "merge_commit_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
-    "artifact_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
-    "artifact_paths": {
-      "type": "array",
-      "items": {"type": "string"},
-      "uniqueItems": true
-    },
-    "verification": {
-      "type": "array",
-      "items": {"type": "string", "minLength": 1}
-    },
-    "gitlab_urls": {
-      "type": "array",
-      "items": {"type": "string", "format": "uri"},
-      "uniqueItems": true
-    },
-    "next_card_ids": {
-      "type": "array",
-      "items": {"type": "string"},
-      "uniqueItems": true
-    },
-    "block_id": {
-      "type": "string",
-      "pattern": "^sdd-[A-Za-z0-9]{20}:t_[A-Za-z0-9_-]+:[1-9][0-9]*$"
-    },
-    "block_kind": {
-      "type": "string",
-      "enum": ["needs_input", "capability", "transient"]
-    },
-    "human_resolution_message_id": {
-      "type": "string",
-      "pattern": "^om_[A-Za-z0-9_-]+$"
-    },
-    "human_resolution_by": {
-      "type": "string",
-      "pattern": "^ou_[A-Za-z0-9_-]+$"
-    },
-    "retry_notes": {"type": ["string", "null"]},
-    "residual_risk": {"type": "array", "items": {"type": "string"}}
-  },
+  "title": "CompletionMetadata",
+  "type": "object",
   "allOf": [
     {
       "if": {
         "properties": {
-          "outcome": {"const": "blocked"}
+          "outcome": {
+            "const": "scope_gap"
+          }
         },
-        "required": ["outcome"]
+        "required": [
+          "outcome"
+        ]
       },
       "then": {
-        "$comment": "A blocked completion is the audited handoff after a human resolution, not the initial kanban_block call.",
         "required": [
-          "block_id",
-          "block_kind",
-          "human_resolution_message_id",
-          "human_resolution_by",
-          "retry_notes",
-          "next_card_ids"
+          "scope_gap_target",
+          "issues"
         ],
         "properties": {
-          "retry_notes": {"type": "string", "minLength": 1},
-          "next_card_ids": {
+          "scope_gap_target": {
+            "enum": [
+              "spec-write",
+              "plan-write",
+              "tasks-write"
+            ]
+          },
+          "issues": {
             "type": "array",
-            "minItems": 1,
-            "items": {"type": "string"},
-            "uniqueItems": true
+            "minItems": 1
           }
         }
       }
@@ -134,67 +271,104 @@
     {
       "if": {
         "properties": {
-          "stage": {"enum": ["spec-review", "plan-review", "tasks-review"]},
-          "outcome": {"const": "pass"}
+          "outcome": {
+            "enum": [
+              "pass",
+              "fail",
+              "cancelled"
+            ]
+          }
         },
-        "required": ["stage", "outcome"]
+        "required": [
+          "outcome"
+        ]
       },
       "then": {
-        "required": ["artifact_paths", "artifact_digest", "review_commit_sha"],
         "properties": {
-          "artifact_paths": {"type": "array", "minItems": 1},
-          "artifact_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-          "review_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+          "scope_gap_target": {
+            "type": "null"
+          }
         }
       }
     },
     {
       "if": {
         "properties": {
-          "stage": {"enum": ["test", "code-review"]},
-          "outcome": {"const": "pass"}
+          "stage": {
+            "enum": [
+              "spec-review",
+              "plan-review",
+              "tasks-review"
+            ]
+          },
+          "outcome": {
+            "const": "pass"
+          }
         },
-        "required": ["stage", "outcome"]
+        "required": [
+          "stage",
+          "outcome"
+        ]
       },
       "then": {
-        "required": ["head_sha", "mr_iid", "mr_url"],
+        "required": [
+          "artifact_paths",
+          "artifact_digest",
+          "review_commit_sha"
+        ],
         "properties": {
-          "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-          "mr_iid": {"type": "integer", "minimum": 1},
-          "mr_url": {"type": "string", "format": "uri"}
+          "artifact_paths": {
+            "type": "array",
+            "minItems": 1
+          },
+          "artifact_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "review_commit_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          }
         }
       }
     },
     {
       "if": {
         "properties": {
-          "stage": {"const": "merge"}
+          "stage": {
+            "enum": [
+              "test",
+              "code-review"
+            ]
+          },
+          "outcome": {
+            "const": "pass"
+          }
         },
-        "required": ["stage"]
+        "required": [
+          "stage",
+          "outcome"
+        ]
       },
       "then": {
-        "$comment": "Dispatcher must also reject unless head_sha equals checked_head and the GitLab merge request used sha=checked_head.",
-        "required": ["head_sha", "checked_head", "mr_iid", "mr_url"],
+        "required": [
+          "mr_iid",
+          "mr_url",
+          "head_sha"
+        ],
         "properties": {
-          "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-          "checked_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-          "mr_iid": {"type": "integer", "minimum": 1},
-          "mr_url": {"type": "string", "format": "uri"}
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "stage": {"const": "merge"},
-          "outcome": {"const": "pass"}
-        },
-        "required": ["stage", "outcome"]
-      },
-      "then": {
-        "required": ["merge_commit_sha"],
-        "properties": {
-          "merge_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+          "mr_iid": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mr_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "head_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          }
         }
       }
     }

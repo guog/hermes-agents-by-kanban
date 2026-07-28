@@ -1,4 +1,4 @@
-<!-- SDD-DECISION: v=1 run=<run_key> stage=<stage> card=<kanban-card-id> -->
+<!-- HOLLYSYS-DECISION: v=1 run=<run_key> stage=<stage> card=<kanban-card-id> -->
 
 ## 关键自主决策
 

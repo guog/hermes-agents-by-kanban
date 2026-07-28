@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+
+from .config import ControllerConfig
+from .kanban import CommandError
+from .models import FeishuOrigin
+
+
+class LarkNotifier:
+    def __init__(self, config: ControllerConfig):
+        self.config = config
+
+    def send(self, key: str, origin: FeishuOrigin, text: str) -> dict:
+        env = os.environ.copy()
+        env.update(
+            {
+                "LARKSUITE_CLI_CONFIG_DIR": str(
+                    self.config.profiles_root / "dispatcher" / ".lark-cli" / "config"
+                ),
+                "LARKSUITE_CLI_DATA_DIR": str(
+                    self.config.profiles_root / "dispatcher" / ".lark-cli" / "data"
+                ),
+                "LARKSUITE_CLI_NO_UPDATE_NOTIFIER": "1",
+                "LARKSUITE_CLI_NO_SKILLS_NOTIFIER": "1",
+            }
+        )
+        idempotency = "hollysys-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:40]
+        command = [
+            self.config.lark_command,
+            "im",
+            "+messages-reply",
+            "--message-id",
+            origin.message_id,
+            "--text",
+            text,
+            "--as",
+            "bot",
+            "--idempotency-key",
+            idempotency,
+        ]
+        if origin.thread_id:
+            command.append("--reply-in-thread")
+        result = subprocess.run(
+            command,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=self.config.command_timeout_seconds,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise CommandError(command, result.returncode, result.stderr)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            payload = {"stdout": result.stdout.strip()}
+        return payload if isinstance(payload, dict) else {"result": payload}

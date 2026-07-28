@@ -1,0 +1,57 @@
+poll_interval_seconds: 2
+reconcile_interval_seconds: 30
+command_timeout_seconds: 120
+fatal_loop_error_limit: 5
+required_pipeline: true
+design_rework_limit: 3
+code_rework_limit: 5
+protocol_retry_limit: 2
+
+stage_assignees:
+  spec-write: spec-writer
+  spec-review: spec-reviewer
+  plan-write: planner
+  plan-review: plan-reviewer
+  tasks-write: tasker
+  tasks-review: task-reviewer
+  implement: coder
+  test: tester
+  code-review: code-reviewer
+
+stage_skills:
+  spec-write: [hollysys-write-spec, glab]
+  spec-review: [hollysys-review-spec, glab]
+  plan-write: [hollysys-write-plan, glab]
+  plan-review: [hollysys-review-plan, glab]
+  tasks-write: [hollysys-create-tasks, glab]
+  tasks-review: [hollysys-analyze-tasks, glab]
+  implement: [hollysys-implement, glab]
+  test: [hollysys-test, glab]
+  code-review: [hollysys-review-code, glab]
+
+# These patterns define the complete artifact set whose path/blob digest is
+# checked at each document gate. Override them for repositories with another
+# Hollysys layout; they are matched against the full repository tree at review SHA.
+artifact_patterns:
+  spec-review:
+    - "docs/prds/*/specs/spec-*.md"
+    - "specs/**/*.md"
+    - "docs/specs/**/*.md"
+  plan-review:
+    - "docs/prds/*/plans/plan-*.md"
+    - "plans/**/*.md"
+    - "docs/plans/**/*.md"
+  tasks-review:
+    - "docs/prds/*/tasks/task-*.md"
+    - "tasks/**/*.md"
+    - "docs/tasks/**/*.md"
+    - "**/tasks.md"
+
+# Set these through HOLLYSYS_*_IDENTITIES in .env. Values may be GitLab username,
+# numeric user id, or display name. Empty means the corresponding gate fails.
+reviewer_identities:
+  spec-review: []
+  plan-review: []
+  tasks-review: []
+  test: []
+  code-review: []

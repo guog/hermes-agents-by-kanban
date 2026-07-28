@@ -2,9 +2,9 @@
 
 <本 PRD 的业务范围、实现摘要和中文项目显示名>
 
-<!-- SDD-RUN:BEGIN -->
+<!-- HOLLYSYS-RUN:BEGIN -->
 ```yaml
-schema_version: 2
+protocol_version: hollysys-controller/v1
 run_key: <run_key>
 project_id: <gitlab-project-id>
 project_path: <group/project>
@@ -24,7 +24,7 @@ gates:
   plan_digest: <sha256-or-null>
   tasks_digest: <sha256-or-null>
 ```
-<!-- SDD-RUN:END -->
+<!-- HOLLYSYS-RUN:END -->
 
 ## 关键自主决策
 
@@ -49,7 +49,3 @@ gates:
 
 - 风险：<risk-or-none>
 - 回滚：<rollback>
-
-## 合并后永久链接评论
-
-dispatcher 合并成功后，以 GitLab 返回的 `merge_commit_sha` 为 revision，逐项生成 PRD、全部 SPEC、PLAN、TASKS 的 `/-/blob/<merge_commit_sha>/<path>` 链接，并在本 MR 留下一个幂等评论；不得使用分支名或合并前 head 代替 merge SHA。

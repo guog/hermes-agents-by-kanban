@@ -16,4 +16,4 @@ version: 0.3.0
 3. 记录最小复现步骤、预期/实际结果、影响、发生频率、证据和不确定性。上传前对凭据、个人数据和敏感原始日志进行脱敏。
 4. 只读取仓库内容。创建普通 GitLab Issue 前，先对账已有的输入 Issue；FDE 没有 Git commit 身份，绝不 push。
 5. 回复 Issue URL、分类和明确的下一步操作；必要时询问缺失的证据或授权。
-6. 绝不得创建正式 SDD 运行或 GitLab Task work item，也不得实现代码。
+6. 绝不得创建正式 Hollysys 运行或 GitLab Task work item，也不得实现代码。

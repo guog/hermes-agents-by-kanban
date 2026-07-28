@@ -1,4 +1,4 @@
-SDD-GATE: v=2 run=<run_key> stage=<spec-review|plan-review|tasks-review|test|code-review> result=<pass|fail|scope_gap> digest=<sha256-or-na> review=<40-char-sha-or-na> head=<40-char-sha-or-na> task=<kanban-card-id>
+HOLLYSYS-GATE: v=3 run=<run_key> stage=<spec-review|plan-review|tasks-review|test|code-review> result=<pass|fail|scope_gap|cancelled> digest=<sha256-or-na> review=<40-char-sha-or-na> head=<40-char-sha-or-na> task=<kanban-card-id>
 
 ## 结论
 
@@ -36,14 +36,17 @@ SDD-GATE: v=2 run=<run_key> stage=<spec-review|plan-review|tasks-review|test|cod
 
 ```json
 {
-  "schema_version": 2,
+  "protocol_version": "hollysys-controller/v1",
   "run_key": "<run_key>",
   "stage": "<stage>",
-  "result": "<pass|fail|scope_gap>",
+  "iteration": 1,
+  "outcome": "<pass|fail|scope_gap|cancelled>",
   "artifact_paths": ["<sorted-path>"],
   "artifact_digest": "<sha256-or-null>",
   "review_commit_sha": "<40-char-sha-or-null>",
   "head_sha": "<40-char-sha-or-null>",
-  "kanban_card_id": "<card-id>"
+  "kanban_card_id": "<card-id>",
+  "issues": [],
+  "scope_gap_target": null
 }
 ```
