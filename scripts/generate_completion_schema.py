@@ -16,25 +16,48 @@ def generated_schema() -> dict:
     schema["allOf"] = [
         {
             "if": {
-                "properties": {"outcome": {"const": "scope_gap"}},
+                "properties": {"outcome": {"const": "fail"}},
                 "required": ["outcome"],
             },
             "then": {
-                "required": ["scope_gap_target", "issues"],
+                "required": ["issues"],
                 "properties": {
-                    "scope_gap_target": {
-                        "enum": ["spec-write", "plan-write", "tasks-write"]
-                    },
                     "issues": {"type": "array", "minItems": 1},
                 },
             },
         },
         {
             "if": {
-                "properties": {"outcome": {"enum": ["pass", "fail", "cancelled"]}},
-                "required": ["outcome"],
+                "properties": {
+                    "stage": {
+                        "enum": [
+                            "spec-review",
+                            "plan-review",
+                            "tasks-review",
+                        ]
+                    },
+                    "outcome": {"enum": ["pass", "fail"]},
+                },
+                "required": ["stage", "outcome"],
             },
-            "then": {"properties": {"scope_gap_target": {"type": "null"}}},
+            "then": {
+                "required": [
+                    "artifact_paths",
+                    "artifact_digest",
+                    "artifact_commit_sha",
+                ],
+                "properties": {
+                    "artifact_paths": {"type": "array", "minItems": 1},
+                    "artifact_digest": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                    },
+                    "artifact_commit_sha": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{40}$",
+                    },
+                },
+            },
         },
         {
             "if": {
@@ -51,21 +74,9 @@ def generated_schema() -> dict:
                 "required": ["stage", "outcome"],
             },
             "then": {
-                "required": [
-                    "artifact_paths",
-                    "artifact_digest",
-                    "review_commit_sha",
-                ],
+                "required": ["baseline_disposition"],
                 "properties": {
-                    "artifact_paths": {"type": "array", "minItems": 1},
-                    "artifact_digest": {
-                        "type": "string",
-                        "pattern": "^[0-9a-f]{64}$",
-                    },
-                    "review_commit_sha": {
-                        "type": "string",
-                        "pattern": "^[0-9a-f]{40}$",
-                    },
+                    "baseline_disposition": {"const": "reviewed"},
                 },
             },
         },
@@ -73,7 +84,7 @@ def generated_schema() -> dict:
             "if": {
                 "properties": {
                     "stage": {"enum": ["test", "code-review"]},
-                    "outcome": {"const": "pass"},
+                    "outcome": {"enum": ["pass", "fail"]},
                 },
                 "required": ["stage", "outcome"],
             },
@@ -89,10 +100,99 @@ def generated_schema() -> dict:
                 },
             },
         },
+        {
+            "if": {
+                "properties": {
+                    "stage": {"const": "test"},
+                    "outcome": {"enum": ["pass", "fail"]},
+                },
+                "required": ["stage", "outcome"],
+            },
+            "then": {
+                "required": ["test_disposition"],
+                "properties": {
+                    "test_disposition": {
+                        "enum": ["executed", "skipped_unavailable"]
+                    },
+                },
+            },
+        },
+        {
+            "if": {
+                "properties": {
+                    "stage": {
+                        "enum": [
+                            "spec-write",
+                            "plan-write",
+                            "tasks-write",
+                            "implement",
+                        ]
+                    },
+                    "outcome": {"const": "pass"},
+                },
+                "required": ["stage", "outcome"],
+            },
+            "then": {
+                "required": ["repository_evidence"],
+                "properties": {
+                    "repository_evidence": {"type": "object"},
+                },
+            },
+        },
+        {
+            "if": {
+                "properties": {
+                    "stage": {"const": "test"},
+                    "test_disposition": {"const": "skipped_unavailable"},
+                },
+                "required": ["stage", "test_disposition"],
+            },
+            "then": {
+                "required": [
+                    "outcome",
+                    "skip_reason",
+                    "verification",
+                    "residual_risk",
+                ],
+                "properties": {
+                    "outcome": {"const": "pass"},
+                    "skip_reason": {"type": "string", "minLength": 1},
+                    "verification": {"type": "array", "minItems": 1},
+                    "residual_risk": {"type": "array", "minItems": 1},
+                },
+            },
+        },
+        {
+            "if": {
+                "properties": {
+                    "mode": {"const": "finalization"},
+                    "outcome": {"const": "pass"},
+                },
+                "required": ["mode", "outcome"],
+            },
+            "then": {
+                "required": [
+                    "artifact_paths",
+                    "artifact_digest",
+                    "artifact_commit_sha",
+                    "baseline_disposition",
+                    "forced_advance",
+                    "mr_iid",
+                    "mr_url",
+                ],
+                "properties": {
+                    "artifact_paths": {"type": "array", "minItems": 1},
+                    "baseline_disposition": {
+                        "const": "forced_after_review_limit"
+                    },
+                    "forced_advance": {"type": "object"},
+                },
+            },
+        },
     ]
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://hollysys.example/schemas/card-completion-v3.json",
+        "$id": "https://hollysys.example/schemas/card-completion-v6.json",
         **schema,
     }
 

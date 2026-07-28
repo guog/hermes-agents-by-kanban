@@ -55,16 +55,13 @@ class CompletionMetadataTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
                 CompletionMetadata.model_validate({**payload, "run_key": invalid})
 
-    def test_scope_gap_requires_target_and_issues(self) -> None:
+    def test_scope_gap_is_rejected_and_fail_requires_issues(self) -> None:
+        payload = completion(self.root).model_dump(mode="json")
+        payload["outcome"] = "scope_gap"
         with self.assertRaises(ValidationError):
-            completion(self.root, outcome="scope_gap")
-        valid = completion(
-            self.root,
-            outcome="scope_gap",
-            scope_gap_target="plan-write",
-            issues=["PLAN omits rollback behavior"],
-        )
-        self.assertEqual(valid.scope_gap_target, "plan-write")
+            CompletionMetadata.model_validate(payload)
+        with self.assertRaises(ValidationError):
+            completion(self.root, Stage.SPEC_REVIEW, outcome="fail")
 
     def test_review_pass_requires_digest_contract(self) -> None:
         with self.assertRaises(ValidationError):
@@ -74,7 +71,8 @@ class CompletionMetadataTests(unittest.TestCase):
             Stage.SPEC_REVIEW,
             artifact_paths=["docs/specs/feature/spec.md"],
             artifact_digest="b" * 64,
-            review_commit_sha="c" * 40,
+            artifact_commit_sha="c" * 40,
+            baseline_disposition="reviewed",
         )
         self.assertEqual(valid.artifact_digest, "b" * 64)
 
@@ -89,6 +87,112 @@ class CompletionMetadataTests(unittest.TestCase):
             head_sha="d" * 40,
         )
         self.assertEqual(valid.head_sha, "d" * 40)
+
+    def test_unavailable_test_condition_is_a_structured_skip(self) -> None:
+        valid = completion(
+            self.root,
+            Stage.TEST,
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+            test_disposition="skipped_unavailable",
+            skip_reason="browser runtime is not installed in the tester container",
+            verification=["unit tests passed", "browser binary preflight failed"],
+            residual_risk=["browser interaction remains unverified"],
+        )
+        self.assertEqual(valid.test_disposition.value, "skipped_unavailable")
+
+        payload = valid.model_dump(mode="json")
+        payload["outcome"] = "fail"
+        payload["issues"] = ["browser test could not run"]
+        with self.assertRaisesRegex(ValidationError, "skipped test requires pass"):
+            CompletionMetadata.model_validate(payload)
+
+        missing_reason = valid.model_dump(mode="json")
+        missing_reason["skip_reason"] = None
+        with self.assertRaisesRegex(ValidationError, "skipped test requires pass"):
+            CompletionMetadata.model_validate(missing_reason)
+
+    def test_authoring_pass_requires_repository_evidence(self) -> None:
+        valid = completion(self.root, Stage.IMPLEMENT)
+        self.assertEqual(
+            valid.repository_evidence.repository_base_sha,
+            "9" * 40,
+        )
+        self.assertEqual(
+            valid.repository_evidence.change_strategy.value,
+            "extend_existing",
+        )
+
+        payload = valid.model_dump(mode="json")
+        payload["repository_evidence"] = None
+        with self.assertRaisesRegex(
+            ValidationError, "authoring pass requires repository_evidence"
+        ):
+            CompletionMetadata.model_validate(payload)
+
+        review = completion(
+            self.root,
+            Stage.CODE_REVIEW,
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+        ).model_dump(mode="json")
+        review["repository_evidence"] = valid.repository_evidence.model_dump(
+            mode="json"
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "only valid for an authoring pass"
+        ):
+            CompletionMetadata.model_validate(review)
+
+        payload = valid.model_dump(mode="json")
+        payload["repository_evidence"]["inspected_paths"] = ["../other-repo"]
+        with self.assertRaisesRegex(
+            ValidationError, "exact repository-relative paths"
+        ):
+            CompletionMetadata.model_validate(payload)
+
+    def test_finalization_requires_matching_forced_baseline_and_risks(self) -> None:
+        forced = {
+            "review_limit": 3,
+            "final_review_card_id": "t_review",
+            "final_review_url": (
+                "https://gitlab.example.com/group/project/-/merge_requests/2#note_31"
+            ),
+            "decision_url": (
+                "https://gitlab.example.com/group/project/-/merge_requests/2#note_32"
+            ),
+            "baseline_commit_sha": "c" * 40,
+            "artifact_paths": ["docs/specs/feature/spec.md"],
+            "artifact_digest": "b" * 64,
+            "key_decisions": ["Prefer the safer validation rule"],
+            "unresolved_findings": ["PRD rules conflict"],
+            "residual_risks": ["compatibility requires follow-up"],
+        }
+        valid = completion(
+            self.root,
+            Stage.SPEC_WRITE,
+            mode="finalization",
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            artifact_paths=["docs/specs/feature/spec.md"],
+            artifact_digest="b" * 64,
+            artifact_commit_sha="c" * 40,
+            baseline_disposition="forced_after_review_limit",
+            forced_advance=forced,
+            gitlab_urls=[forced["decision_url"]],
+            key_decisions=["Prefer the safer validation rule"],
+            residual_risk=["compatibility requires follow-up"],
+        )
+        self.assertEqual(valid.forced_advance.review_limit, 3)
+
+        payload = valid.model_dump(mode="json")
+        payload["forced_advance"]["artifact_digest"] = "e" * 64
+        with self.assertRaisesRegex(
+            ValidationError, "forced_advance baseline"
+        ):
+            CompletionMetadata.model_validate(payload)
 
     def test_committed_schema_matches_model(self) -> None:
         path = (
@@ -107,13 +211,17 @@ class CompletionMetadataTests(unittest.TestCase):
             r"^hollysys-[a-z0-9]{20}$",
         )
         conditions = schema["allOf"]
-        self.assertEqual(len(conditions), 4)
+        self.assertEqual(len(conditions), 8)
         self.assertEqual(conditions[0]["then"]["properties"]["issues"]["minItems"], 1)
         self.assertEqual(
-            conditions[2]["then"]["properties"]["artifact_paths"]["minItems"],
+            conditions[1]["then"]["properties"]["artifact_paths"]["minItems"],
             1,
         )
         self.assertIn("head_sha", conditions[3]["then"]["required"])
+        self.assertIn("test_disposition", conditions[4]["then"]["required"])
+        self.assertIn("repository_evidence", conditions[5]["then"]["required"])
+        self.assertIn("skip_reason", conditions[6]["then"]["required"])
+        self.assertIn("forced_advance", conditions[7]["then"]["required"])
 
 
 if __name__ == "__main__":

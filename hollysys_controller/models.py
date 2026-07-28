@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
@@ -29,10 +30,44 @@ class Stage(StrEnum):
     CODE_REVIEW = "code-review"
 
 
+class Phase(StrEnum):
+    SPEC = "spec"
+    PLAN = "plan"
+    TASKS = "tasks"
+    CODE = "code"
+
+
+class WorkMode(StrEnum):
+    NORMAL = "normal"
+    FINALIZATION = "finalization"
+
+
+class RepairKind(StrEnum):
+    REVIEW_FAILURE = "review_failure"
+    CODE_GATE_FAILURE = "code_gate_failure"
+    FROZEN_ARTIFACT_VIOLATION = "frozen_artifact_violation"
+
+
+class BaselineDisposition(StrEnum):
+    SOURCE = "source"
+    REVIEWED = "reviewed"
+    FORCED_AFTER_REVIEW_LIMIT = "forced_after_review_limit"
+
+
+class TestDisposition(StrEnum):
+    EXECUTED = "executed"
+    SKIPPED_UNAVAILABLE = "skipped_unavailable"
+
+
+class ChangeStrategy(StrEnum):
+    EXTEND_EXISTING = "extend_existing"
+    MODIFY_EXISTING = "modify_existing"
+    EXTEND_AND_MODIFY = "extend_and_modify"
+
+
 class Outcome(StrEnum):
     PASS = "pass"
     FAIL = "fail"
-    SCOPE_GAP = "scope_gap"
     CANCELLED = "cancelled"
 
 
@@ -56,6 +91,7 @@ class ProjectFacts(StrictModel):
 class SourceFacts(StrictModel):
     prd_path: str
     prd_commit_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
+    prd_blob_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
     prd_blob_url: AnyHttpUrl
     prd_mr_url: AnyHttpUrl
 
@@ -66,10 +102,11 @@ class WorkspaceFacts(StrictModel):
     worktree: str
     branch: str
     target_branch: str
+    repository_base_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
 
 
 class RunRecord(StrictModel):
-    protocol_version: Literal["hollysys-controller/v1"] = "hollysys-controller/v1"
+    protocol_version: Literal["hollysys-controller/v2"] = "hollysys-controller/v2"
     kind: Literal["run-init"] = "run-init"
     run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
     project: ProjectFacts
@@ -78,25 +115,146 @@ class RunRecord(StrictModel):
     origin: FeishuOrigin
 
 
+class ArtifactBaseline(StrictModel):
+    phase: Literal["prd", "spec", "plan", "tasks"]
+    disposition: BaselineDisposition
+    artifact_paths: list[str] = Field(min_length=1)
+    artifact_digest: Annotated[str, Field(pattern=DIGEST_PATTERN)]
+    artifact_commit_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
+    source_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    decision_urls: list[AnyHttpUrl] = Field(default_factory=list)
+    key_decisions: list[str] = Field(default_factory=list)
+    unresolved_findings: list[str] = Field(default_factory=list)
+    residual_risk: list[str] = Field(default_factory=list)
+
+
+class RepairContext(StrictModel):
+    kind: RepairKind
+    trigger_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    issues: list[str] = Field(min_length=1)
+    review_attempt: Annotated[int | None, Field(ge=1)] = None
+    review_limit: Annotated[int | None, Field(ge=1)] = None
+    related_card_ids: list[
+        Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    ] = Field(default_factory=list)
+    head_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)] = None
+    code_modification: Annotated[int | None, Field(ge=1)] = None
+    code_modification_limit: Annotated[int | None, Field(ge=1)] = None
+    frozen_baselines: list[ArtifactBaseline] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_repair_contract(self) -> RepairContext:
+        if self.kind == RepairKind.REVIEW_FAILURE and (
+            self.review_attempt is None or self.review_limit is None
+        ):
+            raise ValueError(
+                "review_failure requires review_attempt and review_limit"
+            )
+        if self.kind != RepairKind.REVIEW_FAILURE and (
+            self.review_attempt is not None or self.review_limit is not None
+        ):
+            raise ValueError(
+                "review attempt fields are only valid for review_failure"
+            )
+        if self.kind == RepairKind.CODE_GATE_FAILURE and (
+            not self.related_card_ids
+            or self.head_sha is None
+            or self.code_modification is None
+            or self.code_modification_limit is None
+        ):
+            raise ValueError(
+                "code_gate_failure requires both gate cards, head, and "
+                "modification counters"
+            )
+        if self.code_modification is not None and (
+            self.code_modification_limit is None
+            or self.code_modification > self.code_modification_limit
+        ):
+            raise ValueError(
+                "code_modification cannot exceed code_modification_limit"
+            )
+        if self.kind != RepairKind.CODE_GATE_FAILURE and (
+            self.related_card_ids
+            or self.head_sha is not None
+            or self.code_modification is not None
+            or self.code_modification_limit is not None
+        ):
+            raise ValueError(
+                "code gate fields are only valid for code_gate_failure"
+            )
+        if self.review_attempt is not None and self.review_limit is not None:
+            if self.review_attempt > self.review_limit:
+                raise ValueError("review_attempt cannot exceed review_limit")
+        return self
+
+
 class CardRecord(StrictModel):
-    protocol_version: Literal["hollysys-controller/v1"] = "hollysys-controller/v1"
+    protocol_version: Literal["hollysys-controller/v2"] = "hollysys-controller/v2"
     kind: Literal["work"] = "work"
     run: RunRecord
     stage: Stage
     iteration: Annotated[int, Field(ge=1)]
+    mode: WorkMode = WorkMode.NORMAL
     idempotency_key: str
     parent_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
     assignee: str
     skills: list[str]
+    frozen_baselines: list[ArtifactBaseline] = Field(default_factory=list)
+    repair_context: RepairContext | None = None
     resume_answer: str | None = None
     resumed_from_card_id: str | None = None
 
 
+class ForcedAdvance(StrictModel):
+    review_limit: Annotated[int, Field(ge=1)]
+    final_review_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    final_review_url: AnyHttpUrl
+    decision_url: AnyHttpUrl
+    baseline_commit_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
+    artifact_paths: list[str] = Field(min_length=1)
+    artifact_digest: Annotated[str, Field(pattern=DIGEST_PATTERN)]
+    key_decisions: list[str] = Field(min_length=1)
+    unresolved_findings: list[str] = Field(default_factory=list)
+    residual_risks: list[str] = Field(default_factory=list)
+
+
+class RepositoryEvidence(StrictModel):
+    repository_base_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
+    inspected_paths: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1
+    )
+    existing_capabilities: list[
+        Annotated[str, Field(min_length=1)]
+    ] = Field(min_length=1)
+    change_strategy: ChangeStrategy
+    reuse_decisions: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1
+    )
+
+    @model_validator(mode="after")
+    def validate_repository_paths(self) -> RepositoryEvidence:
+        if len(set(self.inspected_paths)) != len(self.inspected_paths):
+            raise ValueError("inspected_paths must be unique")
+        for raw_path in self.inspected_paths:
+            path = PurePosixPath(raw_path)
+            if (
+                path.is_absolute()
+                or raw_path in {"", "."}
+                or ".." in path.parts
+                or any(token in raw_path for token in ("*", "?", "[", "]", "\0"))
+            ):
+                raise ValueError(
+                    "inspected_paths must be exact repository-relative paths"
+                )
+        return self
+
+
 class CompletionMetadata(StrictModel):
-    protocol_version: Literal["hollysys-controller/v1"]
+    protocol_version: Literal["hollysys-controller/v2"]
     run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
     stage: Stage
     iteration: Annotated[int, Field(ge=1)]
+    mode: WorkMode = WorkMode.NORMAL
     outcome: Outcome
 
     project_id: Annotated[int, Field(gt=0)]
@@ -107,56 +265,165 @@ class CompletionMetadata(StrictModel):
     target_branch: str
     prd_path: str
     prd_commit_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
+    prd_blob_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
     prd_mr_url: AnyHttpUrl
     kanban_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
 
     mr_iid: Annotated[int | None, Field(gt=0)] = None
     mr_url: AnyHttpUrl | None = None
     head_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)] = None
-    review_commit_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)] = None
+    artifact_commit_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)] = None
     artifact_digest: Annotated[str | None, Field(pattern=DIGEST_PATTERN)] = None
     artifact_paths: list[str] = Field(default_factory=list)
+    baseline_disposition: BaselineDisposition | None = None
+    forced_advance: ForcedAdvance | None = None
+    repository_evidence: RepositoryEvidence | None = None
+    test_disposition: TestDisposition | None = None
+    skip_reason: Annotated[str | None, Field(min_length=1)] = None
     verification: list[str] = Field(default_factory=list)
     gitlab_urls: list[AnyHttpUrl] = Field(default_factory=list)
+    key_decisions: list[str] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
-    scope_gap_target: Literal["spec-write", "plan-write", "tasks-write"] | None = None
     residual_risk: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_stage_contract(self) -> CompletionMetadata:
-        if self.outcome == Outcome.SCOPE_GAP:
-            if self.scope_gap_target is None or not self.issues:
-                raise ValueError(
-                    "scope_gap requires scope_gap_target and a non-empty issues list"
-                )
-        elif self.scope_gap_target is not None:
-            raise ValueError("scope_gap_target is only valid for outcome=scope_gap")
+        document_reviews = {
+            Stage.SPEC_REVIEW,
+            Stage.PLAN_REVIEW,
+            Stage.TASKS_REVIEW,
+        }
+        document_producers = {
+            Stage.SPEC_WRITE,
+            Stage.PLAN_WRITE,
+            Stage.TASKS_WRITE,
+        }
+        repository_authors = document_producers | {Stage.IMPLEMENT}
+        code_gates = {Stage.TEST, Stage.CODE_REVIEW}
+
+        if self.outcome == Outcome.FAIL and not self.issues:
+            raise ValueError("fail requires a non-empty issues list")
+        if self.outcome == Outcome.FAIL and self.stage not in (
+            document_reviews | code_gates
+        ):
+            raise ValueError("only review/test stages may return fail")
 
         if (
-            self.outcome == Outcome.PASS
-            and self.stage
-            in {
-                Stage.SPEC_REVIEW,
-                Stage.PLAN_REVIEW,
-                Stage.TASKS_REVIEW,
-            }
+            self.outcome in {Outcome.PASS, Outcome.FAIL}
+            and self.stage in document_reviews
             and (
                 not self.artifact_paths
                 or self.artifact_digest is None
-                or self.review_commit_sha is None
+                or self.artifact_commit_sha is None
             )
         ):
             raise ValueError(
-                "artifact review pass requires paths, digest, and review_commit_sha"
+                "artifact review requires paths, digest, and artifact_commit_sha"
             )
 
         if (
-            self.outcome == Outcome.PASS
-            and self.stage in {Stage.TEST, Stage.CODE_REVIEW}
+            self.outcome in {Outcome.PASS, Outcome.FAIL}
+            and self.stage in code_gates
             and (self.mr_iid is None or self.mr_url is None or self.head_sha is None)
         ):
             raise ValueError(
-                "test/code-review pass requires mr_iid, mr_url, and head_sha"
+                "test/code-review requires mr_iid, mr_url, and head_sha"
+            )
+
+        if self.stage == Stage.TEST and self.outcome in {
+            Outcome.PASS,
+            Outcome.FAIL,
+        }:
+            if self.test_disposition is None:
+                raise ValueError(
+                    "test pass/fail requires test_disposition"
+                )
+            if self.test_disposition == TestDisposition.SKIPPED_UNAVAILABLE:
+                if (
+                    self.outcome != Outcome.PASS
+                    or self.skip_reason is None
+                    or not self.verification
+                    or not self.residual_risk
+                ):
+                    raise ValueError(
+                        "skipped test requires pass, skip_reason, "
+                        "verification evidence, and residual risk"
+                    )
+            elif self.skip_reason is not None:
+                raise ValueError(
+                    "executed test must not include skip_reason"
+                )
+        elif self.test_disposition is not None or self.skip_reason is not None:
+            raise ValueError(
+                "test disposition fields are only valid for test pass/fail"
+            )
+
+        if self.outcome == Outcome.PASS and self.stage in repository_authors:
+            if self.repository_evidence is None:
+                raise ValueError(
+                    "SPEC/PLAN/TASKS/CODE authoring pass requires "
+                    "repository_evidence"
+                )
+        elif self.repository_evidence is not None:
+            raise ValueError(
+                "repository_evidence is only valid for an authoring pass"
+            )
+
+        if self.mode == WorkMode.FINALIZATION:
+            if self.stage not in document_producers:
+                raise ValueError(
+                    "finalization is only valid for a document producer"
+                )
+            if self.outcome == Outcome.PASS and (
+                not self.artifact_paths
+                or self.artifact_digest is None
+                or self.artifact_commit_sha is None
+                or self.mr_iid is None
+                or self.mr_url is None
+                or self.baseline_disposition
+                != BaselineDisposition.FORCED_AFTER_REVIEW_LIMIT
+                or self.forced_advance is None
+            ):
+                raise ValueError(
+                    "finalization requires a forced artifact baseline and decision"
+                )
+            if (
+                self.outcome == Outcome.PASS
+                and self.forced_advance is not None
+                and (
+                    self.forced_advance.baseline_commit_sha
+                    != self.artifact_commit_sha
+                    or self.forced_advance.artifact_paths
+                    != self.artifact_paths
+                    or self.forced_advance.artifact_digest
+                    != self.artifact_digest
+                    or self.forced_advance.key_decisions
+                    != self.key_decisions
+                    or self.forced_advance.residual_risks
+                    != self.residual_risk
+                )
+            ):
+                raise ValueError(
+                    "forced_advance baseline and residual risks must match "
+                    "top-level finalization evidence"
+                )
+            if self.outcome not in {Outcome.PASS, Outcome.CANCELLED}:
+                raise ValueError("finalization only allows pass or cancelled")
+        elif self.forced_advance is not None:
+            raise ValueError("forced_advance is only valid for finalization")
+
+        if self.stage in document_reviews and self.outcome == Outcome.PASS:
+            if self.baseline_disposition != BaselineDisposition.REVIEWED:
+                raise ValueError(
+                    "document review pass requires baseline_disposition=reviewed"
+                )
+        elif (
+            self.mode != WorkMode.FINALIZATION
+            and self.baseline_disposition is not None
+        ):
+            raise ValueError(
+                "baseline_disposition is only valid for a document review pass "
+                "or finalization"
             )
         return self
 

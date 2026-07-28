@@ -15,12 +15,14 @@ from urllib.parse import quote, unquote, urlparse
 from .config import ControllerConfig
 from .kanban import CommandError
 from .models import (
+    ArtifactBaseline,
     CompletionMetadata,
     FeishuOrigin,
     ProjectFacts,
     RunRecord,
     SourceFacts,
     Stage,
+    WorkMode,
     WorkspaceFacts,
 )
 
@@ -29,9 +31,15 @@ PRD_URL_RE = re.compile(
 )
 MR_URL_RE = re.compile(r"^/(?P<project>.+?)/-/merge_requests/(?P<iid>[1-9][0-9]*)/?$")
 GATE_RE = re.compile(
-    r"HOLLYSYS-GATE:\s+v=3\s+run=(?P<run>\S+)\s+stage=(?P<stage>\S+)"
+    r"HOLLYSYS-GATE:\s+v=5\s+run=(?P<run>\S+)\s+stage=(?P<stage>\S+)"
     r"\s+result=(?P<result>\S+)\s+digest=(?P<digest>\S+)"
-    r"\s+review=(?P<review>\S+)\s+head=(?P<head>\S+)\s+task=(?P<task>\S+)"
+    r"\s+artifact=(?P<artifact>\S+)\s+head=(?P<head>\S+)"
+    r"\s+test=(?P<test>\S+)\s+task=(?P<task>\S+)"
+)
+FORCED_ADVANCE_RE = re.compile(
+    r"HOLLYSYS-FORCED-ADVANCE:\s+v=1\s+run=(?P<run>\S+)"
+    r"\s+phase=(?P<phase>spec|plan|tasks)\s+review_limit=(?P<limit>[1-9][0-9]*)"
+    r"\s+task=(?P<task>\S+)"
 )
 
 
@@ -219,6 +227,7 @@ class GitLabClient:
             source=SourceFacts(
                 prd_path=prd_path,
                 prd_commit_sha=prd_sha,
+                prd_blob_sha=str(requested_file["blob_id"]),
                 prd_blob_url=prd_blob_url,
                 prd_mr_url=prd_mr_url,
             ),
@@ -228,6 +237,7 @@ class GitLabClient:
                 worktree=str(worktree),
                 branch=delivery_branch,
                 target_branch=default_branch,
+                repository_base_sha=base_sha,
             ),
             origin=origin,
         )
@@ -311,6 +321,32 @@ class GitLabClient:
                 ],
             )
 
+    def validate_repository_evidence(
+        self,
+        run: RunRecord,
+        metadata: CompletionMetadata,
+    ) -> None:
+        evidence = metadata.repository_evidence
+        if evidence is None:
+            return
+        if evidence.repository_base_sha != run.workspace.repository_base_sha:
+            raise ValueError("repository evidence uses another base commit")
+        worktree = Path(run.workspace.worktree)
+        for path in evidence.inspected_paths:
+            result = self._git(
+                worktree,
+                [
+                    "cat-file",
+                    "-e",
+                    f"{run.workspace.repository_base_sha}:{path}",
+                ],
+                tolerate=True,
+            )
+            if result.returncode != 0:
+                raise ValueError(
+                    f"repository evidence path does not exist at base: {path}"
+                )
+
     def _git(
         self, cwd: Path, args: list[str], tolerate: bool = False
     ) -> subprocess.CompletedProcess[str]:
@@ -389,34 +425,7 @@ class GitLabClient:
             Stage.PLAN_REVIEW,
             Stage.TASKS_REVIEW,
         }:
-            assert metadata.review_commit_sha and metadata.artifact_digest
-            refs = self.paginated_list(
-                f"{self._project_endpoint(run.project.project_id)}/repository/"
-                f"commits/{metadata.review_commit_sha}/refs?type=branch"
-            )
-            if not any(
-                ref.get("type") == "branch" and ref.get("name") == run.workspace.branch
-                for ref in refs
-            ):
-                raise ValueError(
-                    f"{metadata.stage} review commit is not on the delivery branch"
-                )
-            actual_paths = self.artifact_paths(
-                run.project.project_id,
-                metadata.review_commit_sha,
-                self.config.artifact_patterns.get(metadata.stage.value, []),
-            )
-            if sorted(metadata.artifact_paths) != actual_paths:
-                raise ValueError(
-                    f"{metadata.stage} artifact path set differs from repository tree"
-                )
-            digest = self.artifact_digest(
-                run.project.project_id,
-                metadata.review_commit_sha,
-                actual_paths,
-            )
-            if digest != metadata.artifact_digest:
-                raise ValueError(f"{metadata.stage} artifact digest mismatch")
+            self.validate_artifact_completion(run, metadata)
         else:
             if metadata.head_sha != mr.get("sha"):
                 raise ValueError(f"{metadata.stage} is not bound to current MR head")
@@ -426,6 +435,122 @@ class GitLabClient:
             int(mr["iid"]),
             metadata,
         )
+
+    def validate_artifact_completion(
+        self, run: RunRecord, metadata: CompletionMetadata
+    ) -> None:
+        stage_for_patterns = {
+            Stage.SPEC_WRITE: Stage.SPEC_REVIEW,
+            Stage.SPEC_REVIEW: Stage.SPEC_REVIEW,
+            Stage.PLAN_WRITE: Stage.PLAN_REVIEW,
+            Stage.PLAN_REVIEW: Stage.PLAN_REVIEW,
+            Stage.TASKS_WRITE: Stage.TASKS_REVIEW,
+            Stage.TASKS_REVIEW: Stage.TASKS_REVIEW,
+        }.get(metadata.stage)
+        if stage_for_patterns is None:
+            raise ValueError(f"{metadata.stage} has no document artifact contract")
+        if metadata.artifact_commit_sha is None or metadata.artifact_digest is None:
+            raise ValueError("document artifact metadata is incomplete")
+        refs = self.paginated_list(
+            f"{self._project_endpoint(run.project.project_id)}/repository/"
+            f"commits/{metadata.artifact_commit_sha}/refs?type=branch"
+        )
+        if not any(
+            ref.get("type") == "branch" and ref.get("name") == run.workspace.branch
+            for ref in refs
+        ):
+            raise ValueError(
+                f"{metadata.stage} artifact commit is not on the delivery branch"
+            )
+        actual_paths = self.artifact_paths(
+            run.project.project_id,
+            metadata.artifact_commit_sha,
+            self.config.artifact_patterns.get(stage_for_patterns.value, []),
+        )
+        if sorted(metadata.artifact_paths) != actual_paths:
+            raise ValueError(
+                f"{metadata.stage} artifact path set differs from repository tree"
+            )
+        digest = self.artifact_digest(
+            run.project.project_id,
+            metadata.artifact_commit_sha,
+            actual_paths,
+        )
+        if digest != metadata.artifact_digest:
+            raise ValueError(f"{metadata.stage} artifact digest mismatch")
+        if metadata.mode == WorkMode.FINALIZATION:
+            self.validate_forced_advance(run, metadata)
+
+    def validate_forced_advance(
+        self, run: RunRecord, metadata: CompletionMetadata
+    ) -> None:
+        forced = metadata.forced_advance
+        if forced is None or metadata.mr_iid is None:
+            raise ValueError("finalization is missing forced-advance evidence")
+        mr = self.delivery_mr(run, metadata.mr_iid)
+        if mr is None:
+            raise ValueError("delivery MR does not exist")
+        phase = {
+            Stage.SPEC_WRITE: "spec",
+            Stage.PLAN_WRITE: "plan",
+            Stage.TASKS_WRITE: "tasks",
+        }.get(metadata.stage)
+        notes = self.paginated_list(
+            f"{self._project_endpoint(run.project.project_id)}/merge_requests/"
+            f"{metadata.mr_iid}/notes"
+        )
+        decision_matches: list[str] = []
+        final_review_found = False
+        expected_review_stage = f"{phase}-review"
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            note_id = note.get("id")
+            note_url = (
+                f"{mr.get('web_url')}#note_{note_id}" if note_id is not None else ""
+            )
+            gate = GATE_RE.search(str(note.get("body") or ""))
+            author = note.get("author") or {}
+            author_values = {
+                str(author.get("id") or ""),
+                str(author.get("username") or ""),
+                str(author.get("name") or ""),
+            }
+            reviewer_identities = set(
+                self.config.reviewer_identities.get(expected_review_stage, [])
+            )
+            if (
+                note_url == str(forced.final_review_url)
+                and gate is not None
+                and gate.group("run") == run.run_key
+                and gate.group("stage") == expected_review_stage
+                and gate.group("result") == "fail"
+                and gate.group("task") == forced.final_review_card_id
+                and bool(reviewer_identities.intersection(author_values))
+            ):
+                final_review_found = True
+            match = FORCED_ADVANCE_RE.search(str(note.get("body") or ""))
+            if not match:
+                continue
+            if (
+                match.group("run") == run.run_key
+                and match.group("phase") == phase
+                and int(match.group("limit")) == forced.review_limit
+                and match.group("task") == metadata.kanban_card_id
+            ):
+                decision_matches.append(note_url)
+        if not final_review_found:
+            raise ValueError(
+                "final_review_url is not the third failed review gate note"
+            )
+        if (
+            len(decision_matches) != 1
+            or decision_matches[0] != str(forced.decision_url)
+        ):
+            raise ValueError(
+                "expected exactly one idempotent HOLLYSYS-FORCED-ADVANCE "
+                "decision note"
+            )
 
     def artifact_paths(
         self, project_id: int, ref: str, patterns: list[str]
@@ -478,13 +603,17 @@ class GitLabClient:
         metadata: CompletionMetadata,
         ref: str,
     ) -> None:
-        if metadata.stage not in {
-            Stage.SPEC_REVIEW,
-            Stage.PLAN_REVIEW,
-            Stage.TASKS_REVIEW,
-        }:
+        pattern_stage = {
+            Stage.SPEC_WRITE: Stage.SPEC_REVIEW,
+            Stage.SPEC_REVIEW: Stage.SPEC_REVIEW,
+            Stage.PLAN_WRITE: Stage.PLAN_REVIEW,
+            Stage.PLAN_REVIEW: Stage.PLAN_REVIEW,
+            Stage.TASKS_WRITE: Stage.TASKS_REVIEW,
+            Stage.TASKS_REVIEW: Stage.TASKS_REVIEW,
+        }.get(metadata.stage)
+        if pattern_stage is None:
             return
-        patterns = self.config.artifact_patterns.get(metadata.stage.value, [])
+        patterns = self.config.artifact_patterns.get(pattern_stage.value, [])
         current_paths = self.artifact_paths(
             run.project.project_id,
             ref,
@@ -492,7 +621,7 @@ class GitLabClient:
         )
         if current_paths != sorted(metadata.artifact_paths):
             raise ValueError(
-                f"{metadata.stage} artifact set changed after its approved review"
+                f"{metadata.stage} artifact set changed after it was frozen"
             )
         current_digest = self.artifact_digest(
             run.project.project_id,
@@ -501,7 +630,43 @@ class GitLabClient:
         )
         if current_digest != metadata.artifact_digest:
             raise ValueError(
-                f"{metadata.stage} artifacts changed after their approved review"
+                f"{metadata.stage} artifacts changed after they were frozen"
+            )
+
+    def validate_baseline_at_ref(
+        self, run: RunRecord, baseline: ArtifactBaseline, ref: str
+    ) -> None:
+        if baseline.phase == "prd":
+            blob_id = self.file(
+                run.project.project_id,
+                run.source.prd_path,
+                ref,
+            ).get("blob_id")
+            if blob_id != run.source.prd_blob_sha:
+                raise ValueError("PRD changed after the run source was frozen")
+            return
+        pattern_stage = {
+            "spec": Stage.SPEC_REVIEW,
+            "plan": Stage.PLAN_REVIEW,
+            "tasks": Stage.TASKS_REVIEW,
+        }[baseline.phase]
+        current_paths = self.artifact_paths(
+            run.project.project_id,
+            ref,
+            self.config.artifact_patterns.get(pattern_stage.value, []),
+        )
+        if current_paths != sorted(baseline.artifact_paths):
+            raise ValueError(
+                f"{baseline.phase} artifact set changed after it was frozen"
+            )
+        current_digest = self.artifact_digest(
+            run.project.project_id,
+            ref,
+            current_paths,
+        )
+        if current_digest != baseline.artifact_digest:
+            raise ValueError(
+                f"{baseline.phase} artifacts changed after they were frozen"
             )
 
     def _validate_gate_note(
@@ -515,8 +680,13 @@ class GitLabClient:
             f"{mr_iid}/notes"
         )
         expected_digest = metadata.artifact_digest or "na"
-        expected_review = metadata.review_commit_sha or "na"
+        expected_artifact = metadata.artifact_commit_sha or "na"
         expected_head = metadata.head_sha or "na"
+        expected_test = (
+            metadata.test_disposition.value
+            if metadata.test_disposition is not None
+            else "na"
+        )
         for note in notes:
             if not isinstance(note, dict):
                 continue
@@ -536,8 +706,9 @@ class GitLabClient:
                 and match.group("stage") == metadata.stage.value
                 and match.group("result") == metadata.outcome.value
                 and match.group("digest") == expected_digest
-                and match.group("review") == expected_review
+                and match.group("artifact") == expected_artifact
                 and match.group("head") == expected_head
+                and match.group("test") == expected_test
                 and match.group("task") == metadata.kanban_card_id
             ):
                 author_id = author.get("id")

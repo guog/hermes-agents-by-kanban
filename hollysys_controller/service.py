@@ -18,20 +18,34 @@ from .kanban import (
     TaskRecord,
     parse_card_body,
     parse_run_body,
+    parse_run_protocol_version,
 )
 from .models import (
+    ArtifactBaseline,
+    BaselineDisposition,
     CardRecord,
     CompletionMetadata,
     FeishuOrigin,
     Outcome,
+    Phase,
+    RepairContext,
+    RepairKind,
     ResolveRequest,
     RunRecord,
     Stage,
     StartRequest,
+    TestDisposition,
+    WorkMode,
 )
 from .notifier import LarkNotifier
 from .store import ControllerStore, ManagedCard
-from .workflow import protocol_retry_allowed, route_completion
+from .workflow import (
+    DOCUMENT_REVIEW_FOR_PRODUCER,
+    PHASE_FOR_STAGE,
+    PRODUCER_FOR_PHASE,
+    protocol_retry_allowed,
+    route_completion,
+)
 
 ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "blocked"}
 TERMINAL_EVENT_KINDS = {
@@ -42,6 +56,21 @@ TERMINAL_EVENT_KINDS = {
     "gave_up",
     "spawn_auto_blocked",
     "status",
+}
+ALLOWED_HUMAN_BLOCK_KINDS = {
+    "permission",
+    "credential",
+    "environment",
+    "unsafe_retry",
+    "destructive_approval",
+}
+REQUIRED_HUMAN_BLOCK_FIELDS = {
+    "block_id",
+    "kind",
+    "summary",
+    "evidence",
+    "required_action",
+    "resume_check",
 }
 
 
@@ -152,6 +181,14 @@ class ControllerService:
                 lambda: self.kanban.complete_root(run, root.id) or {"card_id": root.id},
             )
             first = self._create_work(run, Stage.SPEC_WRITE, root.id)
+            self._enqueue_progress(
+                run,
+                "run-accepted",
+                self._mention(run.origin)
+                + "已受理 PRD 自动交付并进入 SPEC。\n"
+                f"run={run.run_key} agent={first.assignee} card={first.id}",
+            )
+            self._enqueue_phase_started(run, Phase.SPEC, first)
             response = {
                 "run_key": run.run_key,
                 "project": run.project.project_path,
@@ -168,9 +205,13 @@ class ControllerService:
 
     def status(self, run_key: str) -> dict:
         with self._lock:
+            protocol_version = self._run_protocol_version(run_key)
+            if protocol_version != "hollysys-controller/v2":
+                return self._historical_status(run_key, protocol_version)
             history, run = self._history(run_key)
             active = [item for item in history if item.task.status in ACTIVE_STATUSES]
             attempts = self._attempts_by_stage(history)
+            document_review_attempts = self._review_attempts_by_stage(history)
             protocol_failures = self._protocol_failures_by_stage(history)
             mr = self.gitlab.delivery_mr(run)
             merged = bool(mr and mr.get("state") == "merged")
@@ -183,9 +224,12 @@ class ControllerService:
                 Stage.TEST,
                 Stage.CODE_REVIEW,
             ):
-                meta = self._latest_valid_pass(history, stage)
+                meta = self._latest_valid_completion(
+                    history, stage, {Outcome.PASS, Outcome.FAIL}
+                )
                 valid = False
-                reason = "no applicable passing completion"
+                evidence_valid = False
+                reason = "no applicable completion"
                 if meta is not None:
                     try:
                         gate_authors[stage] = self.gitlab.validate_gate(run, meta)
@@ -202,17 +246,32 @@ class ControllerService:
                             self.gitlab.validate_artifact_gate_at_ref(
                                 run, meta, str(mr["sha"])
                             )
-                        valid = True
-                        reason = None
+                        evidence_valid = True
+                        valid = meta.outcome == Outcome.PASS
+                        reason = (
+                            None
+                            if valid
+                            else "gate evidence is valid but outcome is fail"
+                        )
                     except Exception as exc:  # noqa: BLE001 - status reports failures
                         reason = str(exc)
                 gates[stage.value] = {
                     "valid": valid,
+                    "evidence_valid": evidence_valid,
+                    "outcome": meta.outcome.value if meta else None,
                     "reason": reason,
                     "author": gate_authors.get(stage),
                     "head_sha": meta.head_sha if meta else None,
-                    "review_commit_sha": meta.review_commit_sha if meta else None,
+                    "artifact_commit_sha": (
+                        meta.artifact_commit_sha if meta else None
+                    ),
                     "artifact_digest": meta.artifact_digest if meta else None,
+                    "test_disposition": (
+                        meta.test_disposition.value
+                        if meta and meta.test_disposition
+                        else None
+                    ),
+                    "skip_reason": meta.skip_reason if meta else None,
                 }
             test_author = gate_authors.get(Stage.TEST)
             review_author = gate_authors.get(Stage.CODE_REVIEW)
@@ -226,6 +285,11 @@ class ControllerService:
                     gates[stage.value]["valid"] = False
                     gates[stage.value]["reason"] = reason
             current = active[-1] if active else None
+            current_record = (
+                parse_card_body(current.task.body)
+                if current and current.managed.purpose == "work"
+                else None
+            )
             latest_work = next(
                 (item for item in reversed(history) if item.managed.purpose == "work"),
                 None,
@@ -260,24 +324,95 @@ class ControllerService:
                         )
                     except Exception as exc:  # noqa: BLE001 - live status fact
                         merge_blocker = self._error_text(exc)
+            frozen_artifacts: list[dict] = []
+            key_decisions: list[dict] = []
+            residual_risks: list[dict] = []
+            current_head = str(mr.get("sha") or "") if mr else ""
+            for baseline in self._frozen_baselines(history, run):
+                valid: bool | None = None
+                reason: str | None = None
+                if current_head:
+                    try:
+                        self.gitlab.validate_baseline_at_ref(
+                            run, baseline, current_head
+                        )
+                        valid = True
+                    except Exception as exc:  # noqa: BLE001 - live status fact
+                        valid = False
+                        reason = self._error_text(exc)
+                frozen_artifacts.append(
+                    {
+                        **baseline.model_dump(mode="json"),
+                        "valid_at_current_head": valid,
+                        "reason": reason,
+                    }
+                )
+                if baseline.decision_urls:
+                    key_decisions.append(
+                        {
+                            "phase": baseline.phase,
+                            "disposition": baseline.disposition.value,
+                            "summary": baseline.key_decisions,
+                            "urls": [str(url) for url in baseline.decision_urls],
+                        }
+                    )
+                if baseline.unresolved_findings or baseline.residual_risk:
+                    residual_risks.append(
+                        {
+                            "phase": baseline.phase,
+                            "unresolved_findings": baseline.unresolved_findings,
+                            "residual_risks": baseline.residual_risk,
+                        }
+                    )
+            review_stages = {
+                Phase.SPEC: Stage.SPEC_REVIEW,
+                Phase.PLAN: Stage.PLAN_REVIEW,
+                Phase.TASKS: Stage.TASKS_REVIEW,
+            }
+            review_attempts = {
+                phase.value: document_review_attempts.get(stage, 0)
+                for phase, stage in review_stages.items()
+            }
+            review_remaining = {
+                phase: max(0, self.config.document_review_limit - count)
+                for phase, count in review_attempts.items()
+            }
+            code_modifications = self._code_modification_count(history)
+            exact_stage = (
+                current.managed.stage
+                if current
+                else "merged"
+                if merged
+                else "checked-head-merge"
+                if latest_work
+                and latest_work.managed.stage == Stage.CODE_REVIEW.value
+                and latest_work.task.status == "done"
+                else "reconciling"
+            )
+            phase = (
+                "merged"
+                if merged
+                else PHASE_FOR_STAGE[Stage(current.managed.stage)].value
+                if current and current.managed.purpose == "work"
+                else "exception"
+                if current
+                else "code"
+                if exact_stage == "checked-head-merge"
+                else "reconciling"
+            )
             return {
                 "run_key": run_key,
-                "phase": (
-                    "merged"
-                    if merged
-                    else current.managed.stage
-                    if current
-                    else "checked-head-merge"
-                    if latest_work
-                    and latest_work.managed.stage == Stage.CODE_REVIEW.value
-                    and latest_work.task.status == "done"
-                    else "reconciling"
-                ),
+                "phase": phase,
+                "stage": exact_stage,
                 "active_card": (
                     {
                         "id": current.task.id,
                         "stage": current.managed.stage,
                         "iteration": current.managed.iteration,
+                        "mode": (
+                            current_record.mode.value if current_record else None
+                        ),
+                        "agent": current.task.assignee,
                         "status": current.task.status,
                         "purpose": current.managed.purpose,
                     }
@@ -285,6 +420,16 @@ class ControllerService:
                     else None
                 ),
                 "attempts": {stage.value: count for stage, count in attempts.items()},
+                "review_attempts": review_attempts,
+                "review_remaining": review_remaining,
+                "code_modifications": {
+                    "used": code_modifications,
+                    "remaining": max(
+                        0,
+                        self.config.code_modification_limit - code_modifications,
+                    ),
+                    "limit": self.config.code_modification_limit,
+                },
                 "protocol_failures": {
                     stage.value: count for stage, count in protocol_failures.items()
                 },
@@ -300,10 +445,14 @@ class ControllerService:
                     else None
                 ),
                 "gates": gates,
+                "frozen_artifacts": frozen_artifacts,
+                "key_decisions": key_decisions,
+                "residual_risks": residual_risks,
                 "blocked": blocked_comment,
                 "merge_blocker": merge_blocker,
                 "board": run.workspace.board,
                 "worktree": run.workspace.worktree,
+                "repository_base_sha": run.workspace.repository_base_sha,
             }
 
     def resolve(self, raw: dict) -> dict:
@@ -351,11 +500,23 @@ class ControllerService:
                 )
                 if block_comment is None:
                     raise ValueError("matching [human-block:v1] comment was not found")
+                block_fields = self._human_block_fields(block_comment)
+                missing = REQUIRED_HUMAN_BLOCK_FIELDS - block_fields.keys()
+                if (
+                    missing
+                    or block_fields.get("kind")
+                    not in ALLOWED_HUMAN_BLOCK_KINDS
+                ):
+                    raise ValueError(
+                        "human block is not an allowed v2 technical/safety block"
+                    )
                 stage = Stage(managed.stage)
+                original_record = parse_card_body(task.body)
                 retry = self._resolved_retry(
                     history,
                     task.id,
                     stage,
+                    original_record.mode,
                     request.answer,
                 )
                 if retry is None:
@@ -365,6 +526,8 @@ class ControllerService:
                         run,
                         stage,
                         task.id,
+                        mode=original_record.mode,
+                        repair_context=original_record.repair_context,
                         resume_answer=request.answer,
                         resumed_from=task.id,
                     )
@@ -389,12 +552,12 @@ class ControllerService:
                     )
                     resolution_exists = True
                 if task.status == "blocked":
-                    self.kanban.unsubscribe(run.workspace.board, task.id, run.origin)
                     cancelled = self._controller_completion(
                         run,
                         managed,
                         task.id,
                         outcome=Outcome.CANCELLED,
+                        mode=original_record.mode,
                         issues=[f"human block resolved; superseded by {retry.id}"],
                     )
                     self.kanban.complete(
@@ -448,6 +611,12 @@ class ControllerService:
                 for event in self.reader.events_after(board, cursor):
                     managed = self.store.managed_card(board, event.task_id)
                     if managed and event.kind in TERMINAL_EVENT_KINDS:
+                        if (
+                            self._run_protocol_version(managed.run_key)
+                            != "hollysys-controller/v2"
+                        ):
+                            self.store.set_cursor(board, event.id)
+                            continue
                         try:
                             if event.kind in {"gave_up", "spawn_auto_blocked"}:
                                 _, run = self._history(managed.run_key)
@@ -469,6 +638,11 @@ class ControllerService:
                         self.resolve(request["payload"])
                 run_errors: list[str] = []
                 for run_key in self.store.run_keys():
+                    if (
+                        self._run_protocol_version(run_key)
+                        != "hollysys-controller/v2"
+                    ):
+                        continue
                     try:
                         self.reconcile_run(run_key)
                     except Exception as exc:  # noqa: BLE001 - isolate each run
@@ -483,6 +657,8 @@ class ControllerService:
                 raise
 
     def reconcile_run(self, run_key: str) -> None:
+        if self._run_protocol_version(run_key) != "hollysys-controller/v2":
+            return
         history, run = self._history(run_key)
         mr = self.gitlab.delivery_mr(run)
         if mr and mr.get("state") == "merged":
@@ -504,18 +680,18 @@ class ControllerService:
         for item in active:
             if item.managed.purpose != "work":
                 continue
-            if not self.reader.subscription_exists(
-                run.workspace.board, item.task.id, run.origin
-            ):
-                self.kanban.subscribe(run.workspace.board, item.task.id, run.origin)
             if item.task.status == "blocked":
                 failure_fuse = any(
                     kind in {"gave_up", "spawn_auto_blocked"}
                     for kind in item.task.event_kinds
                 )
-                human_block = any(
-                    "[human-block:v1]" in str(comment["body"])
-                    for comment in item.task.comments
+                human_block_comment = next(
+                    (
+                        str(comment["body"])
+                        for comment in reversed(item.task.comments)
+                        if "[human-block:v1]" in str(comment["body"])
+                    ),
+                    None,
                 )
                 if item.task.latest_outcome is None and not failure_fuse:
                     # This is an interrupted controller publish, not a worker
@@ -523,7 +699,46 @@ class ControllerService:
                     # the absence of a task-run outcome is the stable signal.
                     self.kanban.release(run.workspace.board, item.task.id)
                     return
-                if item.task.latest_outcome == "blocked" and not human_block:
+                if (
+                    item.task.latest_outcome == "blocked"
+                    and human_block_comment is not None
+                ):
+                    block_fields = self._human_block_fields(
+                        human_block_comment
+                    )
+                    missing = REQUIRED_HUMAN_BLOCK_FIELDS - block_fields.keys()
+                    if (
+                        missing
+                        or block_fields.get("kind")
+                        not in ALLOWED_HUMAN_BLOCK_KINDS
+                    ):
+                        reason = (
+                            "unsupported human block; business ambiguity must "
+                            "be resolved autonomously"
+                        )
+                        if missing:
+                            reason += "; missing=" + ",".join(sorted(missing))
+                        if not any(
+                            "[controller-block-rejected:v2]"
+                            in str(comment["body"])
+                            for comment in item.task.comments
+                        ):
+                            self.kanban.comment(
+                                run.workspace.board,
+                                item.task.id,
+                                "[controller-block-rejected:v2]\n"
+                                f"reason: {reason}",
+                                "hollysys-controller",
+                            )
+                        self.kanban.release(
+                            run.workspace.board, item.task.id
+                        )
+                        return
+                    self._enqueue_human_block(run, item, human_block_comment)
+                if (
+                    item.task.latest_outcome == "blocked"
+                    and human_block_comment is None
+                ):
                     self._enqueue_controller_failure(
                         run.run_key,
                         ValueError(
@@ -560,11 +775,29 @@ class ControllerService:
         try:
             metadata = CompletionMetadata.model_validate(latest.task.latest_metadata)
             self._validate_completion_context(run, latest, metadata)
+            self._validate_finalization_context(history, latest, metadata)
         except (ValidationError, ValueError, TypeError) as exc:
             self._protocol_failure(run, history, latest, self._error_text(exc))
             return
 
-        if metadata.outcome == Outcome.PASS:
+        if metadata.repository_evidence is not None:
+            try:
+                self.gitlab.validate_repository_evidence(run, metadata)
+            except ValueError as exc:
+                self._protocol_failure(run, history, latest, str(exc))
+                return
+
+        gate_stages = {
+            Stage.SPEC_REVIEW,
+            Stage.PLAN_REVIEW,
+            Stage.TASKS_REVIEW,
+            Stage.TEST,
+            Stage.CODE_REVIEW,
+        }
+        if metadata.stage in gate_stages and metadata.outcome in {
+            Outcome.PASS,
+            Outcome.FAIL,
+        }:
             try:
                 self.gitlab.validate_gate(run, metadata)
             except ValueError as exc:
@@ -577,42 +810,199 @@ class ControllerService:
                 else:
                     self._protocol_failure(run, history, latest, str(exc))
                 return
+        if metadata.mode == WorkMode.FINALIZATION:
+            try:
+                self.gitlab.validate_artifact_completion(run, metadata)
+            except ValueError as exc:
+                self._protocol_failure(run, history, latest, str(exc))
+                return
+
+        live_mr = self.gitlab.delivery_mr(run, metadata.mr_iid)
+        if live_mr is not None and live_mr.get("sha"):
+            current_head = str(live_mr["sha"])
+            violation = self._frozen_violation(run, history, current_head)
+            if violation is not None:
+                phase = PHASE_FOR_STAGE[metadata.stage]
+                repair_mode = (
+                    WorkMode.FINALIZATION
+                    if metadata.mode == WorkMode.FINALIZATION
+                    else WorkMode.NORMAL
+                )
+                self._create_frozen_repair(
+                    run,
+                    history,
+                    phase,
+                    latest.task.id,
+                    violation,
+                    mode=repair_mode,
+                )
+                return
+            if (
+                metadata.stage
+                in {
+                    Stage.SPEC_REVIEW,
+                    Stage.PLAN_REVIEW,
+                    Stage.TASKS_REVIEW,
+                }
+                and metadata.outcome == Outcome.PASS
+            ):
+                try:
+                    self.gitlab.validate_artifact_gate_at_ref(
+                        run, metadata, current_head
+                    )
+                except ValueError as exc:
+                    self._create_review_repair(
+                        run,
+                        history,
+                        metadata,
+                        latest.task.id,
+                        [str(exc)],
+                    )
+                    return
+            if metadata.mode == WorkMode.FINALIZATION:
+                try:
+                    self.gitlab.validate_artifact_gate_at_ref(
+                        run, metadata, current_head
+                    )
+                except ValueError as exc:
+                    phase = PHASE_FOR_STAGE[metadata.stage]
+                    self._create_frozen_repair(
+                        run,
+                        history,
+                        phase,
+                        latest.task.id,
+                        str(exc),
+                        mode=WorkMode.FINALIZATION,
+                    )
+                    return
+
+        review_attempts = self._review_attempts_by_stage(history)
+        code_modifications = self._code_modification_count(history)
+        paired_test = None
+        if metadata.stage == Stage.CODE_REVIEW and metadata.outcome in {
+            Outcome.PASS,
+            Outcome.FAIL,
+        }:
+            paired_test = self._latest_valid_completion(
+                history,
+                Stage.TEST,
+                {Outcome.PASS, Outcome.FAIL},
+            )
+            if (
+                paired_test is None
+                or paired_test.mr_iid != metadata.mr_iid
+                or paired_test.mr_url != metadata.mr_url
+                or paired_test.head_sha != metadata.head_sha
+            ):
+                self._create_work(run, Stage.TEST, latest.task.id)
+                return
+            try:
+                self.gitlab.validate_gate(run, paired_test)
+            except ValueError:
+                self._create_work(run, Stage.TEST, latest.task.id)
+                return
+        route = route_completion(
+            metadata,
+            review_attempts_by_stage=review_attempts,
+            config=self.config,
+            paired_test=paired_test,
+            code_modifications=code_modifications,
+        )
+        if route.blocked_reason:
+            reason = route.blocked_reason
+            if metadata.stage == Stage.CODE_REVIEW and paired_test is not None:
+                findings = self._code_gate_issues(paired_test, metadata)
+                reason += (
+                    f"; head={metadata.head_sha}; "
+                    f"tester={paired_test.outcome.value}; "
+                    f"code-reviewer={metadata.outcome.value}; findings="
+                    + " | ".join(findings[:6])
+                    + "; required_action=human must decide whether to continue "
+                    "with a new modification budget or stop delivery"
+                )
+            self._exception(run, latest.task.id, reason)
+            return
+        if route.next_stage:
+            repair_context = None
+            if (
+                metadata.stage == Stage.TEST
+                and metadata.test_disposition
+                == TestDisposition.SKIPPED_UNAVAILABLE
+            ):
+                self._enqueue_test_skipped(run, metadata)
             if metadata.stage in {
                 Stage.SPEC_REVIEW,
                 Stage.PLAN_REVIEW,
                 Stage.TASKS_REVIEW,
-            }:
-                live_mr = self.gitlab.delivery_mr(run, metadata.mr_iid)
-                if live_mr is None or not live_mr.get("sha"):
-                    self._protocol_failure(
-                        run,
-                        history,
-                        latest,
-                        "delivery MR has no current head",
-                    )
-                    return
-                try:
-                    self.gitlab.validate_artifact_gate_at_ref(
-                        run, metadata, str(live_mr["sha"])
-                    )
-                except ValueError:
-                    producer = {
-                        Stage.SPEC_REVIEW: Stage.SPEC_WRITE,
-                        Stage.PLAN_REVIEW: Stage.PLAN_WRITE,
-                        Stage.TASKS_REVIEW: Stage.TASKS_WRITE,
-                    }[metadata.stage]
-                    self._restart_with_budget(run, history, producer, latest.task.id)
-                    return
-
-        attempts = self._attempts_by_stage(history)
-        route = route_completion(
-            metadata, attempts_by_stage=attempts, config=self.config
-        )
-        if route.blocked_reason:
-            self._exception(run, latest.task.id, route.blocked_reason)
-            return
-        if route.next_stage:
-            self._create_work(run, route.next_stage, latest.task.id)
+            } and metadata.outcome == Outcome.FAIL:
+                review_attempt = review_attempts.get(metadata.stage, 0)
+                repair_context = RepairContext(
+                    kind=RepairKind.REVIEW_FAILURE,
+                    trigger_card_id=latest.task.id,
+                    issues=metadata.issues,
+                    review_attempt=review_attempt,
+                    review_limit=self.config.document_review_limit,
+                )
+                self._enqueue_review_failed(
+                    run,
+                    metadata,
+                    review_attempt,
+                    route.next_mode,
+                )
+            if (
+                metadata.stage == Stage.CODE_REVIEW
+                and paired_test is not None
+                and (
+                    paired_test.outcome == Outcome.FAIL
+                    or metadata.outcome == Outcome.FAIL
+                )
+            ):
+                next_modification = code_modifications + 1
+                repair_context = RepairContext(
+                    kind=RepairKind.CODE_GATE_FAILURE,
+                    trigger_card_id=latest.task.id,
+                    related_card_ids=[
+                        paired_test.kanban_card_id,
+                        metadata.kanban_card_id,
+                    ],
+                    head_sha=metadata.head_sha,
+                    code_modification=next_modification,
+                    code_modification_limit=self.config.code_modification_limit,
+                    issues=self._code_gate_issues(paired_test, metadata),
+                )
+                self._enqueue_code_retry(
+                    run,
+                    paired_test,
+                    metadata,
+                    next_modification,
+                )
+            if metadata.stage in {
+                Stage.SPEC_REVIEW,
+                Stage.PLAN_REVIEW,
+                Stage.TASKS_REVIEW,
+            } and metadata.outcome == Outcome.PASS:
+                self._enqueue_phase_frozen(
+                    run,
+                    PHASE_FOR_STAGE[metadata.stage],
+                    metadata,
+                )
+            if metadata.mode == WorkMode.FINALIZATION:
+                self._enqueue_phase_frozen(
+                    run,
+                    PHASE_FOR_STAGE[metadata.stage],
+                    metadata,
+                )
+            created = self._create_work(
+                run,
+                route.next_stage,
+                latest.task.id,
+                mode=route.next_mode,
+                repair_context=repair_context,
+            )
+            if PHASE_FOR_STAGE[route.next_stage] != PHASE_FOR_STAGE[metadata.stage]:
+                self._enqueue_phase_started(
+                    run, PHASE_FOR_STAGE[route.next_stage], created
+                )
             return
         if route.merge:
             test = self._latest_valid_pass(history, Stage.TEST)
@@ -624,26 +1014,16 @@ class ControllerService:
             if live_mr is None or not live_mr.get("sha"):
                 return
             current_head = str(live_mr["sha"])
-            document_gates = (
-                (Stage.SPEC_REVIEW, Stage.SPEC_WRITE),
-                (Stage.PLAN_REVIEW, Stage.PLAN_WRITE),
-                (Stage.TASKS_REVIEW, Stage.TASKS_WRITE),
-            )
-            for gate_stage, producer_stage in document_gates:
-                gate = self._latest_valid_pass(history, gate_stage)
-                if gate is None:
-                    self._restart_with_budget(
-                        run, history, producer_stage, latest.task.id
-                    )
-                    return
-                try:
-                    self.gitlab.validate_gate(run, gate)
-                    self.gitlab.validate_artifact_gate_at_ref(run, gate, current_head)
-                except ValueError:
-                    self._restart_with_budget(
-                        run, history, producer_stage, latest.task.id
-                    )
-                    return
+            violation = self._frozen_violation(run, history, current_head)
+            if violation is not None:
+                self._create_frozen_repair(
+                    run,
+                    history,
+                    Phase.CODE,
+                    latest.task.id,
+                    violation,
+                )
+                return
             try:
                 self.gitlab.validate_gate(run, test)
                 self.gitlab.validate_gate(run, review)
@@ -679,23 +1059,6 @@ class ControllerService:
                 return
             self._enqueue_success(run, merged)
 
-    def _restart_with_budget(
-        self,
-        run: RunRecord,
-        history: list[HistoryItem],
-        stage: Stage,
-        parent_card_id: str,
-    ) -> None:
-        attempts = self._attempts_by_stage(history).get(stage, 0)
-        if attempts >= 1 + self.config.design_rework_limit:
-            self._exception(
-                run,
-                parent_card_id,
-                f"{stage.value} rework budget exhausted after gate invalidation",
-            )
-            return
-        self._create_work(run, stage, parent_card_id)
-
     def flush_outbox(self) -> None:
         for item in self.store.pending_outbox():
             try:
@@ -721,14 +1084,26 @@ class ControllerService:
         kanban_ok = all(item["ok"] for item in board_health.values()) and (
             bool(boards) or not self.store.run_keys()
         )
+        historical_v1_runs: list[str] = []
+        active_v1_runs: list[str] = []
+        for run_key in self.store.run_keys():
+            if self._run_protocol_version(run_key) != "hollysys-controller/v1":
+                continue
+            historical_v1_runs.append(run_key)
+            if self._historical_status(run_key, "hollysys-controller/v1")[
+                "active_card"
+            ]:
+                active_v1_runs.append(run_key)
         data.update(
             {
-                "ok": self.last_reconcile_error is None,
+                "ok": self.last_reconcile_error is None and not active_v1_runs,
                 "boards": sorted(boards),
                 "board_health": board_health,
                 "last_reconcile_at": self.last_reconcile_at,
                 "last_reconcile_error": self.last_reconcile_error,
                 "kanban_ok": kanban_ok,
+                "historical_v1_runs": historical_v1_runs,
+                "active_v1_runs": active_v1_runs,
             }
         )
         data["ok"] = data["ok"] and kanban_ok
@@ -746,9 +1121,63 @@ class ControllerService:
         stage: Stage,
         parent_card_id: str,
         *,
+        mode: WorkMode = WorkMode.NORMAL,
+        repair_context: RepairContext | None = None,
         resume_answer: str | None = None,
         resumed_from: str | None = None,
     ) -> TaskRecord:
+        full_history, _ = self._history(run.run_key)
+        frozen_baselines = self._frozen_baselines(full_history, run)
+        mr = self.gitlab.delivery_mr(run)
+        frozen_repair = (
+            repair_context is not None
+            and repair_context.kind == RepairKind.FROZEN_ARTIFACT_VIOLATION
+        )
+        if mr is not None and mr.get("sha") and not frozen_repair:
+            violation = self._frozen_violation(
+                run, full_history, str(mr["sha"])
+            )
+            if violation is not None:
+                phase = PHASE_FOR_STAGE[stage]
+                stage = PRODUCER_FOR_PHASE[phase]
+                if mode == WorkMode.FINALIZATION and repair_context is not None:
+                    repair_context = repair_context.model_copy(
+                        update={
+                            "issues": [
+                                *repair_context.issues,
+                                "恢复冻结工件后再完成 finalization。 " + violation,
+                            ]
+                        }
+                    )
+                else:
+                    prior_issues = (
+                        repair_context.issues
+                        if repair_context is not None
+                        else []
+                    )
+                    mode = WorkMode.NORMAL
+                    repair_context = RepairContext(
+                        kind=RepairKind.FROZEN_ARTIFACT_VIOLATION,
+                        trigger_card_id=parent_card_id,
+                        issues=[
+                            *prior_issues,
+                            "恢复冻结工件到 Controller 提供的基线；"
+                            "只在当前阶段吸收必要适配。 " + violation,
+                        ],
+                    )
+                self._enqueue_progress(
+                    run,
+                    f"{phase.value}:preflight-frozen-repair:"
+                    f"{hashlib.sha256(violation.encode()).hexdigest()[:12]}",
+                    self._mention(run.origin)
+                    + f"释放下一张卡前发现冻结工件被修改，"
+                    f"已改派 {phase.value.upper()} 恢复任务。\n"
+                    f"run={run.run_key} reason={violation[:500]}",
+                )
+        if repair_context is not None:
+            repair_context = repair_context.model_copy(
+                update={"frozen_baselines": frozen_baselines}
+            )
         history = self.store.cards_for_run(run.run_key)
         attempts = sum(
             1
@@ -756,17 +1185,20 @@ class ControllerService:
             if card.purpose == "work" and card.stage == stage.value
         )
         iteration = attempts + 1
-        key = f"{run.run_key}:{stage.value}:{iteration}:work"
+        key = f"{run.run_key}:{stage.value}:{iteration}:{mode.value}:work"
         assignee = self.config.stage_assignees[stage]
         skills = self.config.stage_skills[stage]
         record = CardRecord(
             run=run,
             stage=stage,
             iteration=iteration,
+            mode=mode,
             idempotency_key=key,
             parent_card_id=parent_card_id,
             assignee=assignee,
             skills=skills,
+            frozen_baselines=frozen_baselines,
+            repair_context=repair_context,
             resume_answer=resume_answer,
             resumed_from_card_id=resumed_from,
         )
@@ -789,21 +1221,6 @@ class ControllerService:
         record = parse_card_body(task.body)
         key = record.idempotency_key
         self._operation(
-            f"{key}:subscribe",
-            "subscribe",
-            {"board": run.workspace.board, "card_id": task.id},
-            lambda: (
-                self.kanban.subscribe(run.workspace.board, task.id, run.origin)
-                or {"card_id": task.id}
-            ),
-        )
-        if not self.reader.subscription_exists(
-            run.workspace.board, task.id, run.origin
-        ):
-            # The durable operation may predate an external subscription
-            # deletion. Repair the observable fact before releasing the card.
-            self.kanban.subscribe(run.workspace.board, task.id, run.origin)
-        self._operation(
             f"{key}:release",
             "release",
             {"board": run.workspace.board, "card_id": task.id},
@@ -822,6 +1239,7 @@ class ControllerService:
         history: list[HistoryItem],
         blocked_card_id: str,
         stage: Stage,
+        mode: WorkMode,
         answer: str,
     ) -> TaskRecord | None:
         for item in reversed(history):
@@ -838,6 +1256,7 @@ class ControllerService:
             if (
                 record.resumed_from_card_id == blocked_card_id
                 and record.resume_answer == answer
+                and record.mode == mode
             ):
                 return item.task
         return None
@@ -900,6 +1319,54 @@ class ControllerService:
             self._verify_work(item.task, record)
         return items, run
 
+    def _run_protocol_version(self, run_key: str) -> str:
+        cards = self.store.cards_for_run(run_key)
+        root = next((card for card in cards if card.purpose == "root"), None)
+        if root is None:
+            raise ValueError(f"run {run_key} has no managed root")
+        task = self.reader.task(root.board, root.card_id)
+        if task is None:
+            raise RuntimeError(f"managed root disappeared: {root.card_id}")
+        return parse_run_protocol_version(task.body)
+
+    def _historical_status(
+        self, run_key: str, protocol_version: str
+    ) -> dict:
+        cards = self.store.cards_for_run(run_key)
+        tasks = [
+            (card, self.reader.task(card.board, card.card_id))
+            for card in cards
+        ]
+        active = [
+            (card, task)
+            for card, task in tasks
+            if task is not None and task.status in ACTIVE_STATUSES
+        ]
+        current = active[-1] if active else None
+        return {
+            "run_key": run_key,
+            "protocol_version": protocol_version,
+            "state": "historical_read_only",
+            "phase": "legacy",
+            "stage": current[0].stage if current else "completed",
+            "active_card": (
+                {
+                    "id": current[1].id,
+                    "stage": current[0].stage,
+                    "iteration": current[0].iteration,
+                    "agent": current[1].assignee,
+                    "status": current[1].status,
+                }
+                if current
+                else None
+            ),
+            "warning": (
+                "active v1 state is not migrated; finish it before deploying v2"
+                if current
+                else "v1 history is retained read-only"
+            ),
+        }
+
     def _attempts_by_stage(self, history: list[HistoryItem]) -> dict[Stage, int]:
         result: dict[Stage, int] = {}
         for item in history:
@@ -907,12 +1374,228 @@ class ControllerService:
                 continue
             stage = Stage(item.managed.stage)
             if any(
-                "[controller-protocol-error:v1]" in str(comment["body"])
+                "[controller-protocol-error:v2]" in str(comment["body"])
                 for comment in item.task.comments
             ):
                 continue
             result[stage] = result.get(stage, 0) + 1
         return result
+
+    def _review_attempts_by_stage(
+        self, history: list[HistoryItem]
+    ) -> dict[Stage, int]:
+        review_stages = {
+            Stage.SPEC_REVIEW,
+            Stage.PLAN_REVIEW,
+            Stage.TASKS_REVIEW,
+        }
+        review_stage_values = {stage.value for stage in review_stages}
+        result: dict[Stage, int] = {}
+        for item in history:
+            if (
+                item.managed.purpose != "work"
+                or item.managed.stage not in review_stage_values
+                or item.task.status != "done"
+                or any(
+                    "[controller-protocol-error:v2]" in str(comment["body"])
+                    for comment in item.task.comments
+                )
+            ):
+                continue
+            try:
+                metadata = CompletionMetadata.model_validate(
+                    item.task.latest_metadata
+                )
+                self._validate_completion_context(
+                    parse_card_body(item.task.body).run,
+                    item,
+                    metadata,
+                )
+            except (ValidationError, ValueError, TypeError):
+                continue
+            if metadata.outcome not in {Outcome.PASS, Outcome.FAIL}:
+                continue
+            stage = Stage(item.managed.stage)
+            result[stage] = result.get(stage, 0) + 1
+        return result
+
+    def _frozen_baselines(
+        self, history: list[HistoryItem], run: RunRecord
+    ) -> list[ArtifactBaseline]:
+        root = next(
+            item for item in history if item.managed.purpose == "root"
+        )
+        prd_digest = hashlib.sha256(
+            f"{run.source.prd_path}\0{run.source.prd_blob_sha}\n".encode("utf-8")
+        ).hexdigest()
+        baselines = [
+            ArtifactBaseline(
+                phase="prd",
+                disposition=BaselineDisposition.SOURCE,
+                artifact_paths=[run.source.prd_path],
+                artifact_digest=prd_digest,
+                artifact_commit_sha=run.source.prd_commit_sha,
+                source_card_id=root.task.id,
+            )
+        ]
+        phase_contracts = (
+            ("spec", Stage.SPEC_WRITE, Stage.SPEC_REVIEW),
+            ("plan", Stage.PLAN_WRITE, Stage.PLAN_REVIEW),
+            ("tasks", Stage.TASKS_WRITE, Stage.TASKS_REVIEW),
+        )
+        for phase, producer, reviewer in phase_contracts:
+            candidate: tuple[int, CompletionMetadata] | None = None
+            for index, item in enumerate(history):
+                if item.managed.purpose != "work" or item.task.status != "done":
+                    continue
+                if item.managed.stage not in {producer.value, reviewer.value}:
+                    continue
+                try:
+                    metadata = CompletionMetadata.model_validate(
+                        item.task.latest_metadata
+                    )
+                    self._validate_completion_context(run, item, metadata)
+                except (ValidationError, ValueError, TypeError):
+                    continue
+                reviewed = (
+                    metadata.stage == reviewer
+                    and metadata.outcome == Outcome.PASS
+                    and metadata.baseline_disposition
+                    == BaselineDisposition.REVIEWED
+                )
+                forced = (
+                    metadata.stage == producer
+                    and metadata.mode == WorkMode.FINALIZATION
+                    and metadata.outcome == Outcome.PASS
+                    and metadata.baseline_disposition
+                    == BaselineDisposition.FORCED_AFTER_REVIEW_LIMIT
+                )
+                if reviewed or forced:
+                    candidate = (index, metadata)
+            if candidate is None:
+                break
+            metadata = candidate[1]
+            assert metadata.artifact_digest
+            assert metadata.artifact_commit_sha
+            decision_urls = list(metadata.gitlab_urls)
+            if (
+                metadata.forced_advance is not None
+                and metadata.forced_advance.decision_url not in decision_urls
+            ):
+                decision_urls.append(metadata.forced_advance.decision_url)
+            baselines.append(
+                ArtifactBaseline(
+                    phase=phase,
+                    disposition=metadata.baseline_disposition,
+                    artifact_paths=metadata.artifact_paths,
+                    artifact_digest=metadata.artifact_digest,
+                    artifact_commit_sha=metadata.artifact_commit_sha,
+                    source_card_id=metadata.kanban_card_id,
+                    decision_urls=decision_urls,
+                    key_decisions=metadata.key_decisions,
+                    unresolved_findings=(
+                        metadata.forced_advance.unresolved_findings
+                        if metadata.forced_advance is not None
+                        else []
+                    ),
+                    residual_risk=metadata.residual_risk,
+                )
+            )
+        return baselines
+
+    def _frozen_violation(
+        self,
+        run: RunRecord,
+        history: list[HistoryItem],
+        ref: str,
+    ) -> str | None:
+        for baseline in self._frozen_baselines(history, run):
+            try:
+                self.gitlab.validate_baseline_at_ref(run, baseline, ref)
+            except ValueError as exc:
+                return f"{baseline.phase}: {exc}"
+        return None
+
+    def _create_review_repair(
+        self,
+        run: RunRecord,
+        history: list[HistoryItem],
+        metadata: CompletionMetadata,
+        parent_card_id: str,
+        issues: list[str],
+    ) -> TaskRecord:
+        review_attempt = self._review_attempts_by_stage(history).get(
+            metadata.stage, 0
+        )
+        mode = (
+            WorkMode.FINALIZATION
+            if review_attempt >= self.config.document_review_limit
+            else WorkMode.NORMAL
+        )
+        context = RepairContext(
+            kind=RepairKind.REVIEW_FAILURE,
+            trigger_card_id=parent_card_id,
+            issues=issues,
+            review_attempt=review_attempt,
+            review_limit=self.config.document_review_limit,
+        )
+        self._enqueue_review_failed(run, metadata, review_attempt, mode)
+        return self._create_work(
+            run,
+            PRODUCER_FOR_PHASE[PHASE_FOR_STAGE[metadata.stage]],
+            parent_card_id,
+            mode=mode,
+            repair_context=context,
+        )
+
+    def _create_frozen_repair(
+        self,
+        run: RunRecord,
+        history: list[HistoryItem],
+        phase: Phase,
+        parent_card_id: str,
+        violation: str,
+        *,
+        mode: WorkMode = WorkMode.NORMAL,
+    ) -> TaskRecord:
+        context = None
+        if mode == WorkMode.FINALIZATION:
+            latest_record = parse_card_body(history[-1].task.body)
+            if (
+                latest_record.repair_context is not None
+                and latest_record.repair_context.kind == RepairKind.REVIEW_FAILURE
+            ):
+                context = latest_record.repair_context.model_copy(
+                    update={
+                        "issues": [
+                            *latest_record.repair_context.issues,
+                            "恢复冻结工件后再完成 finalization。 " + violation,
+                        ]
+                    }
+                )
+        if context is None:
+            context = RepairContext(
+                kind=RepairKind.FROZEN_ARTIFACT_VIOLATION,
+                trigger_card_id=parent_card_id,
+                issues=[
+                    "恢复冻结工件到 Controller 提供的基线；只在当前阶段吸收必要适配。 "
+                    + violation
+                ],
+            )
+        self._enqueue_progress(
+            run,
+            f"{phase.value}:frozen-repair:{hashlib.sha256(violation.encode()).hexdigest()[:12]}",
+            self._mention(run.origin)
+            + f"检测到冻结工件被修改，已在 {phase.value.upper()} 阶段派发恢复任务。\n"
+            f"run={run.run_key} reason={violation[:500]}",
+        )
+        return self._create_work(
+            run,
+            PRODUCER_FOR_PHASE[phase],
+            parent_card_id,
+            mode=mode,
+            repair_context=context,
+        )
 
     def _protocol_failures_by_stage(
         self, history: list[HistoryItem]
@@ -922,7 +1605,7 @@ class ControllerService:
             if item.managed.purpose != "work":
                 continue
             if any(
-                "[controller-protocol-error:v1]" in str(comment["body"])
+                "[controller-protocol-error:v2]" in str(comment["body"])
                 for comment in item.task.comments
             ):
                 stage = Stage(item.managed.stage)
@@ -939,6 +1622,7 @@ class ControllerService:
             "run_key": run.run_key,
             "stage": item.managed.stage,
             "iteration": item.managed.iteration,
+            "mode": parse_card_body(item.task.body).mode.value,
             "project_id": run.project.project_id,
             "project_path": run.project.project_path,
             "checkout": run.workspace.checkout,
@@ -947,6 +1631,7 @@ class ControllerService:
             "target_branch": run.workspace.target_branch,
             "prd_path": run.source.prd_path,
             "prd_commit_sha": run.source.prd_commit_sha,
+            "prd_blob_sha": run.source.prd_blob_sha,
             "prd_mr_url": str(run.source.prd_mr_url),
             "kanban_card_id": item.task.id,
         }
@@ -958,6 +1643,73 @@ class ControllerService:
             raise ValueError(
                 "completion context mismatch: " + ", ".join(sorted(mismatches))
             )
+        if (
+            metadata.repository_evidence is not None
+            and metadata.repository_evidence.repository_base_sha
+            != run.workspace.repository_base_sha
+        ):
+            raise ValueError(
+                "repository evidence is not bound to the run base commit"
+            )
+
+    def _validate_finalization_context(
+        self,
+        history: list[HistoryItem],
+        item: HistoryItem,
+        metadata: CompletionMetadata,
+    ) -> None:
+        if metadata.mode != WorkMode.FINALIZATION:
+            return
+        record = parse_card_body(item.task.body)
+        context = record.repair_context
+        forced = metadata.forced_advance
+        if (
+            context is None
+            or context.kind != RepairKind.REVIEW_FAILURE
+            or forced is None
+        ):
+            raise ValueError("finalization card is missing review failure context")
+        if (
+            context.review_attempt != self.config.document_review_limit
+            or context.review_limit != self.config.document_review_limit
+            or forced.review_limit != self.config.document_review_limit
+            or forced.final_review_card_id != context.trigger_card_id
+        ):
+            raise ValueError("finalization review-limit evidence does not match card")
+        review_item = next(
+            (
+                previous
+                for previous in history
+                if previous.task.id == context.trigger_card_id
+            ),
+            None,
+        )
+        if review_item is None:
+            raise ValueError("finalization source review card was not found")
+        review_metadata = CompletionMetadata.model_validate(
+            review_item.task.latest_metadata
+        )
+        expected_review_stage = DOCUMENT_REVIEW_FOR_PRODUCER[metadata.stage]
+        review_index = history.index(review_item)
+        review_count = self._review_attempts_by_stage(
+            history[: review_index + 1]
+        ).get(expected_review_stage, 0)
+        if (
+            review_item.managed.stage != expected_review_stage.value
+            or review_metadata.stage != expected_review_stage
+            or review_metadata.outcome != Outcome.FAIL
+            or review_count != self.config.document_review_limit
+        ):
+            raise ValueError(
+                "finalization source is not the third valid failed review"
+            )
+        review_urls = {str(url) for url in review_metadata.gitlab_urls}
+        if str(forced.final_review_url) not in review_urls:
+            raise ValueError("final_review_url is not evidence from the third review")
+        if str(forced.decision_url) not in {
+            str(url) for url in metadata.gitlab_urls
+        }:
+            raise ValueError("decision_url must also appear in gitlab_urls")
 
     def _protocol_failure(
         self,
@@ -966,7 +1718,7 @@ class ControllerService:
         latest: HistoryItem,
         reason: str,
     ) -> None:
-        marker = "[controller-protocol-error:v1]"
+        marker = "[controller-protocol-error:v2]"
         already_marked = any(
             marker in str(comment["body"]) for comment in latest.task.comments
         )
@@ -982,7 +1734,14 @@ class ControllerService:
         if not already_marked:
             invalid_count += 1
         if protocol_retry_allowed(invalid_count, self.config):
-            self._create_work(run, Stage(latest.managed.stage), latest.task.id)
+            record = parse_card_body(latest.task.body)
+            self._create_work(
+                run,
+                Stage(latest.managed.stage),
+                latest.task.id,
+                mode=record.mode,
+                repair_context=record.repair_context,
+            )
         else:
             self._exception(
                 run,
@@ -1016,7 +1775,6 @@ class ControllerService:
             purpose="exception",
             created_at=task.created_at,
         )
-        self.kanban.subscribe(run.workspace.board, task.id, run.origin)
         outbox_key = f"{run.run_key}:exception:{suffix}"
         self.store.enqueue(
             outbox_key,
@@ -1025,8 +1783,11 @@ class ControllerService:
             {
                 "origin": run.origin.model_dump(mode="json"),
                 "text": self._mention(run.origin)
-                + f"自动交付需要异常处理。\nrun={run.run_key} "
-                f"card={task.id}\nreason={reason[:500]}",
+                + "自动交付需要异常处理。\n"
+                f"run={run.run_key} stage=exception agent=dispatcher "
+                f"card={task.id}\n"
+                f"evidence={reason[:700]}\n"
+                "action=请查看异常卡与证据，明确决定恢复、调整授权或停止交付。",
             },
         )
         return task
@@ -1038,13 +1799,15 @@ class ControllerService:
         card_id: str,
         *,
         outcome: Outcome,
+        mode: WorkMode = WorkMode.NORMAL,
         issues: list[str],
     ) -> dict:
         return CompletionMetadata(
-            protocol_version="hollysys-controller/v1",
+            protocol_version="hollysys-controller/v2",
             run_key=run.run_key,
             stage=Stage(managed.stage),
             iteration=managed.iteration,
+            mode=mode,
             outcome=outcome,
             project_id=run.project.project_id,
             project_path=run.project.project_path,
@@ -1054,6 +1817,7 @@ class ControllerService:
             target_branch=run.workspace.target_branch,
             prd_path=run.source.prd_path,
             prd_commit_sha=run.source.prd_commit_sha,
+            prd_blob_sha=run.source.prd_blob_sha,
             prd_mr_url=run.source.prd_mr_url,
             kanban_card_id=card_id,
             issues=issues,
@@ -1061,6 +1825,14 @@ class ControllerService:
 
     def _latest_valid_pass(
         self, history: list[HistoryItem], stage: Stage
+    ) -> CompletionMetadata | None:
+        return self._latest_valid_completion(history, stage, {Outcome.PASS})
+
+    def _latest_valid_completion(
+        self,
+        history: list[HistoryItem],
+        stage: Stage,
+        outcomes: set[Outcome],
     ) -> CompletionMetadata | None:
         # A gate only remains relevant when it is after the latest producer
         # attempt that can invalidate it.
@@ -1093,9 +1865,49 @@ class ControllerService:
                 )
             except (ValidationError, ValueError, TypeError):
                 continue
-            if metadata.outcome == Outcome.PASS:
+            if metadata.outcome in outcomes:
                 return metadata
         return None
+
+    def _code_modification_count(self, history: list[HistoryItem]) -> int:
+        implementation_versions = 0
+        for item in history:
+            if (
+                item.managed.purpose != "work"
+                or item.managed.stage != Stage.IMPLEMENT.value
+                or item.task.status != "done"
+            ):
+                continue
+            try:
+                metadata = CompletionMetadata.model_validate(
+                    item.task.latest_metadata
+                )
+                self._validate_completion_context(
+                    parse_card_body(item.task.body).run,
+                    item,
+                    metadata,
+                )
+            except (ValidationError, ValueError, TypeError):
+                continue
+            if metadata.outcome == Outcome.PASS:
+                implementation_versions += 1
+        # The first implementation is the initial version. Every later
+        # successful implement completion represents one coder modification.
+        return max(0, implementation_versions - 1)
+
+    @staticmethod
+    def _code_gate_issues(
+        test: CompletionMetadata,
+        review: CompletionMetadata,
+    ) -> list[str]:
+        issues = [
+            *(f"[tester] {issue}" for issue in test.issues),
+            *(f"[code-reviewer] {issue}" for issue in review.issues),
+        ]
+        # A code_gate_failure RepairContext must always have at least one
+        # concrete issue. Models already require issues on a failing gate, so
+        # this fallback only protects against malformed historical data.
+        return issues or ["CODE 双门禁未同时通过，需人工核对门禁证据。"]
 
     def _operation(
         self,
@@ -1114,6 +1926,160 @@ class ControllerService:
         except Exception as exc:
             self.store.fail_operation(key, str(exc))
             raise
+
+    def _enqueue_progress(
+        self, run: RunRecord, event_key: str, text: str
+    ) -> None:
+        self.store.enqueue(
+            f"{run.run_key}:progress:{event_key}",
+            run.run_key,
+            "progress",
+            {
+                "origin": run.origin.model_dump(mode="json"),
+                "text": text,
+            },
+        )
+
+    def _enqueue_phase_started(
+        self, run: RunRecord, phase: Phase, task: TaskRecord
+    ) -> None:
+        self._enqueue_progress(
+            run,
+            f"{phase.value}:started",
+            self._mention(run.origin)
+            + f"自动交付进入 {phase.value.upper()} 阶段。\n"
+            f"run={run.run_key} agent={task.assignee} card={task.id}",
+        )
+
+    def _enqueue_review_failed(
+        self,
+        run: RunRecord,
+        metadata: CompletionMetadata,
+        review_attempt: int,
+        next_mode: WorkMode,
+    ) -> None:
+        phase = PHASE_FOR_STAGE[metadata.stage]
+        summary = "；".join(metadata.issues[:3])
+        if next_mode == WorkMode.FINALIZATION:
+            action = "三次 review 已用尽，进入 finalization；完成关键决策后将冻结并继续。"
+        else:
+            action = "已退回本阶段 writer 重写，完成后再次 review。"
+        self._enqueue_progress(
+            run,
+            f"{phase.value}:review-failed:{review_attempt}:{metadata.kanban_card_id}",
+            self._mention(run.origin)
+            + f"{phase.value.upper()} review 未通过 "
+            f"({review_attempt}/{self.config.document_review_limit})。\n"
+            f"run={run.run_key} findings={summary[:500]}\n"
+            f"next_agent={self.config.stage_assignees[PRODUCER_FOR_PHASE[phase]]} "
+            f"{action}",
+        )
+
+    def _enqueue_phase_frozen(
+        self,
+        run: RunRecord,
+        phase: Phase,
+        metadata: CompletionMetadata,
+    ) -> None:
+        disposition = metadata.baseline_disposition
+        label = (
+            "review 通过"
+            if disposition == BaselineDisposition.REVIEWED
+            else "达到 review 上限后强制收敛"
+        )
+        urls = " ".join(
+            dict.fromkeys(
+                [
+                    *([str(metadata.mr_url)] if metadata.mr_url else []),
+                    *(str(url) for url in metadata.gitlab_urls),
+                ]
+            )
+        )
+        risks = "；".join(metadata.residual_risk[:3]) or "无"
+        decisions = "；".join(metadata.key_decisions[:3]) or "无"
+        self._enqueue_progress(
+            run,
+            f"{phase.value}:frozen:{disposition}:{metadata.artifact_digest}",
+            self._mention(run.origin)
+            + f"{phase.value.upper()} 已冻结（{label}）。\n"
+            f"run={run.run_key} decisions={decisions[:300]} "
+            f"risks={risks[:500]}"
+            + (f"\nlinks={urls}" if urls else ""),
+        )
+
+    def _enqueue_code_retry(
+        self,
+        run: RunRecord,
+        test: CompletionMetadata,
+        review: CompletionMetadata,
+        next_modification: int,
+    ) -> None:
+        summary = "；".join(self._code_gate_issues(test, review)[:6])
+        self._enqueue_progress(
+            run,
+            f"code:gates-failed:{review.head_sha}:modification:{next_modification}",
+            self._mention(run.origin)
+            + "CODE 同一提交的双门禁未同时通过，已汇总 tester 与 "
+            "code-reviewer 意见退回 coder；代码 push 后将重新执行两道门禁。\n"
+            f"run={run.run_key} head={review.head_sha} "
+            f"tester={test.outcome.value} code-reviewer={review.outcome.value} "
+            f"modification={next_modification}/"
+            f"{self.config.code_modification_limit}\n"
+            f"findings={summary[:700]}",
+        )
+
+    def _enqueue_test_skipped(
+        self,
+        run: RunRecord,
+        metadata: CompletionMetadata,
+    ) -> None:
+        verification = "；".join(metadata.verification[:3])
+        risks = "；".join(metadata.residual_risk[:3])
+        self._enqueue_progress(
+            run,
+            f"code:test-skipped:{metadata.head_sha}:{metadata.kanban_card_id}",
+            self._mention(run.origin)
+            + "TEST 的必要条件经预检确认不具备，已结构化跳过该部分测试；"
+            "code-reviewer 将继续审查同一提交。\n"
+            f"run={run.run_key} head={metadata.head_sha} "
+            f"reason={metadata.skip_reason}\n"
+            f"verification={verification[:500]} risks={risks[:500]}",
+        )
+
+    def _enqueue_human_block(
+        self, run: RunRecord, item: HistoryItem, comment: str
+    ) -> None:
+        fields = self._human_block_fields(comment)
+        token = fields.get("block_id") or hashlib.sha256(
+            f"{item.task.id}\0{comment}".encode("utf-8")
+        ).hexdigest()[:20]
+        summary = fields.get("summary") or item.task.latest_summary or "工作卡暂停"
+        evidence = fields.get("evidence") or "见 Kanban 脱敏阻塞评论"
+        action = fields.get("required_action") or "按阻塞评论完成一个明确动作"
+        self.store.enqueue(
+            f"{run.run_key}:human-block:{token}",
+            run.run_key,
+            "human-block",
+            {
+                "origin": run.origin.model_dump(mode="json"),
+                "text": self._mention(run.origin)
+                + "自动交付遇到真正阻塞，需要你的处理。\n"
+                f"run={run.run_key} stage={item.managed.stage} "
+                f"agent={item.task.assignee} card={item.task.id}\n"
+                f"summary={summary[:300]}\nevidence={evidence[:300]}\n"
+                f"action={action[:300]}",
+            },
+        )
+
+    @staticmethod
+    def _human_block_fields(comment: str) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for raw_line in comment.splitlines():
+            key, separator, value = raw_line.partition(":")
+            normalized = key.strip()
+            if separator and normalized in REQUIRED_HUMAN_BLOCK_FIELDS:
+                fields[normalized] = value.strip()
+        return fields
 
     def _enqueue_success(self, run: RunRecord, mr: dict) -> None:
         merge_sha = str(mr.get("merge_commit_sha") or "")
@@ -1134,6 +2100,8 @@ class ControllerService:
     def _enqueue_failure_limit(self, run: RunRecord, event: EventRecord) -> None:
         key = f"{run.run_key}:failure-limit:{event.task_id}"
         details = json.dumps(event.payload or {}, ensure_ascii=False)[:500]
+        managed = self.store.managed_card(run.workspace.board, event.task_id)
+        task = self.reader.task(run.workspace.board, event.task_id)
         self.store.enqueue(
             key,
             run.run_key,
@@ -1142,8 +2110,10 @@ class ControllerService:
                 "origin": run.origin.model_dump(mode="json"),
                 "text": self._mention(run.origin)
                 + "Hermes 工作卡已触发失败熔断，需要人工检查。\n"
-                f"run={run.run_key} card={event.task_id} "
-                f"event={event.kind}\ndetails={details}",
+                f"run={run.run_key} stage={managed.stage if managed else 'unknown'} "
+                f"agent={task.assignee if task else 'unknown'} card={event.task_id} "
+                f"event={event.kind}\nevidence={details}\n"
+                "action=检查该卡的脱敏运行证据并修复环境后查询 status",
             },
         )
 
@@ -1170,7 +2140,8 @@ class ControllerService:
                 "origin": run.origin.model_dump(mode="json"),
                 "text": self._mention(run.origin)
                 + "Hollysys Controller 对账失败，需要管理员检查。\n"
-                f"run={run_key}\nerror={reason[:700]}",
+                f"run={run_key}\nevidence={reason[:700]}\n"
+                "action=修复 Controller/GitLab/Kanban 连通性后运行 health 和 status",
             },
         )
 

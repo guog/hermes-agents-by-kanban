@@ -1,16 +1,161 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://hollysys.example/schemas/card-completion-v3.json",
+  "$id": "https://hollysys.example/schemas/card-completion-v6.json",
   "$defs": {
+    "BaselineDisposition": {
+      "enum": [
+        "source",
+        "reviewed",
+        "forced_after_review_limit"
+      ],
+      "title": "BaselineDisposition",
+      "type": "string"
+    },
+    "ChangeStrategy": {
+      "enum": [
+        "extend_existing",
+        "modify_existing",
+        "extend_and_modify"
+      ],
+      "title": "ChangeStrategy",
+      "type": "string"
+    },
+    "ForcedAdvance": {
+      "additionalProperties": false,
+      "properties": {
+        "review_limit": {
+          "minimum": 1,
+          "title": "Review Limit",
+          "type": "integer"
+        },
+        "final_review_card_id": {
+          "pattern": "^t_[A-Za-z0-9_-]+$",
+          "title": "Final Review Card Id",
+          "type": "string"
+        },
+        "final_review_url": {
+          "format": "uri",
+          "minLength": 1,
+          "title": "Final Review Url",
+          "type": "string"
+        },
+        "decision_url": {
+          "format": "uri",
+          "minLength": 1,
+          "title": "Decision Url",
+          "type": "string"
+        },
+        "baseline_commit_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Baseline Commit Sha",
+          "type": "string"
+        },
+        "artifact_paths": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Artifact Paths",
+          "type": "array"
+        },
+        "artifact_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Artifact Digest",
+          "type": "string"
+        },
+        "key_decisions": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Key Decisions",
+          "type": "array"
+        },
+        "unresolved_findings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unresolved Findings",
+          "type": "array"
+        },
+        "residual_risks": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Residual Risks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "review_limit",
+        "final_review_card_id",
+        "final_review_url",
+        "decision_url",
+        "baseline_commit_sha",
+        "artifact_paths",
+        "artifact_digest",
+        "key_decisions"
+      ],
+      "title": "ForcedAdvance",
+      "type": "object"
+    },
     "Outcome": {
       "enum": [
         "pass",
         "fail",
-        "scope_gap",
         "cancelled"
       ],
       "title": "Outcome",
       "type": "string"
+    },
+    "RepositoryEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "repository_base_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Repository Base Sha",
+          "type": "string"
+        },
+        "inspected_paths": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Inspected Paths",
+          "type": "array"
+        },
+        "existing_capabilities": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Existing Capabilities",
+          "type": "array"
+        },
+        "change_strategy": {
+          "$ref": "#/$defs/ChangeStrategy"
+        },
+        "reuse_decisions": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Reuse Decisions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "repository_base_sha",
+        "inspected_paths",
+        "existing_capabilities",
+        "change_strategy",
+        "reuse_decisions"
+      ],
+      "title": "RepositoryEvidence",
+      "type": "object"
     },
     "Stage": {
       "enum": [
@@ -26,12 +171,28 @@
       ],
       "title": "Stage",
       "type": "string"
+    },
+    "TestDisposition": {
+      "enum": [
+        "executed",
+        "skipped_unavailable"
+      ],
+      "title": "TestDisposition",
+      "type": "string"
+    },
+    "WorkMode": {
+      "enum": [
+        "normal",
+        "finalization"
+      ],
+      "title": "WorkMode",
+      "type": "string"
     }
   },
   "additionalProperties": false,
   "properties": {
     "protocol_version": {
-      "const": "hollysys-controller/v1",
+      "const": "hollysys-controller/v2",
       "title": "Protocol Version",
       "type": "string"
     },
@@ -47,6 +208,10 @@
       "minimum": 1,
       "title": "Iteration",
       "type": "integer"
+    },
+    "mode": {
+      "$ref": "#/$defs/WorkMode",
+      "default": "normal"
     },
     "outcome": {
       "$ref": "#/$defs/Outcome"
@@ -83,6 +248,11 @@
     "prd_commit_sha": {
       "pattern": "^[0-9a-f]{40}$",
       "title": "Prd Commit Sha",
+      "type": "string"
+    },
+    "prd_blob_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Prd Blob Sha",
       "type": "string"
     },
     "prd_mr_url": {
@@ -136,7 +306,7 @@
       "default": null,
       "title": "Head Sha"
     },
-    "review_commit_sha": {
+    "artifact_commit_sha": {
       "anyOf": [
         {
           "pattern": "^[0-9a-f]{40}$",
@@ -147,7 +317,7 @@
         }
       ],
       "default": null,
-      "title": "Review Commit Sha"
+      "title": "Artifact Commit Sha"
     },
     "artifact_digest": {
       "anyOf": [
@@ -169,6 +339,63 @@
       "title": "Artifact Paths",
       "type": "array"
     },
+    "baseline_disposition": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BaselineDisposition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "forced_advance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ForcedAdvance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "repository_evidence": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RepositoryEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "test_disposition": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TestDisposition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "skip_reason": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Skip Reason"
+    },
     "verification": {
       "items": {
         "type": "string"
@@ -185,29 +412,19 @@
       "title": "Gitlab Urls",
       "type": "array"
     },
+    "key_decisions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Key Decisions",
+      "type": "array"
+    },
     "issues": {
       "items": {
         "type": "string"
       },
       "title": "Issues",
       "type": "array"
-    },
-    "scope_gap_target": {
-      "anyOf": [
-        {
-          "enum": [
-            "spec-write",
-            "plan-write",
-            "tasks-write"
-          ],
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Scope Gap Target"
     },
     "residual_risk": {
       "items": {
@@ -231,6 +448,7 @@
     "target_branch",
     "prd_path",
     "prd_commit_sha",
+    "prd_blob_sha",
     "prd_mr_url",
     "kanban_card_id"
   ],
@@ -241,7 +459,7 @@
       "if": {
         "properties": {
           "outcome": {
-            "const": "scope_gap"
+            "const": "fail"
           }
         },
         "required": [
@@ -250,17 +468,9 @@
       },
       "then": {
         "required": [
-          "scope_gap_target",
           "issues"
         ],
         "properties": {
-          "scope_gap_target": {
-            "enum": [
-              "spec-write",
-              "plan-write",
-              "tasks-write"
-            ]
-          },
           "issues": {
             "type": "array",
             "minItems": 1
@@ -271,22 +481,43 @@
     {
       "if": {
         "properties": {
+          "stage": {
+            "enum": [
+              "spec-review",
+              "plan-review",
+              "tasks-review"
+            ]
+          },
           "outcome": {
             "enum": [
               "pass",
-              "fail",
-              "cancelled"
+              "fail"
             ]
           }
         },
         "required": [
+          "stage",
           "outcome"
         ]
       },
       "then": {
+        "required": [
+          "artifact_paths",
+          "artifact_digest",
+          "artifact_commit_sha"
+        ],
         "properties": {
-          "scope_gap_target": {
-            "type": "null"
+          "artifact_paths": {
+            "type": "array",
+            "minItems": 1
+          },
+          "artifact_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "artifact_commit_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
           }
         }
       }
@@ -312,22 +543,11 @@
       },
       "then": {
         "required": [
-          "artifact_paths",
-          "artifact_digest",
-          "review_commit_sha"
+          "baseline_disposition"
         ],
         "properties": {
-          "artifact_paths": {
-            "type": "array",
-            "minItems": 1
-          },
-          "artifact_digest": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
-          },
-          "review_commit_sha": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{40}$"
+          "baseline_disposition": {
+            "const": "reviewed"
           }
         }
       }
@@ -342,7 +562,10 @@
             ]
           },
           "outcome": {
-            "const": "pass"
+            "enum": [
+              "pass",
+              "fail"
+            ]
           }
         },
         "required": [
@@ -368,6 +591,149 @@
           "head_sha": {
             "type": "string",
             "pattern": "^[0-9a-f]{40}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "const": "test"
+          },
+          "outcome": {
+            "enum": [
+              "pass",
+              "fail"
+            ]
+          }
+        },
+        "required": [
+          "stage",
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "test_disposition"
+        ],
+        "properties": {
+          "test_disposition": {
+            "enum": [
+              "executed",
+              "skipped_unavailable"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "enum": [
+              "spec-write",
+              "plan-write",
+              "tasks-write",
+              "implement"
+            ]
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "stage",
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "repository_evidence"
+        ],
+        "properties": {
+          "repository_evidence": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "const": "test"
+          },
+          "test_disposition": {
+            "const": "skipped_unavailable"
+          }
+        },
+        "required": [
+          "stage",
+          "test_disposition"
+        ]
+      },
+      "then": {
+        "required": [
+          "outcome",
+          "skip_reason",
+          "verification",
+          "residual_risk"
+        ],
+        "properties": {
+          "outcome": {
+            "const": "pass"
+          },
+          "skip_reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "verification": {
+            "type": "array",
+            "minItems": 1
+          },
+          "residual_risk": {
+            "type": "array",
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "finalization"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "mode",
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "artifact_paths",
+          "artifact_digest",
+          "artifact_commit_sha",
+          "baseline_disposition",
+          "forced_advance",
+          "mr_iid",
+          "mr_url"
+        ],
+        "properties": {
+          "artifact_paths": {
+            "type": "array",
+            "minItems": 1
+          },
+          "baseline_disposition": {
+            "const": "forced_after_review_limit"
+          },
+          "forced_advance": {
+            "type": "object"
           }
         }
       }

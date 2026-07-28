@@ -94,8 +94,8 @@ kanban:
   dispatch_interval_seconds: 20
   failure_limit: 3
   auto_decompose: false
-  # Formal Hollysys cards manage subscriptions explicitly: subscribe while a card
-  # is in flight, remove before normal completion, retain on blocked.
+  # Formal Hollysys notifications use the Controller's durable outbox. Do not
+  # create a second automatic Kanban-notifier delivery path.
   auto_subscribe_on_create: false
   auto_promote_children: true
   orchestrator_profile: dispatcher

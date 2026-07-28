@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import ControllerConfig
-from .models import CardRecord, FeishuOrigin, RunRecord
+from .models import CardRecord, RunRecord
 
-CARD_MARKER = "[hollysys-controller-card:v1]"
-RUN_MARKER = "[hollysys-controller-run:v1]"
+CARD_MARKER = "[hollysys-controller-card:v2]"
+RUN_MARKER = "[hollysys-controller-run:v2]"
+LEGACY_RUN_MARKER = "[hollysys-controller-run:v1]"
 
 
 class CommandError(RuntimeError):
@@ -74,12 +75,14 @@ def render_card_body(card: CardRecord) -> str:
     payload = json.dumps(card.model_dump(mode="json"), ensure_ascii=False, indent=2)
     return (
         f"{CARD_MARKER}\n\n"
-        f"执行阶段：`{card.stage}`，迭代：`{card.iteration}`。\n\n"
+        f"执行阶段：`{card.stage}`，模式：`{card.mode}`，"
+        f"迭代：`{card.iteration}`。\n\n"
         "开始前必须读取完整 JSON 输入和角色 Skill。所有工作写入指定共享 "
         "worktree/branch/MR；完成时提交符合 "
         "`/opt/fleet/schemas/card-completion.schema.json` 的严格 metadata。\n\n"
-        "正常完成前退订本卡；真正需要人类时保留订阅并使用 "
-        "`kanban_block`。不得创建、链接或推进其他正式卡片。\n\n"
+        "真正需要人类时先写 `[human-block:v1]` 评论再使用 "
+        "`kanban_block`；Controller outbox 负责原渠道通知。不得创建、链接或推进 "
+        "其他正式卡片。\n\n"
         f"```json\n{payload}\n```\n"
     )
 
@@ -98,6 +101,11 @@ def _extract_json(body: str | None, marker: str) -> dict:
 
 def parse_run_body(body: str | None) -> RunRecord:
     return RunRecord.model_validate(_extract_json(body, RUN_MARKER))
+
+
+def parse_run_protocol_version(body: str | None) -> str:
+    marker = RUN_MARKER if body and RUN_MARKER in body else LEGACY_RUN_MARKER
+    return str(_extract_json(body, marker).get("protocol_version") or "")
 
 
 def parse_card_body(body: str | None) -> CardRecord:
@@ -255,23 +263,6 @@ class KanbanReader:
             ).fetchone()
         return self.task(board, str(row["id"])) if row else None
 
-    def subscription_exists(
-        self, board: str, task_id: str, origin: FeishuOrigin
-    ) -> bool:
-        with closing(self._connect(board)) as conn:
-            row = conn.execute(
-                """
-                SELECT notifier_profile, user_id FROM kanban_notify_subs
-                WHERE task_id=? AND platform='feishu' AND chat_id=? AND thread_id=?
-                """,
-                (task_id, origin.chat_id, origin.thread_id or ""),
-            ).fetchone()
-        return bool(
-            row
-            and row["notifier_profile"] == "dispatcher"
-            and row["user_id"] == origin.initiator_open_id
-        )
-
     def max_event_id(self, board: str) -> int:
         with closing(self._connect(board)) as conn:
             row = conn.execute(
@@ -367,7 +358,7 @@ class KanbanCLI:
             return
         metadata = json.dumps(
             {
-                "protocol_version": "hollysys-controller/v1",
+                "protocol_version": "hollysys-controller/v2",
                 "kind": "run-init",
                 "run_key": run.run_key,
             },
@@ -420,40 +411,6 @@ class KanbanCLI:
         if task is None:
             raise RuntimeError("created work card was not readable")
         return task
-
-    def subscribe(self, board: str, task_id: str, origin: FeishuOrigin) -> None:
-        args = [
-            "notify-subscribe",
-            task_id,
-            "--platform",
-            "feishu",
-            "--chat-id",
-            origin.chat_id,
-            "--user-id",
-            origin.initiator_open_id,
-            "--notifier-profile",
-            "dispatcher",
-        ]
-        if origin.thread_id:
-            args.extend(["--thread-id", origin.thread_id])
-        self._run(args, board=board)
-        if not self.reader.subscription_exists(board, task_id, origin):
-            raise RuntimeError(f"subscription verification failed for {task_id}")
-
-    def unsubscribe(self, board: str, task_id: str, origin: FeishuOrigin) -> None:
-        if not self.reader.subscription_exists(board, task_id, origin):
-            return
-        args = [
-            "notify-unsubscribe",
-            task_id,
-            "--platform",
-            "feishu",
-            "--chat-id",
-            origin.chat_id,
-        ]
-        if origin.thread_id:
-            args.extend(["--thread-id", origin.thread_id])
-        self._run(args, board=board)
 
     def release(self, board: str, task_id: str) -> None:
         task = self.reader.task(board, task_id)
@@ -508,7 +465,7 @@ class KanbanCLI:
         if existing:
             return existing
         body = (
-            "[hollysys-controller-exception:v1]\n\n"
+            "[hollysys-controller-exception:v2]\n\n"
             f"run_key: {run.run_key}\n\n"
             f"reason: {reason[:1000]}\n\n"
             "该卡由 Dispatcher 作为异常入口处理；不得直接推进门禁或合并。"

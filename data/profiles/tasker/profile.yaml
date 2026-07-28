@@ -1,3 +1,2 @@
-description: Compiles approved SPEC and PLAN artifacts into a stable, acyclic, traceable TASKS DAG.
+description: Compiles frozen SPEC and PLAN baselines into a stable, acyclic, traceable TASKS DAG.
 description_auto: false
-

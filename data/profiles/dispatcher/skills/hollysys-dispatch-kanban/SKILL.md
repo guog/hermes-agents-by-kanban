@@ -1,13 +1,14 @@
 ---
 name: hollysys-dispatch-kanban
-description: 当收到正式 PRD 交付启动、状态查询、阻塞恢复或控制器异常时，通过 hollysysctl 与确定性 Controller 交互。
-version: 1.0.0
+description: 作为人类唯一入口，通过 hollysysctl 启动、查询和恢复正式交付，并解释 Controller 的飞书进度、重试、冻结及异常通知。
+version: 2.0.0
 ---
 
 # Hollysys Controller 命令入口
 
-本 Skill 只负责自然语言到 `hollysysctl` 的可靠转换。正式卡片、门禁、重试、GitLab
-head 对账和合并由无 LLM 的 Controller 负责。
+本 Skill 负责自然语言到 `hollysysctl` 的可靠转换，以及向人类解释自动进展。正式卡片、
+三次 review、finalization、冻结基线、GitLab head 对账和合并由无 LLM 的 Controller
+持续执行；Dispatcher 会话重启不得中断 run。
 
 ## 禁止事项
 
@@ -52,8 +53,31 @@ active_card、board 和 worktree 精简展示给原会话。命令失败时原�
 hollysysctl status --run-key '<run_key>'
 ```
 
-展示 `phase`、active card/status、attempts、MR/head、gates 和 blocked 摘要。
+展示 `phase`、精确 `stage`、active card/mode/status、review 次数与剩余次数、
+CODE `code_modifications.used/remaining/limit`、
+run 的 `repository_base_sha`、`frozen_artifacts` 的
+`reviewed|forced_after_review_limit`、MR/head、gates、
+`key_decisions`、unresolved findings、residual risks 和 blocked 摘要。若
+`state=historical_read_only`，说明这是未迁移的 v1 历史；active v1 必须先结束，
+不得尝试续跑。
 Controller 返回 `reconciling` 时明确说正在基于 Kanban+GitLab复算，不猜下一阶段。
+
+解释工件时说明它们是基于 `repository_base_sha` 的现有企业 MES 定制，不是绿地开发；
+不要把“新增功能”误解为新建独立系统。
+
+## 自动进度通知
+
+Controller 使用 Dispatcher 飞书身份和持久 outbox，在原消息/话题幂等汇报：
+
+- run 受理和每个阶段开始；
+- 文档 review 第 `n/3` 次失败、主要 findings、下一位 writer；
+- 第三次失败进入 finalization，以及阶段最终按 review 通过或强制收敛冻结；
+- tester 与 code-reviewer 对同一 head 的汇总结论、第 `n/5` 次 coder 修改、
+  测试条件不可用的结构化跳过、checked-head merge 完成；
+- 第 5 次修改后的双门禁仍未同时通过时结束自动流程，立即 @ 发起人并要求人类决定。
+
+Dispatcher 只解释通知中的 Controller 事实和链接，不自行补充门禁结论，不发送普通
+heartbeat。阻塞通知必须真实 @ 原发起人并给一个明确动作；业务歧义不是阻塞理由。
 
 ## 人类阻塞恢复
 

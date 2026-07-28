@@ -3,8 +3,8 @@ reconcile_interval_seconds: 30
 command_timeout_seconds: 120
 fatal_loop_error_limit: 5
 required_pipeline: true
-design_rework_limit: 3
-code_rework_limit: 5
+document_review_limit: 3
+code_modification_limit: 5
 protocol_retry_limit: 2
 
 stage_assignees:
@@ -31,7 +31,7 @@ stage_skills:
 
 # These patterns define the complete artifact set whose path/blob digest is
 # checked at each document gate. Override them for repositories with another
-# Hollysys layout; they are matched against the full repository tree at review SHA.
+# Hollysys layout; they are matched against the full tree at artifact commit.
 artifact_patterns:
   spec-review:
     - "docs/prds/*/specs/spec-*.md"

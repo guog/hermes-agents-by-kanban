@@ -1,2 +1,2 @@
-description: Produces one-to-one repository-grounded PLANs for the approved SPEC set on the shared branch.
+description: Produces one-to-one repository-grounded PLANs from the frozen SPEC baseline on the shared branch.
 description_auto: false

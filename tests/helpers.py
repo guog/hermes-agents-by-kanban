@@ -75,6 +75,7 @@ def run_record(tmp_path: Path) -> RunRecord:
         source=SourceFacts(
             prd_path="docs/prds/example.md",
             prd_commit_sha="a" * 40,
+            prd_blob_sha="f" * 40,
             prd_blob_url=(
                 "https://gitlab.example.com/group/project/-/blob/"
                 + "a" * 40
@@ -94,6 +95,7 @@ def run_record(tmp_path: Path) -> RunRecord:
             ),
             branch="feature/example-aaaaaaaa",
             target_branch="main",
+            repository_base_sha="9" * 40,
         ),
         origin=origin(),
     )
@@ -106,10 +108,11 @@ def completion(
 ) -> CompletionMetadata:
     run = run_record(tmp_path)
     data = {
-        "protocol_version": "hollysys-controller/v1",
+        "protocol_version": "hollysys-controller/v2",
         "run_key": run.run_key,
         "stage": stage,
         "iteration": 1,
+        "mode": "normal",
         "outcome": "pass",
         "project_id": run.project.project_id,
         "project_path": run.project.project_path,
@@ -119,9 +122,34 @@ def completion(
         "target_branch": run.workspace.target_branch,
         "prd_path": run.source.prd_path,
         "prd_commit_sha": run.source.prd_commit_sha,
+        "prd_blob_sha": run.source.prd_blob_sha,
         "prd_mr_url": str(run.source.prd_mr_url),
         "kanban_card_id": "t_abc",
         "verification": ["unit tests"],
     }
     data.update(overrides)
+    if (
+        stage
+        in {
+            Stage.SPEC_WRITE,
+            Stage.PLAN_WRITE,
+            Stage.TASKS_WRITE,
+            Stage.IMPLEMENT,
+        }
+        and data["outcome"] == "pass"
+        and "repository_evidence" not in overrides
+    ):
+        data["repository_evidence"] = {
+            "repository_base_sha": run.workspace.repository_base_sha,
+            "inspected_paths": ["src/existing-module", "docs/architecture.md"],
+            "existing_capabilities": ["existing MES application framework"],
+            "change_strategy": "extend_existing",
+            "reuse_decisions": ["reuse the existing module and conventions"],
+        }
+    if (
+        stage == Stage.TEST
+        and data["outcome"] in {"pass", "fail"}
+        and "test_disposition" not in overrides
+    ):
+        data["test_disposition"] = "executed"
     return CompletionMetadata.model_validate(data)

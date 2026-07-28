@@ -29,7 +29,19 @@ services:
       HOLLYSYS_CODE_REVIEWER_IDENTITIES: ${HOLLYSYS_CODE_REVIEWER_IDENTITIES:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
-      PATH: /opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PATH: /opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.dotnet:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PIP_CONFIG_FILE: /etc/pip.conf
+      PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+      PIP_EXTRA_INDEX_URL: ""
+      UV_DEFAULT_INDEX: https://mirrors.aliyun.com/pypi/simple/
+      UV_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+      UV_EXTRA_INDEX_URL: ""
+      NPM_CONFIG_REGISTRY: https://registry.npmmirror.com/
+      npm_config_registry: https://registry.npmmirror.com/
+      NPM_CONFIG_USERCONFIG: /opt/fleet/container/mirrors/npmrc
+      COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
+      PNPM_CONFIG_REGISTRY: https://registry.npmmirror.com/
+      YARN_NPM_REGISTRY_SERVER: https://registry.npmmirror.com/
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -45,6 +57,12 @@ services:
       - ./hollysys_controller:/opt/hollysys-controller-src/hollysys_controller:ro
       - ./controller/config.yaml:/opt/hollysys-controller/config.yaml:ro
       - ./hollysysctl:/usr/local/bin/hollysysctl:ro
+      - ./container:/opt/fleet/container:ro
+      - ./container/ensure-dotnet8.sh:/etc/cont-init.d/00-hollysys-dotnet8:ro
+      - ./container/mirrors/debian.sources:/etc/apt/sources.list.d/debian.sources:ro
+      - ./container/mirrors/sources.list:/etc/apt/sources.list:ro
+      - ./container/mirrors/pip.conf:/etc/pip.conf:ro
+      - ./container/mirrors/uv.toml:/etc/uv/uv.toml:ro
       - ./templates:/opt/fleet/templates:ro
       - ./schemas:/opt/fleet/schemas:ro
     healthcheck:
@@ -52,5 +70,5 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 5m
     shm_size: 1gb

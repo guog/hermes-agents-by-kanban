@@ -42,7 +42,7 @@ branch=<branch> mr=<draft-mr-or-pending> stage=<stage>
 
 ## 需要人类
 
-Kanban notifier 的首条 reason 必须控制在 160 字符内，并在群聊/话题中真实 mention 发起人：
+Controller outbox 的阻塞消息必须简洁，并在群聊/话题中真实 mention 发起人：
 
 ```text
 <at user_id="<initiator_open_id>"></at> 自动交付在 <stage> 暂停：<一个问题或动作>。
@@ -50,6 +50,19 @@ Kanban notifier 的首条 reason 必须控制在 160 字符内，并在群聊/�
 ```
 
 单聊省略 `<at>`。不要要求人类在飞书中发送 token、密码或原始敏感日志。
+
+CODE 已完成第 5 次修改但双门禁仍未同时通过时，Controller 结束自动流程并使用：
+
+```text
+<at user_id="<initiator_open_id>"></at> CODE 自动修改次数已用尽，需要人工决定。
+run=<run_key> head=<head_sha> modification=5/5
+tester=<pass|fail> code-reviewer=<pass|fail>
+findings=<两方主要意见>
+action=请决定扩大修改预算、调整任务，或停止本次交付。
+```
+
+必要测试条件不可用不是该类阻塞。Controller 应先发送结构化跳过进度，包含
+`head_sha`、`skip_reason`、已执行检查和残余风险，并继续 code-review。
 
 Dispatcher 把实际 sender/chat/thread/message 交给 `hollysysctl resolve`；Controller
 核对 root origin 和完整 `[human-block:v1]` 评论。答复被拒绝时按返回原因引导：

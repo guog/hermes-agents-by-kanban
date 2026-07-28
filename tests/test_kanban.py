@@ -14,7 +14,7 @@ from hollysys_controller.kanban import (
     render_run_body,
 )
 from hollysys_controller.models import CardRecord, Stage
-from tests.helpers import origin, run_record
+from tests.helpers import run_record
 
 DB_SCHEMA = """
 CREATE TABLE tasks (
@@ -33,10 +33,6 @@ CREATE TABLE task_runs (
 CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
 CREATE TABLE task_comments (
   id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INTEGER
-);
-CREATE TABLE kanban_notify_subs (
-  task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT, user_id TEXT,
-  notifier_profile TEXT
 );
 """
 
@@ -67,19 +63,13 @@ class KanbanReaderTests(unittest.TestCase):
             )
             conn.execute("INSERT INTO task_links VALUES('t_root','t_a')")
             conn.execute("INSERT INTO task_comments VALUES(1,'t_a','worker','note',2)")
-            conn.execute(
-                """
-                INSERT INTO kanban_notify_subs
-                VALUES('t_a','feishu','oc_abc','omt_abc','ou_abc','dispatcher')
-                """
-            )
             conn.commit()
         self.reader = KanbanReader(self.root)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_reads_events_runs_links_and_subscription_without_writes(self) -> None:
+    def test_reads_events_runs_and_links_without_writes(self) -> None:
         events = self.reader.events_after("default", 0)
         self.assertEqual(events[0].run_id, 4)
         self.assertEqual([event.id for event in events], [1, 2])
@@ -92,7 +82,6 @@ class KanbanReaderTests(unittest.TestCase):
         self.assertEqual(task.latest_metadata, {"protocol_version": "bad"})
         self.assertEqual(task.parents, ["t_root"])
         self.assertEqual(task.event_kinds, ["completed", "gave_up"])
-        self.assertTrue(self.reader.subscription_exists("default", "t_a", origin()))
 
     def test_card_and_root_bodies_round_trip(self) -> None:
         run = run_record(self.root)

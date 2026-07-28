@@ -36,8 +36,8 @@ class ControllerConfig(BaseModel):
     stage_skills: dict[Stage, list[str]]
     artifact_patterns: dict[str, list[str]]
     reviewer_identities: dict[str, list[str]]
-    design_rework_limit: int = 3
-    code_rework_limit: int = 5
+    document_review_limit: int = Field(default=3, ge=1)
+    code_modification_limit: int = Field(default=5, ge=1)
     protocol_retry_limit: int = 2
 
     @model_validator(mode="after")
