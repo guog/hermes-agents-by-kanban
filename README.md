@@ -226,7 +226,8 @@ chmod 600 .env
 
 - `PUID`、`PGID`：Ubuntu 部署用户的 UID/GID。
 - `HERMES_CONTAINER_NAME`：容器名；同机并存部署必须使用不同名称。
-- `HERMES_DASHBOARD_PORT`：Dashboard 在宿主机发布的端口，默认 `9119`。
+- `HERMES_DASHBOARD_HOST_PORT`：Dashboard 在宿主机发布的端口，默认 `9119`；
+  容器内监听端口固定为 `9119`。
 - `HOLLYSYS_GITLAB_HOST=https://green-git.hollysys.net`、
   `HOLLYSYS_GITLAB_ALLOWED_GROUPS` 和五类 reviewer/tester
   GitLab identity 白名单。
@@ -237,7 +238,7 @@ chmod 600 .env
 `docker-compose.yaml` 堆积大量条目，Dashboard、Controller、模型服务和软件镜像等可配置
 环境变量均集中在该文件；固定的容器内部路径仍保留在 Compose。
 
-Dashboard 通过宿主机所有网卡的 `${HERMES_DASHBOARD_PORT:-9119}` 端口发布。本部署假设运行
+Dashboard 通过宿主机所有网卡的 `${HERMES_DASHBOARD_HOST_PORT:-9119}` 端口发布。本部署假设运行
 在可信内部网络，局域网用户共用以下明文账号，`.env.example` 和实际 `.env` 保持一致：
 
 ```dotenv

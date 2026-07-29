@@ -16,6 +16,9 @@ services:
     environment:
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: "0.0.0.0"
+      # Keep the image's internal listener stable. Host publication is
+      # independently selected with HERMES_DASHBOARD_HOST_PORT below.
+      HERMES_DASHBOARD_PORT: "9119"
       HERMES_HOME: /opt/data
       HERMES_WRITE_SAFE_ROOT: /opt/data:/workspace/projects
       PYTHONPATH: /opt/hollysys-controller-src
@@ -26,7 +29,7 @@ services:
       PIP_CONFIG_FILE: /etc/pip.conf
       NPM_CONFIG_USERCONFIG: /opt/fleet/container/mirrors/npmrc
     ports:
-      - "${HERMES_DASHBOARD_PORT:-9119}:9119"
+      - "${HERMES_DASHBOARD_HOST_PORT:-9119}:9119"
     volumes:
       - ${HERMES_DATA_DIR:-./data}:/opt/data
       - ${PROJECTS_DIR:-./projects}:/workspace/projects
