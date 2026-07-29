@@ -202,7 +202,14 @@ class ControllerStore:
             ).fetchall()
             return [str(row[0]) for row in rows]
 
-    def begin_request(self, key: str, kind: str, payload: dict) -> dict | None:
+    def begin_request(
+        self,
+        key: str,
+        kind: str,
+        payload: dict,
+        *,
+        retry_failed: bool = False,
+    ) -> dict | None:
         now = int(time.time())
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         with self.connect() as conn:
@@ -218,7 +225,17 @@ class ControllerStore:
                 if row["status"] == "done" and row["response"]:
                     return json.loads(row["response"])
                 if row["status"] == "failed":
-                    raise RuntimeError(row["error"] or f"request {key} failed")
+                    if not retry_failed:
+                        raise RuntimeError(
+                            row["error"] or f"request {key} failed"
+                        )
+                    conn.execute(
+                        """
+                        UPDATE requests SET status='running', error=NULL, updated_at=?
+                        WHERE request_key=?
+                        """,
+                        (now, key),
+                    )
                 return None
             conn.execute(
                 """

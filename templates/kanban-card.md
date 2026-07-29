@@ -101,6 +101,10 @@
   只有测试条件经实际预检确认不具备时才允许 `skipped_unavailable`，此时使用
   `outcome=pass`，并给出非空 `skip_reason`、已执行的可用检查 `verification`
   以及未执行测试带来的 `residual_risk`。
+- 非 TEST 卡必须省略 `test_disposition` 和 `skip_reason`（兼容输入可为 JSON
+  `null`）。lint、build、文档检查等结果属于 `verification`，不能写成
+  `test_disposition=executed`。TEST 使用 `executed` 时也必须省略
+  `skip_reason`（或设为 `null`）。
 - finalization producer 的 pass 必须给工件证据、MR、`baseline_disposition=
   forced_after_review_limit` 和完整 `forced_advance`，其中包含第三次 review
   卡片/评论、最终决策评论、baseline commit/paths/digest、关键决策、未解决
@@ -108,9 +112,11 @@
 - 不得包含 `next_card_ids`、continuation、`live_reconcile_required`、人类
   resolution 或 merge 专属字段；Schema 对额外字段使用 `additionalProperties=false`。
 
-Hermes 官方完成入口保存 free-form metadata，不会替本部署强制 v6。Worker 必须先
-自检；Controller 会在卡片 done 后再次严格验证，非法 metadata 不推进并创建同阶段新
-attempt，最多自动重试两次。
+Hermes 官方完成入口保存 free-form metadata，不会替本部署强制 v6。Worker 必须先将
+完整 metadata 保存为 JSON 文件并执行
+`hollysysctl validate-completion --card-id <当前卡ID> --metadata <JSON文件>`；
+只有返回 `ok=true` 才能调用 `kanban_complete`。Controller 会在卡片 done 后再次严格
+验证，非法 metadata 不推进并创建同阶段新 attempt，最多自动重试两次。
 
 ## 执行协议
 
@@ -124,7 +130,8 @@ attempt，最多自动重试两次。
 4. 长任务定期 `kanban_heartbeat(note=...)`。heartbeat 只保活，不触发飞书进度
    通知。详细工件和证据写入 GitLab；
    Kanban completion 只保存摘要、结构化事实与链接。
-5. 正常完成前先构造并自检完整 metadata，然后立即完成；Controller 的持久 outbox
+5. 正常完成前先构造完整 metadata，执行上述 `validate-completion` 并确认
+   `ok=true`，然后把同一对象原样传给 `kanban_complete`；Controller 的持久 outbox
    负责业务进度和阻塞通知。
 6. 不创建下一卡、不判断整体门禁、不执行合并；Controller 监听完成事件并重读
    Kanban+GitLab后决定下一步。

@@ -70,6 +70,34 @@ class StoreTests(unittest.TestCase):
             {"state": "merged"},
         )
 
+    def test_failed_admin_request_requires_explicit_replay_policy(self) -> None:
+        payload = {"exception_card_id": "t_exception"}
+        self.assertIsNone(
+            self.store.begin_request("recover", "recover-exception", payload)
+        )
+        self.store.fail_request("recover", "connection lost")
+        with self.assertRaisesRegex(RuntimeError, "connection lost"):
+            self.store.begin_request("recover", "recover-exception", payload)
+
+        self.assertIsNone(
+            self.store.begin_request(
+                "recover",
+                "recover-exception",
+                payload,
+                retry_failed=True,
+            )
+        )
+        self.store.finish_request("recover", {"new_card": "t_retry"})
+        self.assertEqual(
+            self.store.begin_request(
+                "recover",
+                "recover-exception",
+                payload,
+                retry_failed=True,
+            ),
+            {"new_card": "t_retry"},
+        )
+
     def test_outbox_is_idempotent(self) -> None:
         self.store.enqueue("k", "run", "merged", {"x": 1})
         self.store.enqueue("k", "run", "merged", {"x": 2})

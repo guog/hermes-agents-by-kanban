@@ -57,6 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--thread-id")
     resolve.add_argument("--answer", required=True)
 
+    validate_completion = sub.add_parser("validate-completion")
+    validate_completion.add_argument("--card-id", required=True)
+    validate_completion.add_argument(
+        "--metadata",
+        required=True,
+        type=Path,
+        help="path to the completion metadata JSON object",
+    )
+
+    recover_exception = sub.add_parser("recover-exception")
+    recover_exception.add_argument("--run-key", required=True)
+    recover_exception.add_argument("--exception-card-id", required=True)
+    recover_exception.add_argument("--expected-parent-card-id", required=True)
+    recover_exception.add_argument("--reason", required=True)
+
     sub.add_parser("health")
     return parser
 
@@ -75,6 +90,17 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
             "chat_type": values["chat_type"],
             "initiator": values["initiator"],
         }
+    elif method == "validate-completion":
+        metadata_path = values["metadata"]
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"cannot read completion metadata from {metadata_path}: {exc}"
+            ) from exc
+        if not isinstance(metadata, dict):
+            raise ValueError("completion metadata file must contain a JSON object")
+        values["metadata"] = metadata
     return method, {key: value for key, value in values.items() if value is not None}
 
 

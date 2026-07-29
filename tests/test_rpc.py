@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,6 +68,64 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             snapshot_config.hermes_home,
             Path(self.temp.name) / "data",
+        )
+
+    def test_validate_completion_reads_exact_json_object(self) -> None:
+        metadata_path = Path(self.temp.name) / "completion.json"
+        metadata_path.write_text(
+            json.dumps({"stage": "plan-write", "outcome": "pass"}),
+            encoding="utf-8",
+        )
+        args = build_parser().parse_args(
+            [
+                "validate-completion",
+                "--card-id",
+                "t_plan",
+                "--metadata",
+                str(metadata_path),
+            ]
+        )
+
+        self.assertEqual(
+            params_for(args),
+            (
+                "validate-completion",
+                {
+                    "card_id": "t_plan",
+                    "metadata": {
+                        "stage": "plan-write",
+                        "outcome": "pass",
+                    },
+                },
+            ),
+        )
+
+    def test_recover_exception_parameters_are_explicit(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "recover-exception",
+                "--run-key",
+                "hollysys-abcdefghijklmnopqrst",
+                "--exception-card-id",
+                "t_exception",
+                "--expected-parent-card-id",
+                "t_parent",
+                "--reason",
+                "schema and runtime contract were corrected",
+            ]
+        )
+
+        self.assertEqual(
+            params_for(args),
+            (
+                "recover-exception",
+                {
+                    "run_key": "hollysys-abcdefghijklmnopqrst",
+                    "exception_card_id": "t_exception",
+                    "expected_parent_card_id": "t_parent",
+                    "reason": "schema and runtime contract were corrected",
+                },
+            ),
         )
 
 

@@ -32,6 +32,14 @@ class ControllerDaemon:
             return await asyncio.to_thread(self.service.status, run_key)
         if request.method == "resolve":
             return await asyncio.to_thread(self.service.resolve, request.params)
+        if request.method == "validate-completion":
+            return await asyncio.to_thread(
+                self.service.validate_completion, request.params
+            )
+        if request.method == "recover-exception":
+            return await asyncio.to_thread(
+                self.service.recover_exception, request.params
+            )
         if request.method == "health":
             return await asyncio.to_thread(self.service.health)
         raise ValueError(f"unsupported method {request.method}")

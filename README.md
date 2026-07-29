@@ -617,8 +617,14 @@ Kanban 卡和 GitLab 实时事实复算；Controller DB 没有 current-stage/hea
 - 必填 `protocol_version=hollysys-controller/v2`、卡片 mode/iteration、
   `prd_blob_sha` 和全部身份字段；outcome 只允许 pass/fail/cancelled，fail 必须给
   非空 findings，并绑定被检查的 artifact digest 或 MR head。
-- Hermes 官方入口仍保存 free-form metadata。Worker 先自检，Controller 在 done 事件后
-  强制验证；非法对象不推进，创建同阶段新 attempt，最多自动重试两次。
+- Hermes 官方入口仍保存 free-form metadata。Worker 必须先把完整对象保存为 JSON，
+  执行 `hollysysctl validate-completion --card-id <card-id> --metadata <file>`，
+  仅在返回 `ok=true` 后把同一对象原样传给 `kanban_complete`。Controller 在 done
+  事件后使用同一 Pydantic、上下文、GitLab gate 规则再次强制验证；非法对象不推进，
+  创建同阶段新 attempt，最多自动重试两次。
+- 非 TEST 卡必须省略 `test_disposition` 和 `skip_reason`（兼容 JSON `null`）；
+  lint、build 和文档检查结果写入 `verification`，不能冒充
+  `test_disposition=executed`。TEST 为 `executed` 时也不得填写 `skip_reason`。
 - run 启动时固定 PRD blob SHA。SPEC/PLAN/TASKS gate 会按配置 pattern 枚举 artifact
   commit 上的完整路径集合，重算排序后的 `<path>\0<blob-sha>\n` digest，并核对
   MR note 作者、artifact commit 与 card ID。
@@ -698,6 +704,22 @@ Dispatcher 不能直接恢复。它把真实 sender/chat/thread/message/answer �
 `[human-block:v1]` 评论，以 `block_id + message_id` 幂等创建一张同阶段新 attempt；
 新卡创建完成后，旧 blocked 尝试以严格 v6 `outcome=cancelled` 结束并释放新卡。不会
 对同一卡盲目 unblock，也不会创建 continuation/恢复 gate。
+
+Controller 自身因已修复的软件契约缺陷耗尽 protocol retry 时，运维人员使用定点审计
+命令恢复，不直接 unblock、不改写失败卡 metadata：
+
+```bash
+hollysysctl recover-exception \
+  --run-key '<run_key>' \
+  --exception-card-id '<controller-exception-card>' \
+  --expected-parent-card-id '<failed-work-card>' \
+  --reason '<已部署修复及其验证证据>'
+```
+
+Controller 校验 run、异常卡、parent、protocol-error 评论、MR 状态和单活跃卡约束；
+先以异常卡为 parent 幂等创建原阶段新 attempt，再给异常卡追加
+`[controller-exception-recovery:v1]` 审计评论并完成异常卡，最后释放新卡。命令或进程
+在任一步中断后可用完全相同参数重放，不会重复建卡。
 
 部署后必须用真实飞书和 Kanban 做一次受控验收，不能用静态检查代替：
 

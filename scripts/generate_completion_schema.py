@@ -116,6 +116,12 @@ def generated_schema() -> dict:
                     },
                 },
             },
+            "else": {
+                "properties": {
+                    "test_disposition": {"type": "null"},
+                    "skip_reason": {"type": "null"},
+                },
+            },
         },
         {
             "if": {
@@ -159,6 +165,11 @@ def generated_schema() -> dict:
                     "skip_reason": {"type": "string", "minLength": 1},
                     "verification": {"type": "array", "minItems": 1},
                     "residual_risk": {"type": "array", "minItems": 1},
+                },
+            },
+            "else": {
+                "properties": {
+                    "skip_reason": {"type": "null"},
                 },
             },
         },

@@ -162,6 +162,21 @@ class CompletionMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "skipped test requires pass"):
             CompletionMetadata.model_validate(missing_reason)
 
+    def test_non_test_rejects_test_disposition_from_lint_or_build(self) -> None:
+        payload = completion(self.root, Stage.PLAN_WRITE).model_dump(mode="json")
+        payload["test_disposition"] = "executed"
+        with self.assertRaisesRegex(
+            ValidationError, "only valid for test pass/fail"
+        ):
+            CompletionMetadata.model_validate(payload)
+
+        payload["test_disposition"] = None
+        payload["skip_reason"] = "build succeeded"
+        with self.assertRaisesRegex(
+            ValidationError, "only valid for test pass/fail"
+        ):
+            CompletionMetadata.model_validate(payload)
+
     def test_authoring_pass_requires_repository_evidence(self) -> None:
         valid = completion(self.root, Stage.IMPLEMENT)
         self.assertEqual(
@@ -268,8 +283,20 @@ class CompletionMetadataTests(unittest.TestCase):
         )
         self.assertIn("head_sha", conditions[3]["then"]["required"])
         self.assertIn("test_disposition", conditions[4]["then"]["required"])
+        self.assertEqual(
+            conditions[4]["else"]["properties"]["test_disposition"],
+            {"type": "null"},
+        )
+        self.assertEqual(
+            conditions[4]["else"]["properties"]["skip_reason"],
+            {"type": "null"},
+        )
         self.assertIn("repository_evidence", conditions[5]["then"]["required"])
         self.assertIn("skip_reason", conditions[6]["then"]["required"])
+        self.assertEqual(
+            conditions[6]["else"]["properties"]["skip_reason"],
+            {"type": "null"},
+        )
         self.assertIn("forced_advance", conditions[7]["then"]["required"])
 
 

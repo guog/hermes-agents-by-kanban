@@ -25,9 +25,11 @@ from .models import (
     BaselineDisposition,
     CardRecord,
     CompletionMetadata,
+    CompletionValidationRequest,
     FeishuOrigin,
     Outcome,
     Phase,
+    RecoverExceptionRequest,
     RepairContext,
     RepairKind,
     ResolveRequest,
@@ -574,6 +576,53 @@ class ControllerService:
             },
         }
 
+    def validate_completion(self, raw: dict) -> dict:
+        request = CompletionValidationRequest.model_validate(raw)
+        with self._lock:
+            matches = [
+                managed
+                for run_key in self.store.run_keys()
+                for managed in self.store.cards_for_run(run_key)
+                if managed.card_id == request.card_id
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"expected one managed card {request.card_id}, "
+                    f"found {len(matches)}"
+                )
+            managed = matches[0]
+            history, run = self._history(managed.run_key)
+            item = next(
+                entry for entry in history if entry.task.id == request.card_id
+            )
+            if item.managed.purpose != "work":
+                raise ValueError("completion validation only accepts work cards")
+            metadata = CompletionMetadata.model_validate(request.metadata)
+            self._validate_completion_context(run, item, metadata)
+            self._validate_finalization_context(history, item, metadata)
+            if metadata.repository_evidence is not None:
+                self.gitlab.validate_repository_evidence(run, metadata)
+            if (
+                metadata.stage
+                in {
+                    Stage.SPEC_REVIEW,
+                    Stage.PLAN_REVIEW,
+                    Stage.TASKS_REVIEW,
+                    Stage.TEST,
+                    Stage.CODE_REVIEW,
+                }
+                and metadata.outcome in {Outcome.PASS, Outcome.FAIL}
+            ):
+                self.gitlab.validate_gate(run, metadata)
+            return {
+                "ok": True,
+                "run_key": run.run_key,
+                "card_id": item.task.id,
+                "stage": metadata.stage.value,
+                "iteration": metadata.iteration,
+                "outcome": metadata.outcome.value,
+            }
+
     def resolve(self, raw: dict) -> dict:
         request = ResolveRequest.model_validate(raw)
         key = f"resolve:{request.block_id}:{request.message_id}"
@@ -720,6 +769,180 @@ class ControllerService:
             self.store.fail_request(key, str(exc))
             raise
 
+    def recover_exception(self, raw: dict) -> dict:
+        request = RecoverExceptionRequest.model_validate(raw)
+        key = f"recover-exception:{request.run_key}:{request.exception_card_id}"
+        previous = self.store.begin_request(
+            key,
+            "recover-exception",
+            request.model_dump(mode="json"),
+            retry_failed=True,
+        )
+        if previous is not None:
+            return previous
+        try:
+            with self._lock:
+                history, run = self._history(request.run_key)
+                exception = next(
+                    (
+                        item
+                        for item in history
+                        if item.task.id == request.exception_card_id
+                    ),
+                    None,
+                )
+                if exception is None or exception.managed.purpose != "exception":
+                    raise ValueError(
+                        "card is not the requested managed Controller exception"
+                    )
+                if (
+                    exception.managed.parent_card_id
+                    != request.expected_parent_card_id
+                    or exception.task.parents
+                    != [request.expected_parent_card_id]
+                ):
+                    raise ValueError(
+                        "exception parent does not match expected_parent_card_id"
+                    )
+                if (
+                    exception.task.created_by != "hollysys-controller"
+                    or exception.task.tenant != run.run_key
+                    or exception.task.assignee != "dispatcher"
+                    or "hollysys-dispatch-kanban" not in exception.task.skills
+                    or "[hollysys-controller-exception:v2]"
+                    not in (exception.task.body or "")
+                    or f"run_key: {run.run_key}" not in (exception.task.body or "")
+                ):
+                    raise ValueError("exception card provenance was modified")
+                parent = next(
+                    (
+                        item
+                        for item in history
+                        if item.task.id == request.expected_parent_card_id
+                    ),
+                    None,
+                )
+                if (
+                    parent is None
+                    or parent.managed.purpose != "work"
+                    or parent.task.status != "done"
+                ):
+                    raise ValueError(
+                        "expected parent is not a completed managed work card"
+                    )
+                if not any(
+                    "[controller-protocol-error:v2]" in str(comment["body"])
+                    for comment in parent.task.comments
+                ):
+                    raise ValueError(
+                        "expected parent has no Controller protocol-error evidence"
+                    )
+                parent_record = parse_card_body(parent.task.body)
+                stage = Stage(parent.managed.stage)
+                retry = self._recovered_exception_retry(
+                    history,
+                    exception.task.id,
+                    stage,
+                    parent_record.mode,
+                )
+                marker = "[controller-exception-recovery:v1]"
+                recovery_exists = any(
+                    marker in str(comment["body"])
+                    for comment in exception.task.comments
+                )
+                if exception.task.status == "done":
+                    if not recovery_exists or retry is None:
+                        raise ValueError(
+                            "completed exception has no matching audited recovery"
+                        )
+                elif exception.task.status not in {"blocked", "ready", "running"}:
+                    raise ValueError(
+                        "exception is not in a recoverable Controller-owned state"
+                    )
+                active_unrelated = [
+                    item.task.id
+                    for item in history
+                    if item.task.status in ACTIVE_STATUSES
+                    and item.task.id != exception.task.id
+                    and (retry is None or item.task.id != retry.id)
+                ]
+                if active_unrelated:
+                    raise ValueError(
+                        "run has unrelated active cards: "
+                        + ", ".join(active_unrelated)
+                    )
+                mr = self.gitlab.delivery_mr(run)
+                if mr is not None and mr.get("state") == "merged":
+                    raise ValueError("delivery MR is already merged")
+                if retry is None:
+                    retry = self._create_work(
+                        run,
+                        stage,
+                        exception.task.id,
+                        mode=parent_record.mode,
+                        repair_context=parent_record.repair_context,
+                        publish=False,
+                    )
+                if not recovery_exists:
+                    self.kanban.comment(
+                        run.workspace.board,
+                        exception.task.id,
+                        (
+                            f"{marker}\n"
+                            f"run_key: {run.run_key}\n"
+                            f"expected_parent_card_id: "
+                            f"{request.expected_parent_card_id}\n"
+                            f"reason: {request.reason}\n"
+                            f"new_card_id: {retry.id}"
+                        ),
+                        "hollysys-controller",
+                    )
+                if exception.task.status in {"blocked", "ready", "running"}:
+                    self.kanban.complete(
+                        run.workspace.board,
+                        exception.task.id,
+                        (
+                            "Controller exception was recovered by an audited "
+                            f"administrative action; retry is {retry.id}."
+                        ),
+                        {
+                            "protocol_version": "hollysys-controller/v2",
+                            "kind": "controller-exception-recovery",
+                            "run_key": run.run_key,
+                            "exception_card_id": exception.task.id,
+                            "expected_parent_card_id": parent.task.id,
+                            "new_card_id": retry.id,
+                            "reason": request.reason,
+                        },
+                    )
+                if retry.status in ACTIVE_STATUSES:
+                    retry = self._ensure_work_published(run, retry)
+                self.store.enqueue(
+                    f"{run.run_key}:exception-recovered:{exception.task.id}",
+                    run.run_key,
+                    "resumed",
+                    {
+                        "origin": run.origin.model_dump(mode="json"),
+                        "text": self._mention(run.origin)
+                        + "Controller 异常已按审计命令恢复。\n"
+                        f"run={run.run_key} exception={exception.task.id} "
+                        f"stage={stage.value} next={retry.id}",
+                    },
+                )
+                response = {
+                    "run_key": run.run_key,
+                    "recovered_exception": exception.task.id,
+                    "parent_card": parent.task.id,
+                    "new_card": retry.id,
+                    "stage": stage.value,
+                    "iteration": parse_card_body(retry.body).iteration,
+                }
+                self.store.finish_request(key, response)
+                return response
+        except Exception as exc:
+            self.store.fail_request(key, str(exc))
+            raise
+
     def poll_once(self) -> None:
         with self._lock:
             boards = self.reader.discover_boards()
@@ -761,6 +984,8 @@ class ControllerService:
                         self.start(request["payload"])
                     elif request["kind"] == "resolve":
                         self.resolve(request["payload"])
+                    elif request["kind"] == "recover-exception":
+                        self.recover_exception(request["payload"])
                 run_errors: list[str] = []
                 for run_key in self.store.run_keys():
                     if (
@@ -1386,6 +1611,28 @@ class ControllerService:
                 and record.resume_answer == answer
                 and record.mode == mode
             ):
+                return item.task
+        return None
+
+    def _recovered_exception_retry(
+        self,
+        history: list[HistoryItem],
+        exception_card_id: str,
+        stage: Stage,
+        mode: WorkMode,
+    ) -> TaskRecord | None:
+        for item in reversed(history):
+            if (
+                item.managed.purpose != "work"
+                or item.managed.stage != stage.value
+                or item.managed.parent_card_id != exception_card_id
+            ):
+                continue
+            try:
+                record = parse_card_body(item.task.body)
+            except (ValidationError, ValueError, json.JSONDecodeError):
+                continue
+            if record.parent_card_id == exception_card_id and record.mode == mode:
                 return item.task
         return None
 

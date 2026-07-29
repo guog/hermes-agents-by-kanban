@@ -264,6 +264,268 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["event"], "resumed")
 
+    def test_validate_completion_uses_the_same_runtime_contract(self) -> None:
+        card = CardRecord(
+            run=self.run,
+            stage=Stage.PLAN_WRITE,
+            iteration=4,
+            idempotency_key=f"{self.run.run_key}:plan-write:4:normal:work",
+            parent_card_id="t_plan_review",
+            assignee="planner",
+            skills=["hollysys-plan", "glab"],
+        )
+        task = task_record(
+            task_id="t_plan",
+            body=render_card_body(card),
+            status="running",
+            assignee=card.assignee,
+            idempotency_key=card.idempotency_key,
+            tenant=self.run.run_key,
+            skills=card.skills,
+            parents=[card.parent_card_id],
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=card.stage.value,
+            iteration=card.iteration,
+            idempotency_key=card.idempotency_key,
+            parent_card_id=card.parent_card_id,
+            purpose="work",
+            created_at=1,
+        )
+        service = object.__new__(ControllerService)
+        service._lock = threading.RLock()
+        service.store = ControllerStore(self.root / "validate-controller.db")
+        service.store.add_managed_card(
+            board=managed.board,
+            card_id=managed.card_id,
+            run_key=managed.run_key,
+            stage=managed.stage,
+            iteration=managed.iteration,
+            idempotency_key=managed.idempotency_key,
+            parent_card_id=managed.parent_card_id,
+            purpose=managed.purpose,
+            created_at=managed.created_at,
+        )
+        history = [HistoryItem(managed, task)]
+        service._history = lambda _: (history, self.run)
+        validated: list[str] = []
+        service.gitlab = type(
+            "ValidationGitLab",
+            (),
+            {
+                "validate_repository_evidence": staticmethod(
+                    lambda run, metadata: validated.append(
+                        metadata.stage.value
+                    )
+                ),
+                "validate_gate": staticmethod(
+                    lambda run, metadata: validated.append("gate")
+                ),
+            },
+        )()
+        metadata = completion(
+            self.root,
+            Stage.PLAN_WRITE,
+            iteration=4,
+            kanban_card_id=task.id,
+        ).model_dump(mode="json")
+
+        result = service.validate_completion(
+            {"card_id": task.id, "metadata": metadata}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stage"], "plan-write")
+        self.assertEqual(validated, ["plan-write"])
+
+        metadata["test_disposition"] = "executed"
+        with self.assertRaisesRegex(
+            ValidationError, "only valid for test pass/fail"
+        ):
+            service.validate_completion(
+                {"card_id": task.id, "metadata": metadata}
+            )
+
+    def test_recover_exception_is_ordered_and_idempotent(self) -> None:
+        parent_record = CardRecord(
+            run=self.run,
+            stage=Stage.PLAN_WRITE,
+            iteration=4,
+            idempotency_key=f"{self.run.run_key}:plan-write:4:normal:work",
+            parent_card_id="t_plan_review",
+            assignee="planner",
+            skills=["hollysys-plan", "glab"],
+        )
+        parent = task_record(
+            task_id="t_parent",
+            body=render_card_body(parent_record),
+            status="done",
+            assignee=parent_record.assignee,
+            idempotency_key=parent_record.idempotency_key,
+            tenant=self.run.run_key,
+            skills=parent_record.skills,
+            parents=[parent_record.parent_card_id],
+            comments=[
+                {
+                    "body": (
+                        "[controller-protocol-error:v2]\n"
+                        "reason: test disposition fields are only valid "
+                        "for test pass/fail"
+                    )
+                }
+            ],
+        )
+        parent_managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=parent.id,
+            run_key=self.run.run_key,
+            stage=parent_record.stage.value,
+            iteration=parent_record.iteration,
+            idempotency_key=parent_record.idempotency_key,
+            parent_card_id=parent_record.parent_card_id,
+            purpose="work",
+            created_at=1,
+        )
+        exception = task_record(
+            task_id="t_exception",
+            body=(
+                "[hollysys-controller-exception:v2]\n\n"
+                f"run_key: {self.run.run_key}\n\n"
+                "reason: metadata retry budget exhausted"
+            ),
+            status="blocked",
+            assignee="dispatcher",
+            idempotency_key=f"{self.run.run_key}:exception:abc:work",
+            tenant=self.run.run_key,
+            skills=["hollysys-dispatch-kanban"],
+            parents=[parent.id],
+        )
+        exception_managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=exception.id,
+            run_key=self.run.run_key,
+            stage="exception",
+            iteration=1,
+            idempotency_key=exception.idempotency_key or "",
+            parent_card_id=parent.id,
+            purpose="exception",
+            created_at=2,
+        )
+        retry_record = CardRecord(
+            run=self.run,
+            stage=Stage.PLAN_WRITE,
+            iteration=5,
+            idempotency_key=f"{self.run.run_key}:plan-write:5:normal:work",
+            parent_card_id=exception.id,
+            assignee="planner",
+            skills=["hollysys-plan", "glab"],
+        )
+        retry = task_record(
+            task_id="t_retry",
+            body=render_card_body(retry_record),
+            status="blocked",
+            assignee=retry_record.assignee,
+            idempotency_key=retry_record.idempotency_key,
+            tenant=self.run.run_key,
+            skills=retry_record.skills,
+            parents=[exception.id],
+        )
+        service = object.__new__(ControllerService)
+        service._lock = threading.RLock()
+        service.store = ControllerStore(self.root / "recover-controller.db")
+        service._history = lambda _: (
+            [
+                HistoryItem(parent_managed, parent),
+                HistoryItem(exception_managed, exception),
+            ],
+            self.run,
+        )
+        calls: list[tuple] = []
+
+        def create_retry(*args, **kwargs):
+            calls.append(
+                (
+                    "create",
+                    args[1].value,
+                    args[2],
+                    kwargs["publish"],
+                )
+            )
+            return retry
+
+        def publish_retry(run, task):
+            self.assertEqual(calls[-1], ("complete", exception.id))
+            calls.append(("publish", task.id))
+            return task_record(
+                task_id=task.id,
+                body=task.body or "",
+                status="ready",
+                assignee=task.assignee,
+                idempotency_key=task.idempotency_key,
+                tenant=task.tenant,
+                skills=task.skills,
+                parents=task.parents,
+            )
+
+        service._create_work = create_retry
+        service._ensure_work_published = publish_retry
+        service.gitlab = type(
+            "RecoveryGitLab",
+            (),
+            {"delivery_mr": staticmethod(lambda run: {"state": "opened"})},
+        )()
+        completion_metadata: list[dict] = []
+        service.kanban = type(
+            "RecoveryKanban",
+            (),
+            {
+                "comment": staticmethod(
+                    lambda board, task_id, text, author: calls.append(
+                        ("comment", task_id)
+                    )
+                ),
+                "complete": staticmethod(
+                    lambda board, task_id, summary, metadata: (
+                        completion_metadata.append(metadata),
+                        calls.append(("complete", task_id)),
+                    )
+                ),
+            },
+        )()
+        request = {
+            "run_key": self.run.run_key,
+            "exception_card_id": exception.id,
+            "expected_parent_card_id": parent.id,
+            "reason": "schema and runtime contract were corrected",
+        }
+
+        first = service.recover_exception(request)
+        calls_after_first = list(calls)
+        second = service.recover_exception(request)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            calls_after_first,
+            [
+                ("create", "plan-write", exception.id, False),
+                ("comment", exception.id),
+                ("complete", exception.id),
+                ("publish", retry.id),
+            ],
+        )
+        self.assertEqual(calls, calls_after_first)
+        self.assertEqual(first["iteration"], 5)
+        self.assertEqual(
+            completion_metadata[0]["kind"],
+            "controller-exception-recovery",
+        )
+        pending = service.store.pending_outbox()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["event"], "resumed")
+
     def test_reconcile_recovers_completed_root_without_first_card(self) -> None:
         root = task_record(
             task_id="t_root",

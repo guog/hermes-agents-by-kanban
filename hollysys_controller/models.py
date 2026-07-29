@@ -481,9 +481,28 @@ class ResolveRequest(StrictModel):
     answer: Annotated[str, Field(min_length=1, max_length=4000)]
 
 
+class CompletionValidationRequest(StrictModel):
+    card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    metadata: dict
+
+
+class RecoverExceptionRequest(StrictModel):
+    run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
+    exception_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    expected_parent_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+
+
 class RpcRequest(StrictModel):
     id: str
-    method: Literal["start", "status", "resolve", "health"]
+    method: Literal[
+        "start",
+        "status",
+        "resolve",
+        "validate-completion",
+        "recover-exception",
+        "health",
+    ]
     params: dict = Field(default_factory=dict)
 
 

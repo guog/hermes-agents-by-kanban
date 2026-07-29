@@ -625,6 +625,16 @@
             ]
           }
         }
+      },
+      "else": {
+        "properties": {
+          "test_disposition": {
+            "type": "null"
+          },
+          "skip_reason": {
+            "type": "null"
+          }
+        }
       }
     },
     {
@@ -695,6 +705,13 @@
           "residual_risk": {
             "type": "array",
             "minItems": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "skip_reason": {
+            "type": "null"
           }
         }
       }
