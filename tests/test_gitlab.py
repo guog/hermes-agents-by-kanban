@@ -20,7 +20,7 @@ from hollysys_controller.errors import (
 )
 from hollysys_controller.gitlab import CheckedHeadConflict, GitLabClient
 from hollysys_controller.models import Stage
-from tests.helpers import completion, config, run_record
+from tests.helpers import completion, config, run_record, write_profile_env
 
 
 class FakeGitLab(GitLabClient):
@@ -548,8 +548,7 @@ class GitLabGateTests(unittest.TestCase):
 
     def test_api_errors_redact_controller_token(self) -> None:
         token = "controller-secret-token"
-        self.client.config.token_file.write_text(token, encoding="utf-8")
-        self.client.config.token_file.chmod(0o600)
+        write_profile_env(self.client.config, token=token)
         error = self.client._api_error(
             "user",
             CompletedProcess(
@@ -562,12 +561,12 @@ class GitLabGateTests(unittest.TestCase):
         self.assertNotIn(token, str(error))
         self.assertIn("[REDACTED]", str(error))
 
-    def test_invalid_controller_token_file_is_local_fatal(self) -> None:
-        self.client.config.token_file.write_text(
-            "controller-token",
-            encoding="utf-8",
+    def test_invalid_dispatcher_profile_env_is_local_fatal(self) -> None:
+        write_profile_env(
+            self.client.config,
+            token="controller-token",
+            mode=0o644,
         )
-        self.client.config.token_file.chmod(0o644)
         with self.assertRaisesRegex(
             ControllerFatalError,
             "controller_gitlab_token_invalid",
@@ -576,11 +575,7 @@ class GitLabGateTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_controller_git_environment_ignores_user_git_configuration(self) -> None:
-        self.client.config.token_file.write_text(
-            "controller-token",
-            encoding="utf-8",
-        )
-        self.client.config.token_file.chmod(0o600)
+        write_profile_env(self.client.config, token="controller-token")
         inherited = {
             "GLAB_TOKEN": "wrong-token",
             "PRIVATE_TOKEN": "wrong-private-token",
@@ -653,8 +648,7 @@ class GitLabGateTests(unittest.TestCase):
             )
 
     def test_api_command_timeout_is_a_transient_dependency_error(self) -> None:
-        self.client.config.token_file.write_text("controller-token", encoding="utf-8")
-        self.client.config.token_file.chmod(0o600)
+        write_profile_env(self.client.config, token="controller-token")
         client = GitLabClient(self.client.config)
         with patch(
             "hollysys_controller.gitlab.subprocess.run",

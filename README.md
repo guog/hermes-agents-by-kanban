@@ -52,7 +52,7 @@ Compose 只有一个 `hermes` service：
 ├── requirements-controller.txt # 与官方镜像一致的 Controller Python 依赖
 ├── requirements-test.txt       # 本地 Schema 语义和完整回归测试依赖
 ├── data/                       # Hermes 的完整可写 /opt/data
-│   ├── controller/             # token、controller.db、socket/lock（不进 Git）
+│   ├── controller/             # controller.db、socket/lock（不进 Git）
 │   └── profiles/
 │       └── <profile>/
 │           ├── .env.example
@@ -176,7 +176,7 @@ NuGet 代理地址，不能把不存在的阿里公共地址写入全局配置�
 
 | Profile | 职责 | GitLab 权限建议 | Feishu Gateway |
 | --- | --- | --- | --- |
-| `dispatcher` | 飞书命令解析、`hollysysctl` 状态展示、异常交互 | Reporter | 是 |
+| `dispatcher` | 飞书命令解析、`hollysysctl` 状态展示、异常交互 | Maintainer（与 Controller 共用） | 是 |
 | `prd-writer` | 与人类编写并合入 PRD | Developer | 是 |
 | `fde` | 整理现场反馈并创建普通 Issue | Reporter | 是 |
 | `spec-writer` | 生成完整 SPEC 集并创建唯一 Draft MR | Developer | 否 |
@@ -189,9 +189,10 @@ NuGet 代理地址，不能把不存在的阿里公共地址写入全局配置�
 | `tester` | 对精确 MR head 独立测试 | Reporter | 否 |
 | `code-reviewer` | 对同一 MR head 独立审查代码 | Reporter | 否 |
 
-Controller 不是 Agent Profile。它从独立的 0600 文件读取专用 Maintainer token，并独占
-正式卡创建、GitLab 门禁复核和 `sha=<checked_head>` 合并动作；任何 Agent token 都不会
-进入 Controller 进程。准入检查拒绝 Controller token 与任一 Profile token 复用。
+Controller 不是 Agent Profile，但固定从 Dispatcher 的 0600 `.env` 读取同一份
+Maintainer token，并独占正式卡创建、GitLab 门禁复核和
+`sha=<checked_head>` 合并动作。准入检查要求 Controller token 与 Dispatcher token
+完全一致；Dispatcher 的 Git transport 仍由角色 wrapper 禁止 push。
 
 每个 Profile 已直接位于 Hermes 官方运行态目录。`SOUL.md`、Memory 和角色 Skill 不需要复制或安装。Memory 与 Skill 写入继续使用：
 
@@ -297,16 +298,12 @@ Git wrapper 仍拒绝 push。
 
 ### 3.2.1 Controller Maintainer 凭据
 
-Controller 启动时从独立文件读取专用 Maintainer token；该 token 不得与任一 Agent
-Profile 复用，也不进入根环境变量或 Git。部署时写入：
+Controller 始终复用 `data/profiles/dispatcher/.env` 中的 `GITLAB_TOKEN`，不再维护
+`data/controller/gitlab-token` 第二份凭据。Dispatcher token 必须具有目标群组的
+Maintainer 权限；Controller 启动时复用 Dispatcher Profile 的身份、host、allowed
+groups、文件所有权和 `0600` 权限校验。轮换 Dispatcher token 后必须在 preflight
+模式重新执行 deep preflight，再恢复 active。
 
-```bash
-mkdir -p data/controller
-install -m 600 /dev/null data/controller/gitlab-token
-# 用安全编辑器写入 Controller 专用的群组级 Maintainer token
-```
-
-Controller 启动时拒绝 group/other 可读的 token 文件。受控写入只由 Controller 执行。
 五类 identity 白名单可填写 GitLab numeric
 user id、username 或显示名，用逗号分隔；留空会使对应 gate 必然失败。
 
@@ -599,7 +596,7 @@ board:    gitlab-p<project_id>
 feature/<prd-basename-max48>-<run-key-suffix>
 ```
 
-Controller 使用独立 token 与 `/usr/bin/git` 幂等准备共享 checkout/worktree。Agent
+Controller 使用 Dispatcher token 与 `/usr/bin/git` 幂等准备共享 checkout/worktree。Agent
 terminal 中的 `git` 固定命中容器启动时安装的 root-owned HTTPS wrapper：只接受
 `https://green-git.hollysys.net/<allowed-group>/...`，通过 askpass 返回非空 username
 `oauth2`，密码只从当前 Profile 的 `GITLAB_TOKEN` 读取；SSH、明文 HTTP、异主机、
@@ -819,8 +816,8 @@ Dispatcher 不能直接恢复。它把真实 sender/chat/thread/message/answer �
 - Controller 只认 `managed_cards` 中的 ID，并回读核对 `created_by=hollysys-controller`、
   idempotency、parent、assignee、Skill 和严格 card JSON。
 - completion schema 由 worker 自检、Controller 强制验证；非法 done 卡不能推进。
-- Controller 使用独立 Maintainer token；checked-head merge 只由 Controller 执行。
-  Dispatcher 使用独立只读 token，且 Agent Git wrapper 额外拒绝其 push。
+- Controller 与 Dispatcher 使用同一 Maintainer token；checked-head merge 只由
+  Controller 流程执行，Agent Git wrapper 额外拒绝 Dispatcher push。
 - Memory/Skill 修改仍经过 Hermes 官方 write approval。
 
 仍需客观看待的边界：
