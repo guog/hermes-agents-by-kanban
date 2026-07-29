@@ -745,7 +745,10 @@ class ControllerService:
             checks[name] = {"ok": resolved is not None, "path": resolved}
         try:
             self.config.read_token()
-            checks["gitlab_token"] = {"ok": True, "mode": "private-file"}
+            checks["gitlab_token"] = {
+                "ok": True,
+                "source": "dispatcher_profile",
+            }
         except Exception as exc:  # noqa: BLE001 - structured preflight result
             checks["gitlab_token"] = {
                 "ok": False,
