@@ -24,8 +24,9 @@ version: 2.0.1
 3. 保留模板中必需的技术上下文、治理检查、决策、架构、接口、数据/迁移、兼容性、可观测性、安全性、测试、回滚、真实项目结构、可追溯性和风险章节。将决策追溯到 SPEC 需求，但不得改变意图或定义最终 Task ID。
 4. review 重写只修改受影响 PLAN 并保留键；冻结违规修复时按 `frozen_baselines` 恢复 PRD/SPEC。不得修改冻结上游。`mode=finalization` 时完成最后取舍并记录残余风险。
 5. commit 最小且连贯的 PLAN 变更，并 push 到同一分支/MR。绝不得创建 PLAN MR。
-6. 普通/重写卡以 v3 `mode=normal,outcome=pass` 完成，并提交严格 v7
-   `repository_evidence`。不得因业务缺口 fail。finalization 按 forced-advance
+6. 普通/重写卡以 v3 `mode=normal,outcome=pass` 完成，绑定共享 `mr_iid`、
+   `mr_url`、当前 `head_sha`，并提交严格 v7 `repository_evidence`。
+   不得因业务缺口 fail。finalization 按 forced-advance
    模板发布决策评论并提交完整最终基线、决策和风险证据后 pass。不得创建下一卡、
    审查或合并。
 7. 调用完成工具前，必须重新读取当前卡片并逐项原样复制 Controller 上下文：

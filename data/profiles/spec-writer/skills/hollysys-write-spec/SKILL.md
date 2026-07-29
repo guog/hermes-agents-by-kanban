@@ -28,8 +28,9 @@ version: 2.0.1
    但不泄漏技术实现选择。键必须稳定，替换全部占位符。
 4. `repair_context.kind=review_failure` 时逐项处理 findings，保留稳定键；`frozen_artifact_violation` 时只按卡片 baseline 恢复冻结文件，再在 SPEC 内吸收当前阶段适配。不得修改 PRD。
 5. 按仓库的约定式提交规则 commit 最小且连贯的 SPEC 变更，并 push 到共享分支。首次有效 SPEC commit 后，先对账，再填充 MR 描述（包括 `## 关键自主决策`；没有时填写 `无`），然后使用 `/opt/fleet/templates/mr-description.md` 创建且只创建一个 `Draft: [PRD] <prd-basename>.md` MR；此后只更新该 MR 及其决策章节。
-6. 普通/重写卡以 `mode=normal,outcome=pass` 提交严格 v7 metadata，并以
-   `repository_evidence` 绑定仓库基线、检查路径、现有能力、变更类型和复用决策；
+6. 普通/重写卡以 `mode=normal,outcome=pass` 提交严格 v7 metadata，绑定共享
+   `mr_iid`、`mr_url`、当前 `head_sha`，并以 `repository_evidence`
+   绑定仓库基线、检查路径、现有能力、变更类型和复用决策；
    不得用业务问题返回 fail。若 `mode=finalization`，尽量修复第三次 findings，在
    SPEC 中记录最终取舍，并按 `/opt/fleet/templates/forced-advance-comment.md`
    发布唯一幂等评论；计算最终工件证据并填写完整 `forced_advance` 后 pass。

@@ -99,12 +99,21 @@
       "title": "ForcedAdvance",
       "type": "object"
     },
+    "GateDecision": {
+      "enum": [
+        "approved",
+        "rejected"
+      ],
+      "title": "GateDecision",
+      "type": "string"
+    },
     "GatePhase": {
       "enum": [
-        "code",
-        "migration",
-        "deployment",
-        "release"
+        "implementation_entry",
+        "implementation_completion",
+        "migration_execution",
+        "deployment_entry",
+        "release_acceptance"
       ],
       "title": "GatePhase",
       "type": "string"
@@ -454,6 +463,98 @@
       ],
       "default": null
     },
+    "gate_decision": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GateDecision"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "gate_reviewer": {
+      "anyOf": [
+        {
+          "pattern": "^id:[1-9][0-9]*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gate Reviewer"
+    },
+    "gate_reviewed_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gate Reviewed At"
+    },
+    "gate_reason": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gate Reason"
+    },
+    "gate_evidence_refs": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Gate Evidence Refs",
+      "type": "array"
+    },
+    "gate_artifact_paths": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Gate Artifact Paths",
+      "type": "array"
+    },
+    "gate_artifact_commit_sha": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gate Artifact Commit Sha"
+    },
+    "gate_artifact_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gate Artifact Digest"
+    },
     "contract_refs": {
       "items": {
         "minLength": 1,
@@ -564,6 +665,48 @@
         "properties": {
           "stage": {
             "enum": [
+              "spec-write",
+              "plan-write",
+              "tasks-write",
+              "implement"
+            ]
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "stage",
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "mr_iid",
+          "mr_url",
+          "head_sha"
+        ],
+        "properties": {
+          "mr_iid": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mr_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "head_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "enum": [
               "spec-review",
               "plan-review",
               "tasks-review"
@@ -662,6 +805,16 @@
             ]
           }
         }
+      },
+      "else": {
+        "properties": {
+          "test_disposition": {
+            "type": "null"
+          },
+          "skip_reason": {
+            "type": "null"
+          }
+        }
       }
     },
     {
@@ -734,6 +887,13 @@
             "minItems": 1
           }
         }
+      },
+      "else": {
+        "properties": {
+          "skip_reason": {
+            "type": "null"
+          }
+        }
       }
     },
     {
@@ -771,6 +931,114 @@
           },
           "forced_advance": {
             "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "gate_phase"
+        ],
+        "properties": {
+          "gate_phase": {
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gate_decision",
+          "gate_reviewer",
+          "gate_reviewed_at",
+          "gate_reason",
+          "gate_evidence_refs",
+          "gate_artifact_paths",
+          "gate_artifact_commit_sha",
+          "gate_artifact_digest",
+          "contract_refs",
+          "requirement_ids"
+        ],
+        "properties": {
+          "gate_evidence_refs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "gate_artifact_paths": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "contract_refs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "requirement_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "stage",
+          "outcome"
+        ],
+        "properties": {
+          "stage": {
+            "const": "tasks-review"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gate_phase",
+          "gate_decision"
+        ],
+        "properties": {
+          "gate_phase": {
+            "const": "implementation_entry"
+          },
+          "gate_decision": {
+            "const": "approved"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "stage",
+          "outcome"
+        ],
+        "properties": {
+          "stage": {
+            "const": "code-review"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gate_phase",
+          "gate_decision"
+        ],
+        "properties": {
+          "gate_phase": {
+            "const": "implementation_completion"
+          },
+          "gate_decision": {
+            "const": "approved"
           }
         }
       }

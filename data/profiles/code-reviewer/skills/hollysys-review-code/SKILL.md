@@ -1,7 +1,7 @@
 ---
 name: hollysys-review-code
 description: 当 Kanban 卡要求代码审查时，独立审查 tester 刚检查的准确 MR head 并发布正确性门禁。
-version: 2.0.1
+version: 2.1.0
 ---
 
 # 审查交付头提交
@@ -22,11 +22,21 @@ version: 2.0.1
 3. 本软件运行于内部网络，设计并发规模不超过 1000 人。不得用纯假设的互联网级攻击、高并发洪峰或超大规模分布式场景制造阻塞 findings；只有变更触达真实信任边界、权限、敏感数据、危险输入、数据完整性或仓库明确安全约束时，才提出相称的安全问题。普通业务代码按实际规模审查并发和性能；当变更涉及看板、工业流程图/P&ID、实时刷新、大批量数据、Canvas/SVG/矢量渲染或仓库已知热点时，必须特别检查渲染、查询、刷新频率、内存和交互性能。
 4. 对可执行的问题使用行内讨论。任何阻塞交付的代码、覆盖或冻结基线违规都使用带非空 findings 的 `fail`；不得要求回改上游工件。非阻塞上游问题写入残余风险。
 5. 发布结论前立即重读 MR head。若已变化，以 `outcome=cancelled` 完成本次陈旧尝试，让 Controller 从 test 重派；不得发布 pass。
-6. 发布一条绑定准确 `head_sha` 和当前 card ID 的幂等 v5 `code-review` 评论，marker 的 `test=na`，并包含精确位置、证据和剩余风险。
+6. 发布一条绑定准确 `head_sha` 和当前 card ID 的幂等 v5 `code-review` 评论，
+   marker 的 `test=na`；pass 时同一 note 还必须包含
+   `HOLLYSYS-SEMANTIC-GATE: v=1 run=<run> phase=implementation_completion
+   decision=approved artifact=<frozen-tasks-commit> digest=<frozen-tasks-digest>`，
+   并包含精确位置、证据和剩余风险。
 7. 使用严格 v7 metadata 完成，pass/fail 都必须将 `head_sha`、`mr_iid`、`mr_url`
    绑定到当前已审头，fail 给非空 issues。Controller 汇总两份结论后才决定合并或
    第 N/5 次 coder 修改。completion metadata 不得包含仅 authoring pass 可用的
    `repository_evidence`；仓库核查证据写入 gate 评论和 `verification`。
+   pass 同时必须提交 `implementation_completion` Gate：填写
+   `gate_decision=approved`、当前 GitLab reviewer 的稳定 `id:<numeric-id>`、
+   带时区的 `gate_reviewed_at`、理由，`gate_evidence_refs` 使用上述 note 的精确
+   `#note_<id>` URL，并原样绑定卡片中的冻结 TASKS
+   paths/commit/digest；`requirement_ids` 和 `contract_refs` 必须真实存在于该 TASKS
+   文本。Gate reviewer 必须与 v5 评论作者一致。fail 不得伪造 approved Gate。
    绝不得修改代码、push、创建卡片/MR 或合并。
 - 调用完成工具前，必须将业务 metadata 保存为 JSON，并执行
   `hollysysctl validate-completion --card-id '<当前卡 ID>' --metadata '<json-file>'`；

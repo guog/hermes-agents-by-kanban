@@ -1,4 +1,5 @@
 HOLLYSYS-GATE: v=5 run=<run_key> stage=<spec-review|plan-review|tasks-review|test|code-review> result=<pass|fail|cancelled> digest=<sha256-or-na> artifact=<40-char-sha-or-na> head=<40-char-sha-or-na> test=<executed|skipped_unavailable|na> task=<kanban-card-id>
+HOLLYSYS-SEMANTIC-GATE: v=1 run=<run_key> phase=<implementation_entry|implementation_completion|migration_execution|deployment_entry|release_acceptance> decision=<approved|rejected> artifact=<frozen-tasks-commit> digest=<frozen-tasks-digest>
 
 ## 结论
 
@@ -52,6 +53,17 @@ HOLLYSYS-GATE: v=5 run=<run_key> stage=<spec-review|plan-review|tasks-review|tes
   "head_sha": "<40-char-sha-or-null>",
   "test_disposition": "<executed|skipped_unavailable|null>",
   "skip_reason": "<unavailable-condition-or-null>",
+  "gate_phase": "<implementation_entry|implementation_completion|migration_execution|deployment_entry|release_acceptance|null>",
+  "gate_decision": "<approved|rejected|null>",
+  "gate_reviewer": "<id:numeric-id-or-null>",
+  "gate_reviewed_at": "<RFC3339-with-timezone-or-null>",
+  "gate_reason": "<reason-or-null>",
+  "gate_evidence_refs": [],
+  "gate_artifact_paths": [],
+  "gate_artifact_commit_sha": "<40-char-sha-or-null>",
+  "gate_artifact_digest": "<sha256-or-null>",
+  "contract_refs": [],
+  "requirement_ids": [],
   "verification": [],
   "kanban_card_id": "<card-id>",
   "key_decisions": [],

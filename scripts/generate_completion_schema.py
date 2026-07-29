@@ -64,6 +64,37 @@ def generated_schema() -> dict:
                 "properties": {
                     "stage": {
                         "enum": [
+                            "spec-write",
+                            "plan-write",
+                            "tasks-write",
+                            "implement",
+                        ]
+                    },
+                    "outcome": {"const": "pass"},
+                },
+                "required": ["stage", "outcome"],
+            },
+            "then": {
+                "required": [
+                    "mr_iid",
+                    "mr_url",
+                    "head_sha",
+                ],
+                "properties": {
+                    "mr_iid": {"type": "integer", "minimum": 1},
+                    "mr_url": {"type": "string", "format": "uri"},
+                    "head_sha": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{40}$",
+                    },
+                },
+            },
+        },
+        {
+            "if": {
+                "properties": {
+                    "stage": {
+                        "enum": [
                             "spec-review",
                             "plan-review",
                             "tasks-review",
@@ -116,6 +147,12 @@ def generated_schema() -> dict:
                     },
                 },
             },
+            "else": {
+                "properties": {
+                    "test_disposition": {"type": "null"},
+                    "skip_reason": {"type": "null"},
+                },
+            },
         },
         {
             "if": {
@@ -161,6 +198,11 @@ def generated_schema() -> dict:
                     "residual_risk": {"type": "array", "minItems": 1},
                 },
             },
+            "else": {
+                "properties": {
+                    "skip_reason": {"type": "null"},
+                },
+            },
         },
         {
             "if": {
@@ -186,6 +228,84 @@ def generated_schema() -> dict:
                         "const": "forced_after_review_limit"
                     },
                     "forced_advance": {"type": "object"},
+                },
+            },
+        },
+        {
+            "if": {
+                "required": ["gate_phase"],
+                "properties": {
+                    "gate_phase": {"type": "string"},
+                },
+            },
+            "then": {
+                "required": [
+                    "gate_decision",
+                    "gate_reviewer",
+                    "gate_reviewed_at",
+                    "gate_reason",
+                    "gate_evidence_refs",
+                    "gate_artifact_paths",
+                    "gate_artifact_commit_sha",
+                    "gate_artifact_digest",
+                    "contract_refs",
+                    "requirement_ids",
+                ],
+                "properties": {
+                    "gate_evidence_refs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "gate_artifact_paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "contract_refs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "requirement_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": True,
+                    },
+                },
+            },
+        },
+        {
+            "if": {
+                "required": ["stage", "outcome"],
+                "properties": {
+                    "stage": {"const": "tasks-review"},
+                    "outcome": {"const": "pass"},
+                },
+            },
+            "then": {
+                "required": ["gate_phase", "gate_decision"],
+                "properties": {
+                    "gate_phase": {"const": "implementation_entry"},
+                    "gate_decision": {"const": "approved"},
+                },
+            },
+        },
+        {
+            "if": {
+                "required": ["stage", "outcome"],
+                "properties": {
+                    "stage": {"const": "code-review"},
+                    "outcome": {"const": "pass"},
+                },
+            },
+            "then": {
+                "required": ["gate_phase", "gate_decision"],
+                "properties": {
+                    "gate_phase": {
+                        "const": "implementation_completion"
+                    },
+                    "gate_decision": {"const": "approved"},
                 },
             },
         },

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
@@ -60,10 +61,16 @@ class TestDisposition(StrEnum):
 
 
 class GatePhase(StrEnum):
-    CODE = "code"
-    MIGRATION = "migration"
-    DEPLOYMENT = "deployment"
-    RELEASE = "release"
+    IMPLEMENTATION_ENTRY = "implementation_entry"
+    IMPLEMENTATION_COMPLETION = "implementation_completion"
+    MIGRATION_EXECUTION = "migration_execution"
+    DEPLOYMENT_ENTRY = "deployment_entry"
+    RELEASE_ACCEPTANCE = "release_acceptance"
+
+
+class GateDecision(StrEnum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 
 class NotificationLevel(StrEnum):
@@ -302,6 +309,27 @@ class CompletionMetadata(StrictModel):
     issues: list[str] = Field(default_factory=list)
     residual_risk: list[str] = Field(default_factory=list)
     gate_phase: GatePhase | None = None
+    gate_decision: GateDecision | None = None
+    gate_reviewer: Annotated[
+        str | None,
+        Field(pattern=r"^id:[1-9][0-9]*$"),
+    ] = None
+    gate_reviewed_at: datetime | None = None
+    gate_reason: Annotated[str | None, Field(min_length=1)] = None
+    gate_evidence_refs: list[Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=list
+    )
+    gate_artifact_paths: list[Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=list
+    )
+    gate_artifact_commit_sha: Annotated[
+        str | None,
+        Field(pattern=SHA_PATTERN),
+    ] = None
+    gate_artifact_digest: Annotated[
+        str | None,
+        Field(pattern=DIGEST_PATTERN),
+    ] = None
     contract_refs: list[Annotated[str, Field(min_length=1)]] = Field(
         default_factory=list
     )
@@ -311,18 +339,75 @@ class CompletionMetadata(StrictModel):
 
     @model_validator(mode="after")
     def validate_stage_contract(self) -> CompletionMetadata:
+        gate_fields_present = any(
+            (
+                self.gate_decision is not None,
+                self.gate_reviewer is not None,
+                self.gate_reviewed_at is not None,
+                self.gate_reason is not None,
+                bool(self.gate_evidence_refs),
+                bool(self.gate_artifact_paths),
+                self.gate_artifact_commit_sha is not None,
+                self.gate_artifact_digest is not None,
+                bool(self.contract_refs),
+                bool(self.requirement_ids),
+            )
+        )
         if self.gate_phase is not None and (
-            not self.contract_refs or not self.requirement_ids
+            self.gate_decision is None
+            or self.gate_reviewer is None
+            or self.gate_reviewed_at is None
+            or self.gate_reason is None
+            or not self.gate_evidence_refs
+            or not self.gate_artifact_paths
+            or self.gate_artifact_commit_sha is None
+            or self.gate_artifact_digest is None
+            or not self.contract_refs
+            or not self.requirement_ids
         ):
             raise ValueError(
-                "gate_phase requires contract_refs and requirement_ids"
+                "gate_phase requires decision, reviewer, reviewed_at, reason, "
+                "evidence refs, frozen artifact paths/version/digest, "
+                "contract_refs and requirement_ids"
             )
-        if self.gate_phase is None and (
-            self.contract_refs or self.requirement_ids
-        ):
+        if self.gate_phase is None and gate_fields_present:
             raise ValueError(
-                "contract_refs and requirement_ids require gate_phase"
+                "gate evidence fields require gate_phase"
             )
+        if (
+            self.gate_phase is not None
+            and self.gate_decision is not None
+            and self.gate_reviewed_at is not None
+        ):
+            if self.gate_reviewed_at.tzinfo is None:
+                raise ValueError("gate_reviewed_at must include a timezone")
+            if self.gate_decision == GateDecision.APPROVED:
+                if self.outcome != Outcome.PASS:
+                    raise ValueError("approved gate requires outcome=pass")
+            elif self.outcome != Outcome.FAIL:
+                raise ValueError("rejected gate requires outcome=fail")
+            for values, name in (
+                (self.requirement_ids, "requirement_ids"),
+                (self.contract_refs, "contract_refs"),
+                (self.gate_evidence_refs, "gate_evidence_refs"),
+                (self.gate_artifact_paths, "gate_artifact_paths"),
+            ):
+                if len(values) != len(set(values)):
+                    raise ValueError(f"{name} must be unique")
+            for raw_path in self.gate_artifact_paths:
+                path = PurePosixPath(raw_path)
+                if (
+                    path.is_absolute()
+                    or raw_path in {"", "."}
+                    or ".." in path.parts
+                    or any(
+                        token in raw_path
+                        for token in ("*", "?", "[", "]", "\0")
+                    )
+                ):
+                    raise ValueError(
+                        "gate_artifact_paths must be exact repository paths"
+                    )
         document_reviews = {
             Stage.SPEC_REVIEW,
             Stage.PLAN_REVIEW,
@@ -335,6 +420,30 @@ class CompletionMetadata(StrictModel):
         }
         repository_authors = document_producers | {Stage.IMPLEMENT}
         code_gates = {Stage.TEST, Stage.CODE_REVIEW}
+
+        if (
+            self.stage == Stage.TASKS_REVIEW
+            and self.outcome == Outcome.PASS
+            and (
+                self.gate_phase != GatePhase.IMPLEMENTATION_ENTRY
+                or self.gate_decision != GateDecision.APPROVED
+            )
+        ):
+            raise ValueError(
+                "tasks-review pass requires approved implementation_entry gate"
+            )
+        if (
+            self.stage == Stage.CODE_REVIEW
+            and self.outcome == Outcome.PASS
+            and (
+                self.gate_phase != GatePhase.IMPLEMENTATION_COMPLETION
+                or self.gate_decision != GateDecision.APPROVED
+            )
+        ):
+            raise ValueError(
+                "code-review pass requires approved "
+                "implementation_completion gate"
+            )
 
         if self.outcome == Outcome.FAIL and not self.issues:
             raise ValueError("fail requires a non-empty issues list")
@@ -398,6 +507,11 @@ class CompletionMetadata(StrictModel):
                 raise ValueError(
                     "SPEC/PLAN/TASKS/CODE authoring pass requires "
                     "repository_evidence"
+                )
+            if self.mr_iid is None or self.mr_url is None or self.head_sha is None:
+                raise ValueError(
+                    "SPEC/PLAN/TASKS/CODE authoring pass requires the "
+                    "shared delivery MR and current head"
                 )
         elif self.repository_evidence is not None:
             raise ValueError(
@@ -501,6 +615,15 @@ class ResolveRequest(StrictModel):
     answer: Annotated[str, Field(min_length=1, max_length=4000)]
 
 
+class RecoverRequest(StrictModel):
+    run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
+    message_id: Annotated[str, Field(pattern=r"^om_[A-Za-z0-9_-]+$")]
+    sender: Annotated[str, Field(pattern=r"^ou_[A-Za-z0-9_-]+$")]
+    chat_id: Annotated[str, Field(pattern=r"^oc_[A-Za-z0-9_-]+$")]
+    thread_id: str | None = None
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+
+
 class AbortRequest(StrictModel):
     run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
     message_id: Annotated[str, Field(pattern=r"^om_[A-Za-z0-9_-]+$")]
@@ -530,6 +653,7 @@ class RpcRequest(StrictModel):
         "start",
         "status",
         "resolve",
+        "recover",
         "health",
         "preflight",
         "abort-request",

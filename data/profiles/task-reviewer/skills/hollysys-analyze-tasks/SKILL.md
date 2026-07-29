@@ -1,7 +1,7 @@
 ---
 name: hollysys-analyze-tasks
 description: 当 Kanban 卡要求审查 TASKS 时，核对 SPEC/PLAN 映射、DAG、覆盖与验收并发布门禁。
-version: 2.0.1
+version: 2.1.0
 ---
 
 # 审查 TASKS 集合
@@ -18,9 +18,16 @@ version: 2.0.1
    SPEC/PLAN/TASK 键、稳定唯一 ID、显式依赖、DAG、执行波次、需求覆盖、验收和测试。
    每项任务必须有 `reuse|modify|extend|create` 动作，新增结构必须有“现有能力无法
    承载”的仓库证据。绿地式搭架子、重复造已有能力或目标路径臆造均属实质性缺陷。
-3. 在审查 commit 上计算完整 TASKS path/blob 摘要，发布包含路径、digest、`artifact_commit_sha`、card ID 和评论 URL 的幂等 v5 gate。
+3. 在审查 commit 上计算完整 TASKS path/blob 摘要，发布包含路径、digest、
+   `artifact_commit_sha`、card ID、v5 marker 和
+   `HOLLYSYS-SEMANTIC-GATE: v=1 run=<run> phase=implementation_entry
+   decision=approved artifact=<tasks-commit> digest=<tasks-digest>` 的幂等 gate。
+   pass metadata 的 `gate_evidence_refs` 必须包含这条 note 的精确 `#note_<id>` URL，
+   并填写当前 GitLab reviewer 的稳定 `id:<numeric-id>`、带时区时间、理由、
+   与本次审查工件完全相同且通过后即冻结的 TASKS paths/commit/digest，以及
+   TASKS 正文中真实存在的 `requirement_ids` 和 `contract_refs`。任一引用无法验证则不得 pass。
 4. 阻塞性任务缺陷使用 `fail` 并给 tasker 可在 TASKS 内完成的动作；不得跨阶段回退。
-5. 使用 v3 normal metadata；pass/fail 都绑定 paths/digest/artifact commit 和 gate URL，pass 填 `baseline_disposition=reviewed`，fail 给非空 issues，并把门禁评论中的关键自主决策摘要写入 `key_decisions`。不得编辑产物、实现、push、创建卡片或合并。
+5. 使用 v3 normal metadata；pass/fail 都绑定 paths/digest/artifact commit 和 gate URL，pass 填 `baseline_disposition=reviewed` 与完整 `implementation_entry` Gate，fail 给非空 issues，并把门禁评论中的关键自主决策摘要写入 `key_decisions`。不得编辑产物、实现、push、创建卡片或合并。
    审查必须核实仓库证据，但 completion metadata 不得包含仅 authoring pass 可用的
    `repository_evidence`；仓库核查结果写入 gate 评论、`verification` 和
    `key_decisions`。

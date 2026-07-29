@@ -1,7 +1,9 @@
 poll_interval_seconds: 2
 reconcile_interval_seconds: 30
+reconcile_workers: 4
+outbox_poll_interval_seconds: 2
 command_timeout_seconds: 120
-required_pipeline: true
+controller_mode: preflight
 notification_level: verbose
 abort_confirmation_ttl_seconds: 600
 dependency_backoff_initial_seconds: 5
@@ -11,8 +13,12 @@ health_stale_seconds: 120
 event_lag_warning_threshold: 100
 outbox_warning_threshold: 20
 worker_progress_lease_seconds: 14400
+worker_redispatch_limit: 2
 merge_wait_retry_seconds: 30
-merge_wait_timeout_seconds: 3600
+merge_blocker_timeout_seconds: 3600
+merge_draft_grace_seconds: 600
+outbox_backoff_initial_seconds: 5
+outbox_backoff_max_seconds: 300
 document_review_limit: 3
 code_modification_limit: 5
 protocol_retry_limit: 2

@@ -103,17 +103,31 @@ worktree/branch/MR 与冻结合同上下文，避免完成后才发现字段越�
   `baseline_disposition=reviewed`。
 - test/code-review 的 pass/fail 都必须给当前 `mr_iid`、`mr_url`、`head_sha`。
 - spec-write、plan-write、tasks-write、implement 的 pass 必须给
-  `repository_evidence`：绑定卡片的 `repository_base_sha`，列出实际检查过的
+  共享交付 `mr_iid`、`mr_url`、当前 `head_sha` 和 `repository_evidence`：
+  后者绑定卡片的 `repository_base_sha`，列出实际检查过的
   现有代码/文档路径、现有能力、`extend_existing|modify_existing|
   extend_and_modify` 变更类型，以及明确的复用决策。不能只写“已检查仓库”。
 - test 的 pass/fail 还必须给 `test_disposition=executed|skipped_unavailable`。
   只有测试条件经实际预检确认不具备时才允许 `skipped_unavailable`，此时使用
   `outcome=pass`，并给出非空 `skip_reason`、已执行的可用检查 `verification`
   以及未执行测试带来的 `residual_risk`。
+- 非 TEST 卡必须省略 `test_disposition` 和 `skip_reason`（兼容输入可为 JSON
+  `null`）。lint、build、文档检查等结果属于 `verification`，不能写成
+  `test_disposition=executed`。TEST 使用 `executed` 时也必须省略
+  `skip_reason`（或设为 `null`）。
 - finalization producer 的 pass 必须给工件证据、MR、`baseline_disposition=
   forced_after_review_limit` 和完整 `forced_advance`，其中包含第三次 review
   卡片/评论、最终决策评论、baseline commit/paths/digest、关键决策、未解决
   findings、residual risks 和 review_limit；嵌套证据必须与顶层字段一致。
+- 携带五类语义 Gate 时，必须同时给出 `gate_decision`、`gate_reviewer`、
+  带时区的 `gate_reviewed_at`、`gate_reason`、`gate_evidence_refs`，以及与卡片中
+  唯一冻结 TASKS 基线完全一致的 `gate_artifact_paths`、
+  `gate_artifact_commit_sha`、`gate_artifact_digest`。`requirement_ids` 和
+  `contract_refs` 必须真实出现在冻结 TASKS 文本中；每个 Gate 至少引用一条当前共享
+  MR 的精确 `#note_<id>` URL，该 note 作者必须匹配 `gate_reviewer=id:<numeric-id>`
+  且包含绑定 run/phase/decision/TASKS commit/digest 的
+  `HOLLYSYS-SEMANTIC-GATE` marker；其他证据使用冻结 commit 中存在的精确仓库路径。
+  缺失、重复、漂移或 reviewer 身份不一致均 fail closed。
 - 不得包含 `next_card_ids`、continuation、`live_reconcile_required`、人类
   resolution 或 merge 专属字段；Schema 对额外字段使用 `additionalProperties=false`。
 
@@ -127,7 +141,11 @@ attempt，最多自动重试两次。
    中的 run/stage/iteration/mode/assignee/parent、冻结基线和 repair_context
    与当前卡一致。
 2. 只在卡片给出的共享 worktree、branch 和单一 MR 工作；GitLab API 操作使用锁定
-   `glab`，本地状态使用常规 `git`。
+   `glab`，由当前 Profile 的 `GITLAB_HOST/GITLAB_TOKEN` 直接认证，不运行
+   `glab auth login`。所有 clone/fetch/pull/push/ls-remote 只调用 PATH 中的受控
+   `git`，remote 必须为 `https://green-git.hollysys.net/<allowed-group>/...`；禁用
+   SSH、明文 HTTP、含用户名/token 的 URL、持久 credential 和绕过 wrapper 的系统 Git
+   路径。Reviewer/Profile 即使 token 误配为高权限也不得 push。
 3. Controller 已在发卡前对账；不要例行 fetch/pull。只有 ref 缺失、已证实头不一致
    或 push 被拒绝时才能 fetch，并记录原因。
 4. 长任务定期 `kanban_heartbeat(note=...)`。heartbeat 只保活，不触发飞书进度
@@ -157,7 +175,7 @@ question: <只需回答的一个问题>
 options: [<A>, <B>]
 required_action: <具体动作>
 resume_check: <可验证条件>
-gate_phase: <migration|deployment|release；environment/destructive_approval 必填>
+gate_phase: <implementation_entry|implementation_completion|migration_execution|deployment_entry|release_acceptance；environment/destructive_approval 必填>
 requirement_ids: <冻结 TASKS/需求 ID，逗号分隔；上述门禁必填>
 contract_refs: <冻结 PLAN/TASKS 合同引用，逗号分隔；上述门禁必填>
 ```
