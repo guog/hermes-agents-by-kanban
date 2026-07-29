@@ -23,7 +23,7 @@ class ComposeContractTests(unittest.TestCase):
         )
         self.assertEqual(service["restart"], "unless-stopped")
         self.assertIn(
-            "./container/services.d/hollysys-controller:/run/service/hollysys-controller:ro",
+            "./container/services.d/hollysys-controller:/etc/services.d/hollysys-controller:ro",
             service["volumes"],
         )
         run_script = (
