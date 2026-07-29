@@ -86,6 +86,7 @@ Compose 只有一个 `hermes` service：
 | `./hollysysctl` | `/usr/local/bin/hollysysctl` | 只读 |
 | `./container` | `/opt/fleet/container` | 只读 |
 | `./container/ensure-dotnet8.sh` | `/etc/cont-init.d/00-hollysys-dotnet8` | 只读、root 初始化 |
+| `./container/ensure-feishu.sh` | `/etc/cont-init.d/02-hollysys-feishu` | 只读、校验并安装固定 Feishu adapter 依赖 |
 | `./container/services.d/hollysys-controller` | `/etc/services.d/hollysys-controller` | 只读、由 s6 复制到可写 `/run` 的长运行服务 |
 | `./container/mirrors/debian.sources` | `/etc/apt/sources.list.d/debian.sources` | 只读 |
 | `./container/mirrors/sources.list` | `/etc/apt/sources.list` | 只读 |
@@ -324,6 +325,11 @@ chmod 600 data/profiles/dispatcher/.lark-cli/config/hermes/config.json
 将其中的 `appId`、`appSecret` 替换为该 Profile `.env` 中同一组 Feishu 凭据。配置固定 `defaultAs=bot`、`strictMode=bot`，不允许使用用户身份冒充人类。
 
 `prd-writer` 和 `fde` 做同样处理。实际 `config.json` 已被 Git 忽略。
+
+官方镜像的 Hermes 0.19.0 将 Feishu adapter 声明为可选 extra。容器初始化固定校验并安装
+`lark-oapi==1.6.8`、`qrcode==7.4.2` 和 `requests-toolbelt==1.0.0`，下载缓存放在
+`/opt/data/.cache/uv`；版本已匹配时跳过安装。缺失或版本漂移时初始化 fail closed，
+不允许 Gateway 仅保持进程存活却没有 Feishu adapter。
 
 ### 3.4 模型、推理强度与认证
 

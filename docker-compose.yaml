@@ -41,6 +41,7 @@ services:
       - ./container:/opt/fleet/container:ro
       - ./container/ensure-dotnet8.sh:/etc/cont-init.d/00-hollysys-dotnet8:ro
       - ./container/install-git-wrapper.sh:/etc/cont-init.d/01-hollysys-git-wrapper:ro
+      - ./container/ensure-feishu.sh:/etc/cont-init.d/02-hollysys-feishu:ro
       # s6-overlay discovers legacy services from /etc/services.d and copies
       # them into its writable /run tree. Mounting directly below /run makes
       # preinit fail when it clears /run/s6 on current Docker releases.

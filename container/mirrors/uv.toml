@@ -1,1 +1,1 @@
-default-index = "https://mirrors.aliyun.com/pypi/simple/"
+index-url = "https://mirrors.aliyun.com/pypi/simple/"
