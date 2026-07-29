@@ -86,7 +86,7 @@ Compose 只有一个 `hermes` service：
 | `./hollysysctl` | `/usr/local/bin/hollysysctl` | 只读 |
 | `./container` | `/opt/fleet/container` | 只读 |
 | `./container/ensure-dotnet8.sh` | `/etc/cont-init.d/00-hollysys-dotnet8` | 只读、root 初始化 |
-| `./container/services.d/hollysys-controller` | `/run/service/hollysys-controller` | 只读、s6 长运行服务 |
+| `./container/services.d/hollysys-controller` | `/etc/services.d/hollysys-controller` | 只读、由 s6 复制到可写 `/run` 的长运行服务 |
 | `./container/mirrors/debian.sources` | `/etc/apt/sources.list.d/debian.sources` | 只读 |
 | `./container/mirrors/sources.list` | `/etc/apt/sources.list` | 只读 |
 | `./container/mirrors/pip.conf` | `/etc/pip.conf` | 只读 |
