@@ -459,9 +459,18 @@ def profile_preflight(
     ) as temporary:
         checkout = Path(temporary) / "repository"
         cloned = _run(
-            [config.agent_git_command, "clone", repository_url, str(checkout)],
+            [
+                config.agent_git_command,
+                "clone",
+                "--depth=1",
+                "--filter=blob:none",
+                "--no-checkout",
+                "--single-branch",
+                repository_url,
+                str(checkout),
+            ],
             env=env,
-            timeout=max(30, config.preflight_command_timeout_seconds),
+            timeout=config.preflight_command_timeout_seconds,
         )
         if cloned.returncode != 0:
             result.update(
