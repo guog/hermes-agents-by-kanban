@@ -9,15 +9,26 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlparse
 
 from .config import ControllerConfig
-from .kanban import CommandError
+from .errors import (
+    ControllerFatalError,
+    DependencyAuthError,
+    DependencyContractError,
+    DependencyError,
+    DependencyRateLimitedError,
+    DependencyTransientError,
+    ErrorContext,
+    MergeBlocked,
+)
 from .models import (
     ArtifactBaseline,
     CompletionMetadata,
     FeishuOrigin,
+    GatePhase,
+    Outcome,
     ProjectFacts,
     RunRecord,
     SourceFacts,
@@ -36,11 +47,31 @@ GATE_RE = re.compile(
     r"\s+artifact=(?P<artifact>\S+)\s+head=(?P<head>\S+)"
     r"\s+test=(?P<test>\S+)\s+task=(?P<task>\S+)"
 )
+SEMANTIC_GATE_RE = re.compile(
+    r"HOLLYSYS-SEMANTIC-GATE:\s+v=1\s+run=(?P<run>\S+)"
+    r"\s+phase=(?P<phase>\S+)\s+decision=(?P<decision>\S+)"
+    r"\s+artifact=(?P<artifact>[0-9a-f]{40})"
+    r"\s+digest=(?P<digest>[0-9a-f]{64})"
+)
 FORCED_ADVANCE_RE = re.compile(
     r"HOLLYSYS-FORCED-ADVANCE:\s+v=1\s+run=(?P<run>\S+)"
     r"\s+phase=(?P<phase>spec|plan|tasks)\s+review_limit=(?P<limit>[1-9][0-9]*)"
     r"\s+task=(?P<task>\S+)"
 )
+TASK_HEADER_RE = re.compile(
+    r"(?m)^- \[ \] (?P<task_id>T[0-9]{3,})\b[^\n]*$"
+)
+TASK_DEPENDENCY_RE = re.compile(
+    r"(?m)^\s+- depends_on[：:]\s*\[(?P<dependencies>[^\]]*)\]\s*$"
+)
+TASK_ACTION_RE = re.compile(
+    r"(?m)^\s+- 动作[：:]\s*(?P<action>reuse|modify|extend|create)\s*$"
+)
+PROJECT_PATH_RE = re.compile(
+    r"^[A-Za-z0-9_][A-Za-z0-9_.-]*"
+    r"(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)+$"
+)
+CONTROLLER_MERGE_SUBMITTED_FIELD = "_hollysys_controller_merge_submitted_v3"
 
 
 @dataclass(frozen=True)
@@ -59,7 +90,29 @@ class GitLabClient:
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
-        env["GITLAB_HOST"] = self.config.gitlab_host
+        for key in (
+            "GLAB_TOKEN",
+            "CI_JOB_TOKEN",
+            "PRIVATE_TOKEN",
+            "GIT_TRACE",
+            "GIT_TRACE_PACKET",
+            "GIT_TRACE_CURL",
+            "GIT_CURL_VERBOSE",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+        ):
+            env.pop(key, None)
+        for key in tuple(env):
+            if key.startswith("GIT_"):
+                env.pop(key, None)
+        env["GITLAB_HOST"] = self.config.gitlab_base_url
         env["GITLAB_TOKEN"] = self.config.read_token()
         env["GLAB_CHECK_UPDATE"] = "false"
         return env
@@ -72,19 +125,109 @@ class GitLabClient:
         input_text: str | None = None,
         tolerate: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            env=self._env(),
-            input=input_text,
-            text=True,
-            capture_output=True,
-            timeout=self.config.command_timeout_seconds,
-            check=False,
-        )
+        try:
+            env = self._env()
+        except (OSError, ValueError) as exc:
+            raise ControllerFatalError(
+                "controller_gitlab_token_invalid"
+            ) from exc
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                input=input_text,
+                text=True,
+                capture_output=True,
+                timeout=self.config.command_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            endpoint = (
+                str(command[2])
+                if len(command) >= 3
+                and command[0] == self.config.glab_command
+                and command[1] == "api"
+                else command[0]
+            )
+            raise DependencyTransientError(
+                f"GitLab command timed out: {endpoint}",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=endpoint,
+                    error_code="timeout",
+                ),
+            ) from exc
+        except OSError as exc:
+            raise ControllerFatalError(
+                f"gitlab_command_unavailable:{command[0]}"
+            ) from exc
         if result.returncode != 0 and not tolerate:
-            raise CommandError(command, result.returncode, result.stderr)
+            if (
+                len(command) >= 3
+                and command[0] == self.config.glab_command
+                and command[1] == "api"
+            ):
+                raise self._api_error(str(command[2]), result)
+            raise ControllerFatalError(
+                f"unclassified_gitlab_command_failure:{command[0]}"
+            )
         return result
+
+    @staticmethod
+    def _http_status(text: str) -> int | None:
+        matches = re.findall(r"\b([1-5][0-9]{2})\b", text)
+        for candidate in reversed(matches):
+            value = int(candidate)
+            if 400 <= value <= 599:
+                return value
+        return None
+
+    @staticmethod
+    def _retry_after(text: str) -> int | None:
+        match = re.search(
+            r"retry-after(?:\s*[:=]\s*|\s+)([0-9]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return int(match.group(1)) if match else None
+
+    def _api_error(
+        self,
+        endpoint: str,
+        result: subprocess.CompletedProcess[str],
+    ) -> DependencyError:
+        summary = (result.stderr or result.stdout or "GitLab command failed").strip()
+        status = self._http_status(summary)
+        context = ErrorContext(
+            dependency="gitlab",
+            endpoint=endpoint,
+            status_code=status,
+            retry_after_seconds=self._retry_after(summary),
+        )
+        safe = self._redact(summary)[:1000]
+        if status in {401, 403}:
+            return DependencyAuthError(safe, context=context)
+        if status == 429:
+            return DependencyRateLimitedError(safe, context=context)
+        if status in {400, 404, 409, 422}:
+            return DependencyContractError(safe, context=context)
+        return DependencyTransientError(safe, context=context)
+
+    def _redact(self, text: str) -> str:
+        safe = text
+        try:
+            token = self.config.read_token()
+        except (OSError, ValueError):
+            token = ""
+        if token:
+            safe = safe.replace(token, "[REDACTED]")
+        safe = re.sub(
+            r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)\S+",
+            r"\1[REDACTED]",
+            safe,
+        )
+        return safe
 
     def api(
         self,
@@ -98,19 +241,44 @@ class GitLabClient:
             "api",
             endpoint,
             "--hostname",
-            self.config.gitlab_host,
+            self.config.gitlab_hostname,
             "--method",
             method,
         ]
         for key, value in (fields or {}).items():
             rendered = str(value).lower() if isinstance(value, bool) else value
             command.extend(["--field", f"{key}={rendered}"])
-        result = self._run(command)
-        return json.loads(result.stdout)
+        result = self._run(command, tolerate=True)
+        if result.returncode != 0:
+            raise self._api_error(endpoint, result)
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise DependencyContractError(
+                f"GitLab returned invalid JSON for {endpoint}",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=endpoint,
+                    error_code="invalid_json",
+                ),
+            ) from exc
 
     @staticmethod
     def _project_endpoint(project_id: int | str) -> str:
         return f"projects/{quote(str(project_id), safe='')}"
+
+    @staticmethod
+    def _require_object(value: object, endpoint: str) -> dict:
+        if isinstance(value, dict):
+            return value
+        raise DependencyContractError(
+            f"GitLab returned a non-object response for {endpoint}",
+            context=ErrorContext(
+                dependency="gitlab",
+                endpoint=endpoint,
+                error_code="invalid_object_response",
+            ),
+        )
 
     def paginated_list(self, endpoint: str) -> list[dict]:
         items: list[dict] = []
@@ -119,7 +287,14 @@ class GitLabClient:
         while True:
             response = self.api(f"{endpoint}{separator}per_page=100&page={page}")
             if not isinstance(response, list):
-                raise TypeError(f"GitLab list response is invalid for {endpoint}")
+                raise DependencyContractError(
+                    f"GitLab list response is invalid for {endpoint}",
+                    context=ErrorContext(
+                        dependency="gitlab",
+                        endpoint=endpoint,
+                        error_code="invalid_list_response",
+                    ),
+                )
             page_items = [item for item in response if isinstance(item, dict)]
             items.extend(page_items)
             if len(response) < 100:
@@ -135,11 +310,26 @@ class GitLabClient:
     ) -> StartFacts:
         blob = urlparse(prd_blob_url)
         mr_url = urlparse(prd_mr_url)
-        if blob.scheme != "https" or mr_url.scheme != "https":
-            raise ValueError("GitLab URLs must use HTTPS")
+        for label, parsed in (("PRD", blob), ("MR", mr_url)):
+            try:
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(f"{label} GitLab URL has an invalid port") from exc
+            if (
+                parsed.scheme != "https"
+                or parsed.username
+                or parsed.password
+                or port is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    f"{label} GitLab URL must be a credential-free HTTPS "
+                    "origin URL without port, query, or fragment"
+                )
         if blob.hostname != mr_url.hostname:
             raise ValueError("PRD and MR URLs use different hosts")
-        if self.config.gitlab_host and blob.hostname != self.config.gitlab_host:
+        if self.config.gitlab_hostname and blob.hostname != self.config.gitlab_hostname:
             raise ValueError("URL host is not the configured GitLab host")
         blob_match = PRD_URL_RE.match(blob.path)
         mr_match = MR_URL_RE.match(mr_url.path)
@@ -148,38 +338,91 @@ class GitLabClient:
                 "PRD URL must be a blob/raw URL pinned to a 40-character commit "
                 "and MR URL must end in /-/merge_requests/<iid>"
             )
-        project_path = unquote(blob_match.group("project"))
-        if project_path != unquote(mr_match.group("project")):
+        blob_project = blob_match.group("project")
+        mr_project = mr_match.group("project")
+        project_path = unquote(blob_project)
+        if (
+            project_path != blob_project
+            or unquote(mr_project) != mr_project
+            or not PROJECT_PATH_RE.fullmatch(project_path)
+            or any(part in {".", ".."} for part in project_path.split("/"))
+        ):
+            raise ValueError("GitLab project path is not canonical")
+        if project_path != mr_project:
             raise ValueError("PRD and MR URLs refer to different projects")
         if self.config.allowed_groups and not any(
-            project_path == group or project_path.startswith(f"{group}/")
+            project_path.startswith(f"{group}/")
             for group in self.config.allowed_groups
         ):
             raise ValueError(f"project {project_path} is outside allowed groups")
+        prd_path = unquote(blob_match.group("path"))
+        if (
+            prd_path.startswith("/")
+            or "\0" in prd_path
+            or any(part in {"", ".", ".."} for part in prd_path.split("/"))
+        ):
+            raise ValueError("PRD path is not a canonical repository path")
 
-        project = self.api(self._project_endpoint(project_path))
-        assert isinstance(project, dict)
+        project_endpoint = self._project_endpoint(project_path)
+        project = self._require_object(
+            self.api(project_endpoint),
+            project_endpoint,
+        )
         if project.get("archived"):
             raise ValueError(f"project {project_path} is archived")
-        project_id = int(project["id"])
-        default_branch = str(project["default_branch"])
+        try:
+            project_id = int(project["id"])
+            default_branch = str(project["default_branch"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DependencyContractError(
+                "GitLab project response lacks id/default_branch",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=project_endpoint,
+                    error_code="invalid_project_response",
+                ),
+            ) from exc
+        if project_id <= 0 or not default_branch:
+            raise DependencyContractError(
+                "GitLab project response has invalid id/default_branch",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=project_endpoint,
+                    error_code="invalid_project_response",
+                ),
+            )
         mr_iid = int(mr_match.group("iid"))
-        mr = self.api(f"{self._project_endpoint(project_id)}/merge_requests/{mr_iid}")
-        assert isinstance(mr, dict)
+        mr_endpoint = (
+            f"{self._project_endpoint(project_id)}/merge_requests/{mr_iid}"
+        )
+        mr = self._require_object(self.api(mr_endpoint), mr_endpoint)
         if mr.get("state") != "merged":
             raise ValueError("the PRD merge request is not merged")
         if mr.get("target_branch") != default_branch:
             raise ValueError("the PRD MR was not merged to the current default branch")
 
-        prd_path = unquote(blob_match.group("path"))
         prd_sha = blob_match.group("sha")
-        changes = self.api(
-            f"{self._project_endpoint(project_id)}/merge_requests/{mr_iid}/changes"
+        changes_endpoint = (
+            f"{self._project_endpoint(project_id)}/merge_requests/"
+            f"{mr_iid}/changes"
         )
-        assert isinstance(changes, dict)
+        changes = self._require_object(
+            self.api(changes_endpoint),
+            changes_endpoint,
+        )
+        raw_changes = changes.get("changes")
+        if not isinstance(raw_changes, list):
+            raise DependencyContractError(
+                "GitLab MR changes response lacks a changes list",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=changes_endpoint,
+                    error_code="invalid_changes_response",
+                ),
+            )
         changed_paths = {
             str(item.get("new_path"))
-            for item in changes.get("changes", [])
+            for item in raw_changes
             if isinstance(item, dict)
         }
         if prd_path not in changed_paths:
@@ -187,26 +430,62 @@ class GitLabClient:
                 "the merged PRD MR does not contain the requested PRD path"
             )
 
-        requested_file = self.file(project_id, prd_path, prd_sha)
-        current_file = self.file(project_id, prd_path, default_branch)
-        if requested_file.get("blob_id") != current_file.get("blob_id"):
-            raise ValueError(
-                "the PRD on the default branch no longer equals the requested version"
-            )
-        branch = self.api(
+        branch_endpoint = (
             f"{self._project_endpoint(project_id)}/repository/branches/"
             f"{quote(default_branch, safe='')}"
         )
-        assert isinstance(branch, dict)
-        base_sha = str(branch["commit"]["id"])
+        branch = self._require_object(
+            self.api(branch_endpoint),
+            branch_endpoint,
+        )
+        try:
+            base_sha = str(branch["commit"]["id"])
+        except (KeyError, TypeError) as exc:
+            raise DependencyContractError(
+                "GitLab branch response lacks commit id",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=branch_endpoint,
+                    error_code="invalid_branch_response",
+                ),
+            ) from exc
+        if not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+            raise DependencyContractError(
+                "GitLab branch response has an invalid commit id",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=branch_endpoint,
+                    error_code="invalid_branch_response",
+                ),
+            )
 
+        requested_file = self.file(project_id, prd_path, prd_sha)
+        current_file = self.file(project_id, prd_path, base_sha)
+        requested_blob = str(requested_file.get("blob_id") or "")
+        current_blob = str(current_file.get("blob_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", requested_blob) or not re.fullmatch(
+            r"[0-9a-f]{40}",
+            current_blob,
+        ):
+            raise DependencyContractError(
+                "GitLab file response has an invalid blob id",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="repository/files",
+                    error_code="invalid_file_response",
+                ),
+            )
+        if requested_blob != current_blob:
+            raise ValueError(
+                "the PRD on the default branch no longer equals the requested version"
+            )
         identity = f"{blob.hostname}|{project_id}|{prd_path}|{prd_sha}".encode()
         digest = hashlib.sha256(identity).digest()
         encoded = base64.b32encode(digest).decode("ascii").lower().rstrip("=")
         run_key = f"hollysys-{encoded[:20]}"
-        repo_slug = str(project["path"]).lower()
+        repo_slug = project_path.rsplit("/", 1)[1].lower()
         prd_name = Path(prd_path).stem.lower()
-        safe_name = re.sub(r"[^a-z0-9._-]+", "-", prd_name).strip("-") or "prd"
+        safe_name = re.sub(r"[^a-z0-9]+", "-", prd_name).strip("-") or "prd"
         checkout = self.config.projects_root / f"p{project_id}-{repo_slug}"
         worktree = self.config.projects_root / "worktrees" / f"p{project_id}" / run_key
         delivery_branch = (
@@ -227,7 +506,7 @@ class GitLabClient:
             source=SourceFacts(
                 prd_path=prd_path,
                 prd_commit_sha=prd_sha,
-                prd_blob_sha=str(requested_file["blob_id"]),
+                prd_blob_sha=requested_blob,
                 prd_blob_url=prd_blob_url,
                 prd_mr_url=prd_mr_url,
             ),
@@ -249,7 +528,14 @@ class GitLabClient:
             f"{quote(path, safe='')}?ref={quote(ref, safe='')}"
         )
         if not isinstance(result, dict):
-            raise TypeError(f"unexpected file response for {path}")
+            raise DependencyContractError(
+                f"unexpected file response for {path}",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="repository/files",
+                    error_code="invalid_file_response",
+                ),
+            )
         return result
 
     def ensure_workspace(self, run: RunRecord, base_sha: str) -> None:
@@ -262,7 +548,9 @@ class GitLabClient:
                 raise ValueError(
                     f"checkout path is non-empty and not a Git repo: {checkout}"
                 )
-            clone_url = f"https://{run.project.host}/{run.project.project_path}.git"
+            clone_url = (
+                f"{self.config.gitlab_base_url}/{run.project.project_path}.git"
+            )
             self._git(
                 checkout.parent,
                 ["clone", clone_url, str(checkout)],
@@ -271,10 +559,14 @@ class GitLabClient:
         expected_suffix = f"/{run.project.project_path}.git"
         parsed_origin = urlparse(origin)
         if (
-            parsed_origin.hostname != run.project.host
-            or not parsed_origin.path.rstrip("/").endswith(expected_suffix.rstrip("/"))
+            parsed_origin.scheme != "https"
+            or parsed_origin.hostname != run.project.host
+            or parsed_origin.port is not None
+            or parsed_origin.path.rstrip("/") != expected_suffix.rstrip("/")
             or parsed_origin.username
             or parsed_origin.password
+            or parsed_origin.query
+            or parsed_origin.fragment
         ):
             raise ValueError(
                 "checkout origin is not the validated token-free project URL"
@@ -292,6 +584,17 @@ class GitLabClient:
             if actual != run.workspace.branch:
                 raise ValueError(
                     f"existing worktree uses {actual!r}, expected {run.workspace.branch!r}"
+                )
+            common_raw = self._git(
+                worktree,
+                ["rev-parse", "--git-common-dir"],
+            ).stdout.strip()
+            common_path = Path(common_raw)
+            if not common_path.is_absolute():
+                common_path = worktree / common_path
+            if common_path.resolve() != (checkout / ".git").resolve():
+                raise ValueError(
+                    "existing worktree is not attached to the validated checkout"
                 )
             return
 
@@ -321,6 +624,40 @@ class GitLabClient:
                 ],
             )
 
+    def local_workspace_state(self, run: RunRecord) -> dict:
+        worktree = Path(run.workspace.worktree)
+        if not worktree.is_dir():
+            return {
+                "ok": False,
+                "worktree": str(worktree),
+                "error_code": "worktree_missing",
+            }
+        branch = self._git(
+            worktree,
+            ["branch", "--show-current"],
+            tolerate=True,
+        )
+        head = self._git(
+            worktree,
+            ["rev-parse", "HEAD"],
+            tolerate=True,
+        )
+        branch_name = branch.stdout.strip()
+        head_sha = head.stdout.strip()
+        ok = (
+            branch.returncode == 0
+            and head.returncode == 0
+            and branch_name == run.workspace.branch
+            and bool(re.fullmatch(r"[0-9a-f]{40}", head_sha))
+        )
+        return {
+            "ok": ok,
+            "worktree": str(worktree),
+            "branch": branch_name or None,
+            "head_sha": head_sha or None,
+            "error_code": None if ok else "workspace_identity_mismatch",
+        }
+
     def validate_repository_evidence(
         self,
         run: RunRecord,
@@ -347,6 +684,276 @@ class GitLabClient:
                     f"repository evidence path does not exist at base: {path}"
                 )
 
+    def validate_author_completion(
+        self,
+        run: RunRecord,
+        metadata: CompletionMetadata,
+    ) -> dict:
+        if (
+            metadata.stage
+            not in {
+                Stage.SPEC_WRITE,
+                Stage.PLAN_WRITE,
+                Stage.TASKS_WRITE,
+                Stage.IMPLEMENT,
+            }
+            or metadata.outcome != Outcome.PASS
+        ):
+            raise ValueError("completion is not an authoring pass")
+        if (
+            metadata.mr_iid is None
+            or metadata.mr_url is None
+            or metadata.head_sha is None
+        ):
+            raise ValueError("authoring pass lacks delivery MR/head identity")
+        mr = self.delivery_mr(run, metadata.mr_iid)
+        if mr is None:
+            raise ValueError("delivery MR does not exist")
+        if (
+            mr.get("state") != "opened"
+            or mr.get("source_branch") != run.workspace.branch
+            or mr.get("target_branch") != run.workspace.target_branch
+            or str(mr.get("web_url") or "") != str(metadata.mr_url)
+            or str(mr.get("sha") or "") != metadata.head_sha
+        ):
+            raise ValueError(
+                "authoring pass is not bound to the current shared delivery MR/head"
+            )
+        return mr
+
+    def validate_semantic_gate(
+        self,
+        run: RunRecord,
+        metadata: CompletionMetadata,
+    ) -> None:
+        if metadata.gate_phase is None:
+            return
+        ref = metadata.gate_artifact_commit_sha
+        digest = metadata.gate_artifact_digest
+        if ref is None or digest is None:
+            raise ValueError("semantic gate is missing frozen artifact identity")
+        paths = sorted(metadata.gate_artifact_paths)
+        if self.artifact_digest(run.project.project_id, ref, paths) != digest:
+            raise ValueError("semantic gate artifact digest drifted")
+
+        documents: list[str] = []
+        for path in paths:
+            file_result = self.file(run.project.project_id, path, ref)
+            if str(file_result.get("encoding") or "base64") != "base64":
+                raise ValueError(f"unsupported GitLab file encoding for {path}")
+            try:
+                documents.append(
+                    base64.b64decode(
+                        "".join(
+                            str(file_result.get("content") or "").split()
+                        ),
+                        validate=True,
+                    ).decode("utf-8")
+                )
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise ValueError(
+                    f"semantic gate artifact is not valid UTF-8: {path}"
+                ) from exc
+        frozen_text = "\n".join(documents)
+        if metadata.gate_phase == GatePhase.IMPLEMENTATION_ENTRY:
+            self._validate_task_graph(documents)
+        for requirement_id in metadata.requirement_ids:
+            if not self._contains_reference(frozen_text, requirement_id):
+                raise ValueError(
+                    f"semantic gate requirement does not exist: {requirement_id}"
+                )
+        for contract_ref in metadata.contract_refs:
+            if not self._contains_reference(frozen_text, contract_ref):
+                raise ValueError(
+                    f"semantic gate contract does not exist: {contract_ref}"
+                )
+
+        reviewer_match = re.fullmatch(
+            r"id:([1-9][0-9]*)",
+            str(metadata.gate_reviewer or ""),
+        )
+        if reviewer_match is None:
+            raise ValueError("semantic gate reviewer must use stable id:<numeric-id>")
+        reviewer_id = int(reviewer_match.group(1))
+        reviewer_note_found = False
+        for evidence_ref in metadata.gate_evidence_refs:
+            parsed = urlparse(evidence_ref)
+            if parsed.scheme:
+                expected_prefix = f"/{run.project.project_path}/"
+                decoded_path = unquote(parsed.path)
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname != run.project.host
+                    or parsed.username
+                    or parsed.password
+                    or parsed.port is not None
+                    or decoded_path != parsed.path
+                    or any(
+                        part in {"", ".", ".."}
+                        for part in PurePosixPath(parsed.path).parts[1:]
+                    )
+                    or not parsed.path.startswith(expected_prefix)
+                ):
+                    raise ValueError(
+                        "semantic gate external evidence must be a validated "
+                        "project HTTPS reference"
+                    )
+                note_match = re.fullmatch(
+                    re.escape(expected_prefix)
+                    + r"-/merge_requests/([1-9][0-9]*)/?",
+                    parsed.path,
+                )
+                fragment_match = re.fullmatch(
+                    r"note_([1-9][0-9]*)",
+                    parsed.fragment,
+                )
+                if note_match is None or fragment_match is None:
+                    raise ValueError(
+                        "semantic gate external evidence must reference an "
+                        "exact delivery MR note"
+                    )
+                mr_iid = int(note_match.group(1))
+                self.delivery_mr(run, mr_iid)
+                note_endpoint = (
+                    f"{self._project_endpoint(run.project.project_id)}/"
+                    f"merge_requests/{mr_iid}/notes/"
+                    f"{int(fragment_match.group(1))}"
+                )
+                note = self._require_object(
+                    self.api(note_endpoint),
+                    note_endpoint,
+                )
+                author = note.get("author")
+                marker = SEMANTIC_GATE_RE.search(
+                    str(note.get("body") or "")
+                )
+                if (
+                    not isinstance(author, dict)
+                    or int(author.get("id") or 0) != reviewer_id
+                    or marker is None
+                    or marker.group("run") != run.run_key
+                    or marker.group("phase") != metadata.gate_phase.value
+                    or marker.group("decision") != metadata.gate_decision.value
+                    or marker.group("artifact")
+                    != metadata.gate_artifact_commit_sha
+                    or marker.group("digest")
+                    != metadata.gate_artifact_digest
+                ):
+                    raise ValueError(
+                        "semantic gate note author or frozen identity does not match"
+                    )
+                reviewer_note_found = True
+                continue
+            evidence_path = PurePosixPath(evidence_ref)
+            if (
+                evidence_path.is_absolute()
+                or ".." in evidence_path.parts
+                or evidence_ref in {"", "."}
+            ):
+                raise ValueError("semantic gate evidence path is unsafe")
+            self.file(run.project.project_id, evidence_ref, ref)
+        if not reviewer_note_found:
+            raise ValueError(
+                "semantic gate requires an authored delivery MR note reference"
+            )
+
+    @staticmethod
+    def _contains_reference(text: str, reference: str) -> bool:
+        boundary = r"A-Za-z0-9_.:/-"
+        return (
+            re.search(
+                rf"(?<![{boundary}]){re.escape(reference)}(?![{boundary}])",
+                text,
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _validate_task_graph(documents: list[str]) -> None:
+        tasks: dict[str, set[str]] = {}
+        for document in documents:
+            headers = list(TASK_HEADER_RE.finditer(document))
+            for index, header in enumerate(headers):
+                task_id = header.group("task_id")
+                if task_id in tasks:
+                    raise ValueError(
+                        f"TASKS contains duplicate task id: {task_id}"
+                    )
+                end = (
+                    headers[index + 1].start()
+                    if index + 1 < len(headers)
+                    else len(document)
+                )
+                block = document[header.start() : end]
+                dependencies = list(TASK_DEPENDENCY_RE.finditer(block))
+                if len(dependencies) != 1:
+                    raise ValueError(
+                        f"TASKS task {task_id} must define exactly one depends_on"
+                    )
+                dependency_text = dependencies[0].group("dependencies").strip()
+                dependency_ids = set(re.findall(r"\bT[0-9]{3,}\b", dependency_text))
+                residue = re.sub(r"\bT[0-9]{3,}\b", "", dependency_text)
+                residue = re.sub(r"[\s,，、]+", "", residue)
+                if residue:
+                    raise ValueError(
+                        f"TASKS task {task_id} has malformed depends_on"
+                    )
+                actions = list(TASK_ACTION_RE.finditer(block))
+                if len(actions) != 1:
+                    raise ValueError(
+                        f"TASKS task {task_id} must define exactly one action"
+                    )
+                action = actions[0].group("action")
+                target_paths = re.findall(r"`([^`\n]+)`", block)
+                if action != "reuse" and any(
+                    GitLabClient._looks_like_frozen_upstream(path)
+                    for path in target_paths
+                ):
+                    raise ValueError(
+                        f"TASKS task {task_id} attempts to modify a frozen "
+                        "PRD/SPEC/PLAN artifact"
+                    )
+                tasks[task_id] = dependency_ids
+        if not tasks:
+            raise ValueError("implementation_entry TASKS contains no executable tasks")
+        for task_id, dependencies in tasks.items():
+            missing = sorted(dependencies - tasks.keys())
+            if missing:
+                raise ValueError(
+                    f"TASKS task {task_id} depends on missing tasks: "
+                    + ", ".join(missing)
+                )
+            if task_id in dependencies:
+                raise ValueError(f"TASKS task {task_id} depends on itself")
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(task_id: str) -> None:
+            if task_id in visiting:
+                raise ValueError(f"TASKS dependency cycle includes {task_id}")
+            if task_id in visited:
+                return
+            visiting.add(task_id)
+            for dependency in tasks[task_id]:
+                visit(dependency)
+            visiting.remove(task_id)
+            visited.add(task_id)
+
+        for task_id in sorted(tasks):
+            visit(task_id)
+
+    @staticmethod
+    def _looks_like_frozen_upstream(path: str) -> bool:
+        normalized = path.strip().lstrip("./").lower()
+        return (
+            normalized.startswith(("specs/", "plans/", "prds/"))
+            or "/specs/" in normalized
+            or "/plans/" in normalized
+            or "/prds/" in normalized
+            or normalized.endswith(("/spec.md", "/plan.md", "/prd.md"))
+        )
+
     def _git(
         self, cwd: Path, args: list[str], tolerate: bool = False
     ) -> subprocess.CompletedProcess[str]:
@@ -366,34 +973,123 @@ class GitLabClient:
             env.update(
                 {
                     "GIT_ASKPASS": str(askpass),
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1",
                     "GIT_TERMINAL_PROMPT": "0",
                     "HOLLYSYS_GIT_ASKPASS_TOKEN": env["GITLAB_TOKEN"],
                 }
             )
-            result = subprocess.run(
-                ["git", *args],
-                cwd=cwd,
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=self.config.command_timeout_seconds,
-                check=False,
-            )
+            try:
+                result = subprocess.run(
+                    [self.config.system_git_command, *args],
+                    cwd=cwd,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.config.command_timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                if args and args[0] in {
+                    "clone",
+                    "fetch",
+                    "pull",
+                    "push",
+                    "ls-remote",
+                }:
+                    raise DependencyTransientError(
+                        f"Git HTTPS operation timed out: {args[0]}",
+                        context=ErrorContext(
+                            dependency="gitlab",
+                            endpoint=f"git:{args[0]}",
+                            error_code="timeout",
+                        ),
+                    ) from exc
+                raise ControllerFatalError(
+                    f"local_git_operation_timed_out:{args[0] if args else 'unknown'}"
+                ) from exc
+            except OSError as exc:
+                raise ControllerFatalError(
+                    f"system_git_unavailable:{self.config.system_git_command}"
+                ) from exc
         if result.returncode != 0 and not tolerate:
-            raise CommandError(["git", *args], result.returncode, result.stderr)
+            operation = args[0] if args else "unknown"
+            summary = self._redact(
+                result.stderr or result.stdout or "Git operation failed"
+            )[:1000]
+            context = ErrorContext(
+                dependency="gitlab",
+                endpoint=f"git:{operation}",
+                error_code="git_https_failed",
+            )
+            lowered = summary.lower()
+            if operation in {"clone", "fetch", "pull", "push", "ls-remote"}:
+                if (
+                    "authentication failed" in lowered
+                    or "access denied" in lowered
+                    or "401" in lowered
+                    or "403" in lowered
+                ):
+                    raise DependencyAuthError(summary, context=context)
+                if "429" in lowered or "too many requests" in lowered:
+                    raise DependencyRateLimitedError(
+                        summary,
+                        context=ErrorContext(
+                            dependency="gitlab",
+                            endpoint=f"git:{operation}",
+                            retry_after_seconds=self._retry_after(summary),
+                            error_code="rate_limited",
+                        ),
+                    )
+                if any(
+                    marker in lowered
+                    for marker in (
+                        "could not resolve host",
+                        "failed to connect",
+                        "connection timed out",
+                        "connection reset",
+                        "tls",
+                        "ssl",
+                        "unexpected eof",
+                        "gnutls",
+                        "500",
+                        "502",
+                        "503",
+                        "504",
+                    )
+                ):
+                    raise DependencyTransientError(summary, context=context)
+                raise DependencyContractError(summary, context=context)
+            raise ControllerFatalError(f"local_git_operation_failed:{operation}")
         return result
 
     def delivery_mr(self, run: RunRecord, mr_iid: int | None = None) -> dict | None:
         project = self._project_endpoint(run.project.project_id)
         if mr_iid is not None:
-            result = self.api(f"{project}/merge_requests/{mr_iid}")
-            return result if isinstance(result, dict) else None
-        results = self.api(
+            endpoint = f"{project}/merge_requests/{mr_iid}"
+            mr = self._require_object(self.api(endpoint), endpoint)
+            if (
+                mr.get("source_branch") != run.workspace.branch
+                or mr.get("target_branch") != run.workspace.target_branch
+            ):
+                raise ValueError(
+                    "delivery MR does not belong to the run branch/target"
+                )
+            return mr
+        endpoint = (
             f"{project}/merge_requests?source_branch="
             f"{quote(run.workspace.branch, safe='')}&scope=all&per_page=20"
         )
+        results = self.api(endpoint)
         if not isinstance(results, list):
-            return None
+            raise DependencyContractError(
+                "GitLab delivery MR list is not an array",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=endpoint,
+                    error_code="invalid_list_response",
+                ),
+            )
         matches = [
             item
             for item in results
@@ -402,7 +1098,14 @@ class GitLabClient:
             and item.get("target_branch") == run.workspace.target_branch
         ]
         if len(matches) > 1:
-            raise RuntimeError("more than one delivery MR exists for the run branch")
+            raise DependencyContractError(
+                "more than one delivery MR exists for the run branch",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="merge_requests",
+                    error_code="multiple_delivery_mrs",
+                ),
+            )
         return matches[0] if matches else None
 
     def abort_delivery(
@@ -421,6 +1124,7 @@ class GitLabClient:
                 "state": "merged",
                 "iid": mr.get("iid"),
                 "web_url": mr.get("web_url"),
+                "sha": mr.get("sha"),
                 "merge_commit_sha": mr.get("merge_commit_sha"),
             }
         iid = int(mr["iid"])
@@ -445,12 +1149,25 @@ class GitLabClient:
             )
         current = self.delivery_mr(run, iid)
         if current and current.get("state") == "opened":
-            current = self.api(
-                f"{project}/merge_requests/{iid}",
-                method="PUT",
-                fields={"state_event": "close"},
+            endpoint = f"{project}/merge_requests/{iid}"
+            current = self._require_object(
+                self.api(
+                    endpoint,
+                    method="PUT",
+                    fields={"state_event": "close"},
+                ),
+                endpoint,
             )
-        return current if isinstance(current, dict) else mr
+        if current is None or current.get("state") not in {"closed", "merged"}:
+            raise DependencyContractError(
+                "GitLab did not confirm delivery MR closure",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=f"{project}/merge_requests/{iid}",
+                    error_code="abort_close_not_confirmed",
+                ),
+            )
+        return current
 
     def validate_gate(self, run: RunRecord, metadata: CompletionMetadata) -> str | None:
         if metadata.stage not in {
@@ -614,7 +1331,7 @@ class GitLabClient:
                     "&recursive=true&per_page=100"
                 ),
                 "--hostname",
-                self.config.gitlab_host,
+                self.config.gitlab_hostname,
                 "--paginate",
                 "--output",
                 "ndjson",
@@ -776,11 +1493,21 @@ class GitLabClient:
     ) -> tuple[dict, str]:
         mr = self.delivery_mr(run, mr_iid)
         if mr is None:
-            raise ValueError("delivery MR does not exist")
+            raise MergeBlocked("not_mergeable", "delivery MR does not exist")
         if mr.get("state") == "merged":
-            return mr, str(mr.get("merge_commit_sha") or "")
+            return mr, str(mr.get("sha") or "")
+        if mr.get("state") != "opened":
+            raise MergeBlocked(
+                "not_mergeable",
+                f"delivery MR state is {mr.get('state') or 'unknown'}",
+                url=str(mr.get("web_url") or "") or None,
+            )
         if mr.get("draft") or mr.get("work_in_progress"):
-            raise ValueError("delivery MR is still draft")
+            raise MergeBlocked(
+                "draft",
+                "delivery MR is still draft",
+                url=str(mr.get("web_url") or "") or None,
+            )
         head = str(mr.get("sha") or "")
         if not head or test.head_sha != head or code_review.head_sha != head:
             raise ValueError("test and code-review are not valid for current MR head")
@@ -794,20 +1521,66 @@ class GitLabClient:
             raise ValueError(
                 "test and code-review must be published by independent GitLab users"
             )
-        merge_status = str(mr.get("detailed_merge_status") or mr.get("merge_status"))
-        if merge_status not in {"mergeable", "can_be_merged"}:
-            raise ValueError(f"MR is not mergeable: {merge_status}")
-        if self.config.required_pipeline:
-            pipelines = self.api(
-                f"{self._project_endpoint(run.project.project_id)}/pipelines"
-                f"?sha={head}&per_page=1"
+        pipelines = self.api(
+            f"{self._project_endpoint(run.project.project_id)}/pipelines"
+            f"?sha={quote(head, safe='')}"
+            f"&ref={quote(run.workspace.branch, safe='')}"
+            "&order_by=id&sort=desc&per_page=1"
+        )
+        if not isinstance(pipelines, list):
+            raise DependencyContractError(
+                "GitLab pipeline list is not an array",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="pipelines",
+                    error_code="invalid_pipeline_response",
+                ),
             )
-            if (
-                not isinstance(pipelines, list)
-                or not pipelines
-                or pipelines[0].get("status") != "success"
-            ):
-                raise ValueError("required pipeline is not successful for checked head")
+        pipeline = pipelines[0] if pipelines else None
+        if isinstance(pipeline, dict) and (
+            str(pipeline.get("sha") or "") != head
+            or str(pipeline.get("ref") or "") != run.workspace.branch
+        ):
+            raise DependencyContractError(
+                "GitLab pipeline response is not bound to the delivery head/ref",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="pipelines",
+                    error_code="pipeline_identity_mismatch",
+                ),
+            )
+        pipeline_status = (
+            str(pipeline.get("status") or "") if isinstance(pipeline, dict) else ""
+        )
+        pipeline_url = (
+            str(pipeline.get("web_url") or "") or None
+            if isinstance(pipeline, dict)
+            else None
+        )
+        if pipeline_status in {"failed", "canceled"}:
+            raise MergeBlocked(
+                "pipeline_failed",
+                f"checked-head pipeline is {pipeline_status}",
+                url=pipeline_url,
+                immediate_exception=True,
+            )
+        if pipeline_status == "skipped":
+            raise MergeBlocked(
+                "pipeline_skipped",
+                "checked-head pipeline is skipped",
+                url=pipeline_url,
+                immediate_exception=True,
+            )
+        if pipeline_status != "success":
+            raise MergeBlocked(
+                "pipeline_pending",
+                (
+                    f"checked-head pipeline is {pipeline_status}"
+                    if pipeline_status
+                    else "checked-head pipeline does not exist"
+                ),
+                url=pipeline_url,
+            )
         discussions = self.paginated_list(
             f"{self._project_endpoint(run.project.project_id)}/merge_requests/"
             f"{mr_iid}/discussions"
@@ -821,13 +1594,45 @@ class GitLabClient:
                     and note.get("resolvable")
                     and not note.get("resolved")
                 ):
-                    raise ValueError("MR has unresolved blocking discussions")
+                    note_id = note.get("id")
+                    base_url = str(mr.get("web_url") or "")
+                    note_url = (
+                        f"{base_url}#note_{note_id}"
+                        if base_url and note_id is not None
+                        else base_url or None
+                    )
+                    author = note.get("author") or {}
+                    raise MergeBlocked(
+                        "discussion_unresolved",
+                        "MR has unresolved blocking discussions",
+                        url=note_url,
+                        owner=str(author.get("username") or "") or None,
+                        updated_at=str(note.get("updated_at") or "") or None,
+                    )
+        merge_status = str(mr.get("detailed_merge_status") or mr.get("merge_status"))
+        if merge_status not in {"mergeable", "can_be_merged"}:
+            if merge_status in {"not_approved", "approvals_missing"}:
+                kind = "approval_missing"
+            else:
+                kind = "not_mergeable"
+            raise MergeBlocked(
+                kind,
+                f"MR is not mergeable: {merge_status}",
+                url=str(mr.get("web_url") or "") or None,
+            )
         return mr, head
 
     def merge(self, run: RunRecord, mr_iid: int, checked_head: str) -> dict:
         mr = self.delivery_mr(run, mr_iid)
         if mr and mr.get("state") == "merged":
-            return mr
+            if str(mr.get("sha") or "") != checked_head:
+                raise CheckedHeadConflict(
+                    "merged MR head differs from checked head"
+                )
+            return {
+                **mr,
+                CONTROLLER_MERGE_SUBMITTED_FIELD: False,
+            }
         try:
             result = self.api(
                 f"{self._project_endpoint(run.project.project_id)}/merge_requests/"
@@ -835,20 +1640,47 @@ class GitLabClient:
                 method="PUT",
                 fields={"sha": checked_head},
             )
-        except CommandError as exc:
+        except DependencyError as exc:
             # The merge may have committed even if the client lost the
             # response. Re-read GitLab before deciding whether to retry.
-            current = self.delivery_mr(run, mr_iid)
+            try:
+                current = self.delivery_mr(run, mr_iid)
+            except DependencyError:
+                raise exc
             if current and current.get("state") == "merged":
-                return current
+                if str(current.get("sha") or "") != checked_head:
+                    raise CheckedHeadConflict(
+                        "merged MR head differs from checked head"
+                    ) from exc
+                return {
+                    **current,
+                    CONTROLLER_MERGE_SUBMITTED_FIELD: True,
+                }
             if current and str(current.get("sha") or "") != checked_head:
                 raise CheckedHeadConflict(
                     "MR head changed during checked-head merge"
                 ) from exc
             raise
         if not isinstance(result, dict) or result.get("state") != "merged":
-            raise RuntimeError("GitLab did not confirm the checked-head merge")
-        return result
+            raise DependencyContractError(
+                "GitLab did not confirm the checked-head merge",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="merge_requests/merge",
+                    error_code="merge_response_not_confirmed",
+                ),
+            )
+        if (
+            str(result.get("sha") or "") != checked_head
+            or int(result.get("iid") or 0) != mr_iid
+        ):
+            raise CheckedHeadConflict(
+                "GitLab merged a different MR head than the checked head"
+            )
+        return {
+            **result,
+            CONTROLLER_MERGE_SUBMITTED_FIELD: True,
+        }
 
     def health(self) -> dict:
         user = self.api("user")

@@ -8,9 +8,15 @@ import sys
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .config import ControllerConfig
+from .errors import (
+    ControllerFatalError,
+    DependencyContractError,
+    DependencyTransientError,
+    ErrorContext,
+)
 from .models import CardRecord, RunRecord
 
 CARD_MARKER = "[hollysys-controller-card:v3]"
@@ -82,6 +88,11 @@ def render_card_body(card: CardRecord) -> str:
         "worktree/branch/MR；完成时提交符合 "
         "`/opt/fleet/schemas/card-completion.schema.json` 的严格 metadata，并先运行 "
         "`hollysysctl validate-completion --card-id <当前卡> --metadata <json>`。\n\n"
+        "GitLab API 只使用当前 Profile 环境中的 `GITLAB_HOST/GITLAB_TOKEN` 调用 "
+        "`glab`，不得运行 `glab auth login`。远程 Git 只使用 PATH 中的受控 `git` "
+        "和 `https://green-git.hollysys.net/<allowed-group>/...`；禁止 SSH、明文 "
+        "HTTP、含 token 的 remote、持久 credential 或系统 Git 绕过路径。"
+        "只读 Profile 不得 push。\n\n"
         "真正需要人类时先写 `[human-block:v1]` 评论再使用 "
         "`kanban_block`；Controller outbox 负责原渠道通知。不得创建、链接或推进 "
         "其他正式卡片。environment/destructive_approval 阻塞还必须写明 "
@@ -124,36 +135,87 @@ class KanbanReader:
         return self.hermes_home / "kanban" / "boards" / board / "kanban.db"
 
     def discover_boards(self) -> dict[str, Path]:
-        result: dict[str, Path] = {}
-        default = self.board_db("default")
-        if default.is_file():
-            result["default"] = default
-        boards_root = self.hermes_home / "kanban" / "boards"
-        if boards_root.is_dir():
-            for path in sorted(boards_root.glob("*/kanban.db")):
-                if path.parent.name != "_archived":
-                    result[path.parent.name] = path
-        return result
+        try:
+            result: dict[str, Path] = {}
+            default = self.board_db("default")
+            if default.is_file():
+                result["default"] = default
+            boards_root = self.hermes_home / "kanban" / "boards"
+            if boards_root.is_dir():
+                for path in sorted(boards_root.glob("*/kanban.db")):
+                    if path.parent.name != "_archived":
+                        result[path.parent.name] = path
+            return result
+        except OSError as exc:
+            raise DependencyTransientError(
+                "Kanban board discovery failed",
+                context=ErrorContext(
+                    dependency="kanban",
+                    endpoint="boards:discover",
+                    error_code="filesystem_unavailable",
+                ),
+            ) from exc
 
     def _connect(self, board: str) -> sqlite3.Connection:
         path = self.board_db(board)
         if not path.is_file():
-            raise FileNotFoundError(path)
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+            raise DependencyTransientError(
+                f"Kanban board database is missing: {board}",
+                context=ErrorContext(
+                    dependency="kanban",
+                    endpoint=f"board:{board}",
+                    error_code="board_missing",
+                ),
+            )
+        try:
+            conn = sqlite3.connect(
+                f"file:{path}?mode=ro",
+                uri=True,
+                timeout=10,
+            )
+        except sqlite3.DatabaseError as exc:
+            self._raise_database_error(board, exc)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _raise_database_error(
+        board: str,
+        error: sqlite3.DatabaseError,
+    ) -> NoReturn:
+        summary = str(error)[:1000]
+        context = ErrorContext(
+            dependency="kanban",
+            endpoint=f"board:{board}",
+            error_code="database_error",
+        )
+        if any(
+            marker in summary.lower()
+            for marker in (
+                "locked",
+                "busy",
+                "unable to open",
+                "disk i/o",
+                "temporarily unavailable",
+            )
+        ):
+            raise DependencyTransientError(summary, context=context) from error
+        raise DependencyContractError(summary, context=context) from error
 
     def events_after(
         self, board: str, cursor: int, limit: int = 200
     ) -> list[EventRecord]:
-        with closing(self._connect(board)) as conn:
-            rows = conn.execute(
-                """
-                SELECT id, task_id, run_id, kind, payload, created_at
-                FROM task_events WHERE id > ? ORDER BY id LIMIT ?
-                """,
-                (cursor, limit),
-            ).fetchall()
+        try:
+            with closing(self._connect(board)) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, task_id, run_id, kind, payload, created_at
+                    FROM task_events WHERE id > ? ORDER BY id LIMIT ?
+                    """,
+                    (cursor, limit),
+                ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            self._raise_database_error(board, exc)
         events: list[EventRecord] = []
         for row in rows:
             payload = None
@@ -175,41 +237,50 @@ class KanbanReader:
         return events
 
     def task(self, board: str, task_id: str) -> TaskRecord | None:
-        with closing(self._connect(board)) as conn:
-            task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if task is None:
-                return None
-            run = conn.execute(
-                """
-                SELECT * FROM task_runs WHERE task_id=?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (task_id,),
-            ).fetchone()
-            parents = [
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id",
+        try:
+            with closing(self._connect(board)) as conn:
+                task = conn.execute(
+                    "SELECT * FROM tasks WHERE id=?",
                     (task_id,),
-                )
-            ]
-            comments = [
-                dict(row)
-                for row in conn.execute(
+                ).fetchone()
+                if task is None:
+                    return None
+                run = conn.execute(
                     """
-                    SELECT id, author, body, created_at FROM task_comments
-                    WHERE task_id=? ORDER BY id
+                    SELECT * FROM task_runs WHERE task_id=?
+                    ORDER BY id DESC LIMIT 1
                     """,
                     (task_id,),
-                )
-            ]
-            event_kinds = [
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
-                    (task_id,),
-                )
-            ]
+                ).fetchone()
+                parents = [
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT parent_id FROM task_links
+                        WHERE child_id=? ORDER BY parent_id
+                        """,
+                        (task_id,),
+                    )
+                ]
+                comments = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, author, body, created_at FROM task_comments
+                        WHERE task_id=? ORDER BY id
+                        """,
+                        (task_id,),
+                    )
+                ]
+                event_kinds = [
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                        (task_id,),
+                    )
+                ]
+        except sqlite3.DatabaseError as exc:
+            self._raise_database_error(board, exc)
         keys = set(task.keys())
         skills: list[str] = []
         if "skills" in keys and task["skills"]:
@@ -255,21 +326,28 @@ class KanbanReader:
         )
 
     def task_by_idempotency(self, board: str, key: str) -> TaskRecord | None:
-        with closing(self._connect(board)) as conn:
-            row = conn.execute(
-                """
-                SELECT id FROM tasks WHERE idempotency_key=? AND status != 'archived'
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (key,),
-            ).fetchone()
+        try:
+            with closing(self._connect(board)) as conn:
+                row = conn.execute(
+                    """
+                    SELECT id FROM tasks
+                    WHERE idempotency_key=? AND status != 'archived'
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (key,),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._raise_database_error(board, exc)
         return self.task(board, str(row["id"])) if row else None
 
     def max_event_id(self, board: str) -> int:
-        with closing(self._connect(board)) as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(id), 0) AS event_id FROM task_events"
-            ).fetchone()
+        try:
+            with closing(self._connect(board)) as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS event_id FROM task_events"
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._raise_database_error(board, exc)
         return int(row["event_id"])
 
 
@@ -277,6 +355,63 @@ class KanbanCLI:
     def __init__(self, config: ControllerConfig, reader: KanbanReader):
         self.config = config
         self.reader = reader
+
+    def _execute(
+        self,
+        command: list[str],
+        *,
+        endpoint: str,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                command,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=self.config.command_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DependencyTransientError(
+                "Hermes Kanban command timed out",
+                context=ErrorContext(
+                    dependency="kanban",
+                    endpoint=endpoint,
+                    error_code="timeout",
+                ),
+            ) from exc
+        except OSError as exc:
+            raise ControllerFatalError(
+                f"hermes_command_unavailable:{command[0]}"
+            ) from exc
+
+    @staticmethod
+    def _raise_for_failure(
+        result: subprocess.CompletedProcess[str],
+        *,
+        endpoint: str,
+    ) -> None:
+        if result.returncode == 0:
+            return
+        summary = (result.stderr or result.stdout or "command failed")[:1000]
+        context = ErrorContext(
+            dependency="kanban",
+            endpoint=endpoint,
+            error_code="command_failed",
+        )
+        if any(
+            marker in summary.lower()
+            for marker in (
+                "database is locked",
+                "database is busy",
+                "temporarily unavailable",
+                "resource busy",
+                "try again",
+            )
+        ):
+            raise DependencyTransientError(summary, context=context)
+        raise DependencyContractError(summary, context=context)
 
     def _run(
         self,
@@ -295,15 +430,10 @@ class KanbanCLI:
         if board is not None:
             command.extend(["--board", board])
         command.extend(args)
-        result = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            timeout=self.config.command_timeout_seconds,
-            check=False,
-        )
-        if result.returncode != 0 and not tolerate:
-            raise CommandError(command, result.returncode, result.stderr)
+        endpoint = f"kanban:{args[0] if args else 'unknown'}"
+        result = self._execute(command, endpoint=endpoint)
+        if not tolerate:
+            self._raise_for_failure(result, endpoint=endpoint)
         if json_output and result.stdout.strip():
             return json.loads(result.stdout)
         return {
@@ -403,7 +533,7 @@ class KanbanCLI:
             "--initial-status",
             "blocked",
             "--max-retries",
-            "3",
+            str(self.config.worker_redispatch_limit),
         ]
         for skill in card.skills:
             args.extend(["--skill", skill])
@@ -444,6 +574,38 @@ class KanbanCLI:
         if task is not None and task.status != "archived":
             self._run(["archive", task_id], board=board)
 
+    def redispatch_stale_worker(
+        self,
+        board: str,
+        task_id: str,
+        reason: str,
+    ) -> TaskRecord:
+        """Ask Hermes to reclaim a confirmed-dead attempt without archiving it."""
+        task = self.reader.task(board, task_id)
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+        if task.status == "running":
+            self._run(
+                ["reclaim", task_id, "--reason", reason[:500]],
+                board=board,
+            )
+        refreshed = self.reader.task(board, task_id)
+        if refreshed is None:
+            raise RuntimeError(f"reclaimed task {task_id} disappeared")
+        if refreshed.status == "blocked":
+            self.release(board, task_id)
+            refreshed = self.reader.task(board, task_id)
+        if refreshed is None or refreshed.status not in {
+            "todo",
+            "ready",
+            "running",
+        }:
+            raise RuntimeError(
+                f"reclaimed task {task_id} is not redispatchable: "
+                f"{refreshed.status if refreshed else 'missing'}"
+            )
+        return refreshed
+
     def prepare_human_block_for_completion(
         self, board: str, task_id: str
     ) -> None:
@@ -473,16 +635,13 @@ class KanbanCLI:
             env = os.environ.copy()
             env["HERMES_KANBAN_BOARD"] = board
             command = [sys.executable, "-c", script]
-            result = subprocess.run(
+            endpoint = "kanban:specify_triage_task"
+            result = self._execute(
                 command,
+                endpoint=endpoint,
                 env=env,
-                text=True,
-                capture_output=True,
-                timeout=self.config.command_timeout_seconds,
-                check=False,
             )
-            if result.returncode != 0:
-                raise CommandError(command, result.returncode, result.stderr)
+            self._raise_for_failure(result, endpoint=endpoint)
             task = self.reader.task(board, task_id)
             if task is None:
                 raise RuntimeError(f"triage card {task_id} disappeared")

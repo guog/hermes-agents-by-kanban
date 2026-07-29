@@ -1,13 +1,61 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .models import NotificationLevel, Stage
+
+HOLLYSYS_GITLAB_HOSTNAME = "green-git.hollysys.net"
+
+
+@dataclass(frozen=True)
+class GitLabEndpoint:
+    hostname: str
+    base_url: str
+
+
+def trusted_runtime_uids() -> set[int]:
+    owners = {0, os.geteuid()}
+    configured = os.environ.get("PUID", "").strip()
+    if configured.isdigit():
+        owners.add(int(configured))
+    return owners
+
+
+def normalize_gitlab_endpoint(raw: str) -> GitLabEndpoint:
+    value = raw.strip()
+    if not value:
+        raise ValueError("gitlab_host must not be empty")
+    if "://" not in value:
+        value = f"https://{value}"
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.port is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "gitlab_host must be a bare hostname or an HTTPS origin without "
+            "credentials, port, path, query, or fragment"
+        )
+    hostname = parsed.hostname.lower()
+    if hostname != HOLLYSYS_GITLAB_HOSTNAME:
+        raise ValueError(
+            f"gitlab_host must be {HOLLYSYS_GITLAB_HOSTNAME}"
+        )
+    return GitLabEndpoint(hostname=hostname, base_url=f"https://{hostname}")
 
 
 class ControllerConfig(BaseModel):
@@ -22,15 +70,21 @@ class ControllerConfig(BaseModel):
     projects_root: Path = Path("/workspace/projects")
     token_file: Path = Path("/opt/data/controller/gitlab-token")
     hermes_command: str = "hermes"
-    glab_command: str = "glab"
-    lark_command: str = "lark-cli"
+    glab_command: str = "/usr/local/bin/glab"
+    lark_command: str = "/usr/local/bin/lark-cli"
+    system_git_command: str = "/usr/bin/git"
+    agent_git_command: str = "/usr/local/bin/git"
     controller_profile: str = "dispatcher"
+    controller_mode: str = "preflight"
     poll_interval_seconds: float = Field(default=2.0, gt=0)
     reconcile_interval_seconds: float = Field(default=30.0, gt=0)
+    reconcile_workers: int = Field(default=4, ge=1, le=32)
+    outbox_poll_interval_seconds: float = Field(default=2.0, gt=0)
     command_timeout_seconds: int = Field(default=120, gt=0)
     gitlab_host: str = ""
     allowed_groups: list[str] = Field(default_factory=list)
-    required_pipeline: bool = True
+    preflight_project_path: str = ""
+    preflight_command_timeout_seconds: int = Field(default=15, ge=2, le=120)
     stage_assignees: dict[Stage, str]
     stage_skills: dict[Stage, list[str]]
     artifact_patterns: dict[str, list[str]]
@@ -43,20 +97,59 @@ class ControllerConfig(BaseModel):
     abort_confirmation_ttl_seconds: int = Field(default=600, ge=60, le=3600)
     dependency_backoff_initial_seconds: float = Field(default=5.0, gt=0)
     dependency_backoff_max_seconds: float = Field(default=300.0, gt=0)
-    dependency_circuit_failure_threshold: int = Field(default=5, ge=1)
+    dependency_circuit_failure_threshold: int = Field(default=5, ge=2)
     health_stale_seconds: int = Field(default=120, ge=10)
     event_lag_warning_threshold: int = Field(default=100, ge=1)
     outbox_warning_threshold: int = Field(default=20, ge=1)
     worker_progress_lease_seconds: int = Field(default=14400, ge=300)
+    worker_redispatch_limit: int = Field(default=2, ge=0, le=10)
     merge_wait_retry_seconds: int = Field(default=30, ge=5)
-    merge_wait_timeout_seconds: int = Field(default=3600, ge=60)
+    merge_blocker_timeout_seconds: int = Field(default=3600, ge=60)
+    merge_draft_grace_seconds: int = Field(default=600, ge=60)
+    outbox_backoff_initial_seconds: int = Field(default=5, ge=1)
+    outbox_backoff_max_seconds: int = Field(default=300, ge=1)
 
     @model_validator(mode="after")
     def validate_controller_contract(self) -> ControllerConfig:
-        if not self.gitlab_host or "://" in self.gitlab_host or "/" in self.gitlab_host:
-            raise ValueError("gitlab_host must be a non-empty hostname")
+        endpoint = normalize_gitlab_endpoint(self.gitlab_host)
+        self.gitlab_host = endpoint.hostname
+        if self.controller_mode not in {"preflight", "active"}:
+            raise ValueError("controller_mode must be preflight or active")
         if not self.allowed_groups:
             raise ValueError("allowed_groups must contain at least one GitLab group")
+        group_pattern = re.compile(
+            r"^[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$"
+        )
+        if (
+            len(self.allowed_groups) != len(set(self.allowed_groups))
+            or any(
+                not group_pattern.fullmatch(group)
+                or any(part in {".", ".."} for part in group.split("/"))
+                for group in self.allowed_groups
+            )
+        ):
+            raise ValueError(
+                "allowed_groups must contain unique GitLab group paths"
+            )
+        if self.preflight_project_path:
+            project_parts = self.preflight_project_path.split("/")
+            if (
+                len(project_parts) < 2
+                or not group_pattern.fullmatch(self.preflight_project_path)
+                or any(part in {".", ".."} for part in project_parts)
+                or self.preflight_project_path.endswith(".git")
+            ):
+                raise ValueError(
+                    "preflight_project_path must be a canonical GitLab "
+                    "namespace/project path without .git"
+                )
+            if not any(
+                self.preflight_project_path.startswith(f"{group}/")
+                for group in self.allowed_groups
+            ):
+                raise ValueError(
+                    "preflight_project_path must be inside an allowed group"
+                )
         expected_stages = set(Stage)
         if set(self.stage_assignees) != expected_stages:
             raise ValueError("stage_assignees must define every workflow stage")
@@ -98,7 +191,21 @@ class ControllerConfig(BaseModel):
             raise ValueError(
                 "dependency_backoff_initial_seconds cannot exceed maximum"
             )
+        if self.outbox_backoff_initial_seconds > self.outbox_backoff_max_seconds:
+            raise ValueError("outbox initial backoff cannot exceed maximum")
         return self
+
+    @staticmethod
+    def normalize_gitlab_endpoint(raw: str) -> GitLabEndpoint:
+        return normalize_gitlab_endpoint(raw)
+
+    @property
+    def gitlab_hostname(self) -> str:
+        return normalize_gitlab_endpoint(self.gitlab_host).hostname
+
+    @property
+    def gitlab_base_url(self) -> str:
+        return normalize_gitlab_endpoint(self.gitlab_host).base_url
 
     @classmethod
     def load(cls) -> ControllerConfig:
@@ -175,7 +282,18 @@ class ControllerConfig(BaseModel):
                     else raw.strip()
                 )
         scalar_env = {
+            "HOLLYSYS_CONTROLLER_MODE": "controller_mode",
+            "HOLLYSYS_PREFLIGHT_PROJECT_PATH": "preflight_project_path",
+            "HOLLYSYS_PREFLIGHT_COMMAND_TIMEOUT_SECONDS": (
+                "preflight_command_timeout_seconds",
+                int,
+            ),
             "HOLLYSYS_NOTIFICATION_LEVEL": "notification_level",
+            "HOLLYSYS_RECONCILE_WORKERS": ("reconcile_workers", int),
+            "HOLLYSYS_OUTBOX_POLL_INTERVAL_SECONDS": (
+                "outbox_poll_interval_seconds",
+                float,
+            ),
             "HOLLYSYS_ABORT_CONFIRMATION_TTL_SECONDS": (
                 "abort_confirmation_ttl_seconds",
                 int,
@@ -205,12 +323,28 @@ class ControllerConfig(BaseModel):
                 "worker_progress_lease_seconds",
                 int,
             ),
+            "HOLLYSYS_WORKER_REDISPATCH_LIMIT": (
+                "worker_redispatch_limit",
+                int,
+            ),
             "HOLLYSYS_MERGE_WAIT_RETRY_SECONDS": (
                 "merge_wait_retry_seconds",
                 int,
             ),
-            "HOLLYSYS_MERGE_WAIT_TIMEOUT_SECONDS": (
-                "merge_wait_timeout_seconds",
+            "HOLLYSYS_MERGE_BLOCKER_TIMEOUT_SECONDS": (
+                "merge_blocker_timeout_seconds",
+                int,
+            ),
+            "HOLLYSYS_MERGE_DRAFT_GRACE_SECONDS": (
+                "merge_draft_grace_seconds",
+                int,
+            ),
+            "HOLLYSYS_OUTBOX_BACKOFF_INITIAL_SECONDS": (
+                "outbox_backoff_initial_seconds",
+                int,
+            ),
+            "HOLLYSYS_OUTBOX_BACKOFF_MAX_SECONDS": (
+                "outbox_backoff_max_seconds",
                 int,
             ),
         }
@@ -231,6 +365,10 @@ class ControllerConfig(BaseModel):
         info = self.token_file.stat()
         if not stat.S_ISREG(info.st_mode):
             raise PermissionError(f"{self.token_file} must be a regular file")
+        if info.st_uid not in trusted_runtime_uids():
+            raise PermissionError(
+                f"{self.token_file} must be owned by root or the controller user"
+            )
         if info.st_mode & 0o177:
             raise PermissionError(f"{self.token_file} must be mode 0600 (or stricter)")
         token = self.token_file.read_text(encoding="utf-8").strip()

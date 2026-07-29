@@ -1,0 +1,17 @@
+#!/command/with-contenv sh
+set -eu
+
+exit_code=${1:-1}
+if [ "$exit_code" -ne 0 ]; then
+  # Prevent a corrupt database or invalid configuration from creating a hot
+  # restart loop while preserving s6's normal long-running service behavior.
+  backoff=${HOLLYSYS_FATAL_RESTART_BACKOFF_SECONDS:-30}
+  case "$backoff" in
+    ''|*[!0-9]*) backoff=30 ;;
+    ?????*) backoff=3600 ;;
+  esac
+  [ "$backoff" -le 3600 ] || backoff=3600
+  sleep "$backoff"
+fi
+
+exit 0
