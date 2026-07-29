@@ -84,8 +84,9 @@ class ComposeContractTests(unittest.TestCase):
         service = self.compose["services"]["hermes"]
         self.assertEqual(
             service["ports"],
-            ["${HERMES_DASHBOARD_PORT:-9119}:9119"],
+            ["${HERMES_DASHBOARD_HOST_PORT:-9119}:9119"],
         )
+        self.assertEqual(service["environment"]["HERMES_DASHBOARD_PORT"], "9119")
 
     def test_container_name_is_parameterized_for_colocated_deployments(
         self,
