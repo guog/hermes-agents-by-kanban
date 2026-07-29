@@ -65,6 +65,14 @@ ALLOWED_HUMAN_BLOCK_KINDS = {
     "unsafe_retry",
     "destructive_approval",
 }
+RESOLVABLE_HUMAN_BLOCK_STATUSES = {
+    "blocked",
+    "triage",
+    # These two states can be left by a process interruption after Controller
+    # starts the audited triage -> todo -> ready transition.
+    "todo",
+    "ready",
+}
 REQUIRED_HUMAN_BLOCK_FIELDS = {
     "block_id",
     "kind",
@@ -631,8 +639,10 @@ class ControllerService:
                     request.answer,
                 )
                 if retry is None:
-                    if task.status != "blocked":
-                        raise ValueError("card is not currently blocked")
+                    if task.status not in RESOLVABLE_HUMAN_BLOCK_STATUSES:
+                        raise ValueError(
+                            "card is not currently a resolvable human block"
+                        )
                     retry = self._create_work(
                         run,
                         stage,
@@ -641,10 +651,8 @@ class ControllerService:
                         repair_context=original_record.repair_context,
                         resume_answer=request.answer,
                         resumed_from=task.id,
+                        publish=False,
                     )
-                else:
-                    if retry.status in ACTIVE_STATUSES:
-                        self._ensure_work_published(run, retry)
                 resolution = (
                     "[human-resolution:v1]\n"
                     f"block_id: {request.block_id}\n"
@@ -662,7 +670,11 @@ class ControllerService:
                         run.workspace.board, task.id, resolution, "hollysys-controller"
                     )
                     resolution_exists = True
-                if task.status == "blocked":
+                if task.status in {"triage", "todo"}:
+                    self.kanban.prepare_human_block_for_completion(
+                        run.workspace.board, task.id
+                    )
+                if task.status in RESOLVABLE_HUMAN_BLOCK_STATUSES:
                     cancelled = self._controller_completion(
                         run,
                         managed,
@@ -682,6 +694,8 @@ class ControllerService:
                     )
                 elif task.status != "done" or not resolution_exists:
                     raise ValueError("card is no longer a resolvable human block")
+                if retry.status in ACTIVE_STATUSES:
+                    retry = self._ensure_work_published(run, retry)
                 event_key = f"{run.run_key}:resumed:{request.block_id}"
                 self.store.enqueue(
                     event_key,
@@ -1238,6 +1252,7 @@ class ControllerService:
         repair_context: RepairContext | None = None,
         resume_answer: str | None = None,
         resumed_from: str | None = None,
+        publish: bool = True,
     ) -> TaskRecord:
         full_history, _ = self._history(run.run_key)
         frozen_baselines = self._frozen_baselines(full_history, run)
@@ -1328,7 +1343,7 @@ class ControllerService:
             purpose="work",
             created_at=task.created_at,
         )
-        return self._ensure_work_published(run, task)
+        return self._ensure_work_published(run, task) if publish else task
 
     def _ensure_work_published(self, run: RunRecord, task: TaskRecord) -> TaskRecord:
         record = parse_card_body(task.body)

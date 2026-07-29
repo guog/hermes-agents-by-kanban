@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -422,6 +424,66 @@ class KanbanCLI:
         released = self.reader.task(board, task_id)
         if released is None or released.status not in {"ready", "running", "todo"}:
             raise RuntimeError(f"card {task_id} did not leave controller hold")
+
+    def prepare_human_block_for_completion(
+        self, board: str, task_id: str
+    ) -> None:
+        """Move a Hermes triage card through audited states so it can complete.
+
+        Hermes routes a repeatedly blocked worker to ``triage``. Its public
+        ``complete`` command accepts ``ready|running|blocked`` but not
+        ``triage``. Use Hermes' own ``specify_triage_task`` transition without
+        changing the card fields, then promote the resulting ``todo`` card.
+        This preserves task events and avoids direct SQLite writes.
+        """
+        task = self.reader.task(board, task_id)
+        if task is None:
+            raise RuntimeError(f"unknown task {task_id}")
+        if task.status == "triage":
+            script = "\n".join(
+                [
+                    "from hermes_cli import kanban_db as kb",
+                    f"task_id = {task_id!r}",
+                    "with kb.connect_closing() as conn:",
+                    "    changed = kb.specify_triage_task(",
+                    "        conn, task_id, author='hollysys-controller'",
+                    "    )",
+                    "raise SystemExit(0 if changed else 1)",
+                ]
+            )
+            env = os.environ.copy()
+            env["HERMES_KANBAN_BOARD"] = board
+            command = [sys.executable, "-c", script]
+            result = subprocess.run(
+                command,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=self.config.command_timeout_seconds,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise CommandError(command, result.returncode, result.stderr)
+            task = self.reader.task(board, task_id)
+            if task is None:
+                raise RuntimeError(f"triage card {task_id} disappeared")
+        if task.status == "todo":
+            self._run(
+                [
+                    "promote",
+                    task_id,
+                    "--reason",
+                    "Controller accepted the matching human resolution.",
+                ],
+                board=board,
+            )
+            task = self.reader.task(board, task_id)
+            if task is None:
+                raise RuntimeError(f"promoted card {task_id} disappeared")
+        if task.status not in {"ready", "blocked"}:
+            raise RuntimeError(
+                f"human-block card {task_id} cannot complete from {task.status}"
+            )
 
     def comment(
         self, board: str, task_id: str, text: str, author: str = "hollysys-controller"

@@ -121,6 +121,149 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(found, task)
 
+    def test_resolve_triage_before_publishing_retry(self) -> None:
+        block_id = f"{self.run.run_key}:t_blocked:7"
+        comment = (
+            "[human-block:v1]\n"
+            f"block_id: {block_id}\n"
+            "kind: environment\n"
+            "summary: target database evidence is unavailable\n"
+            "evidence: target snapshot is missing\n"
+            "required_action: provide an explicit safe implementation boundary\n"
+            "resume_check: the answer preserves the deployment gate"
+        )
+        card = CardRecord(
+            run=self.run,
+            stage=Stage.IMPLEMENT,
+            iteration=1,
+            idempotency_key=f"{self.run.run_key}:implement:1:normal:work",
+            parent_card_id="t_tasks_review",
+            assignee="coder",
+            skills=["hollysys-implement", "glab"],
+        )
+        triage = task_record(
+            task_id="t_blocked",
+            body=render_card_body(card),
+            status="triage",
+            assignee=card.assignee,
+            idempotency_key=card.idempotency_key,
+            tenant=self.run.run_key,
+            skills=card.skills,
+            parents=[card.parent_card_id],
+            comments=[{"body": comment}],
+            latest_outcome="blocked",
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=triage.id,
+            run_key=self.run.run_key,
+            stage=card.stage.value,
+            iteration=card.iteration,
+            idempotency_key=card.idempotency_key,
+            parent_card_id=card.parent_card_id,
+            purpose="work",
+            created_at=1,
+        )
+        retry_card = CardRecord(
+            run=self.run,
+            stage=Stage.IMPLEMENT,
+            iteration=2,
+            idempotency_key=f"{self.run.run_key}:implement:2:normal:work",
+            parent_card_id=triage.id,
+            assignee="coder",
+            skills=["hollysys-implement", "glab"],
+            resume_answer="continue local implementation; preserve deployment gates",
+            resumed_from_card_id=triage.id,
+        )
+        retry = task_record(
+            task_id="t_retry",
+            body=render_card_body(retry_card),
+            status="blocked",
+            assignee=retry_card.assignee,
+            idempotency_key=retry_card.idempotency_key,
+            tenant=self.run.run_key,
+            skills=retry_card.skills,
+            parents=[triage.id],
+        )
+        service = object.__new__(ControllerService)
+        service._lock = threading.RLock()
+        service.store = ControllerStore(self.root / "controller.db")
+        service._history = lambda _: ([HistoryItem(managed, triage)], self.run)
+        calls: list[tuple] = []
+
+        def create_retry(*args, **kwargs):
+            calls.append(("create", kwargs["publish"]))
+            return retry
+
+        def publish_retry(run, task):
+            self.assertIn(("complete", triage.id), calls)
+            calls.append(("publish", task.id))
+            return task_record(
+                task_id=task.id,
+                body=task.body or "",
+                status="ready",
+                assignee=task.assignee,
+                idempotency_key=task.idempotency_key,
+                tenant=task.tenant,
+                skills=task.skills,
+                parents=task.parents,
+            )
+
+        service._create_work = create_retry
+        service._ensure_work_published = publish_retry
+        service._controller_completion = lambda *args, **kwargs: {
+            "outcome": "cancelled"
+        }
+        service.kanban = type(
+            "TriageKanban",
+            (),
+            {
+                "comment": staticmethod(
+                    lambda board, task_id, text, author: calls.append(
+                        ("comment", task_id)
+                    )
+                ),
+                "prepare_human_block_for_completion": staticmethod(
+                    lambda board, task_id: calls.append(("prepare", task_id))
+                ),
+                "complete": staticmethod(
+                    lambda board, task_id, summary, metadata: calls.append(
+                        ("complete", task_id)
+                    )
+                ),
+            },
+        )()
+        answer = "continue local implementation; preserve deployment gates"
+
+        result = service.resolve(
+            {
+                "run_key": self.run.run_key,
+                "card_id": triage.id,
+                "block_id": block_id,
+                "message_id": "om_reply",
+                "sender": self.run.origin.initiator_open_id,
+                "chat_id": self.run.origin.chat_id,
+                "thread_id": self.run.origin.thread_id,
+                "answer": answer,
+            }
+        )
+
+        self.assertEqual(result["resolved_card"], triage.id)
+        self.assertEqual(result["new_card"], retry.id)
+        self.assertEqual(
+            calls,
+            [
+                ("create", False),
+                ("comment", triage.id),
+                ("prepare", triage.id),
+                ("complete", triage.id),
+                ("publish", retry.id),
+            ],
+        )
+        pending = service.store.pending_outbox()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["event"], "resumed")
+
     def test_reconcile_recovers_completed_root_without_first_card(self) -> None:
         root = task_record(
             task_id="t_root",

@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from hollysys_controller.kanban import (
+    KanbanCLI,
     KanbanReader,
+    TaskRecord,
     parse_card_body,
     parse_run_body,
     render_card_body,
     render_run_body,
 )
 from hollysys_controller.models import CardRecord, Stage
-from tests.helpers import run_record
+from tests.helpers import config, run_record
 
 DB_SCHEMA = """
 CREATE TABLE tasks (
@@ -97,6 +101,52 @@ class KanbanReaderTests(unittest.TestCase):
         )
         self.assertEqual(parse_run_body(render_run_body(run)), run)
         self.assertEqual(parse_card_body(render_card_body(card)), card)
+
+    def test_prepares_triage_for_completion_with_hermes_transitions(self) -> None:
+        states = iter(["triage", "todo", "ready"])
+
+        def task_with_status(status: str) -> TaskRecord:
+            return TaskRecord(
+                id="t_triage",
+                title="triage",
+                body="body",
+                assignee="coder",
+                status=status,
+                created_by="hollysys-controller",
+                created_at=1,
+                completed_at=None,
+                idempotency_key="key",
+                tenant="run",
+                workspace_path=None,
+                branch_name=None,
+                skills=[],
+                current_run_id=None,
+                latest_summary=None,
+                latest_metadata=None,
+                latest_outcome="blocked",
+                parents=[],
+                comments=[],
+                event_kinds=[],
+            )
+
+        reader = type(
+            "StateReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: task_with_status(next(states)))},
+        )()
+        cli = KanbanCLI(config(self.root), reader)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+
+        with patch("hollysys_controller.kanban.subprocess.run", return_value=completed) as run:
+            cli.prepare_human_block_for_completion("gitlab-p12", "t_triage")
+
+        self.assertEqual(run.call_count, 2)
+        first = run.call_args_list[0]
+        self.assertIn("specify_triage_task", first.args[0][2])
+        self.assertEqual(first.kwargs["env"]["HERMES_KANBAN_BOARD"], "gitlab-p12")
+        second_command = run.call_args_list[1].args[0]
+        self.assertIn("promote", second_command)
+        self.assertIn("t_triage", second_command)
 
 
 if __name__ == "__main__":
