@@ -26,7 +26,8 @@ version: 2.0.1
    执行波次和完整覆盖矩阵。
 4. review 重写只修复任务缺陷；冻结违规修复时恢复卡片列出的基线。PLAN/SPEC 不充分时在 TASKS 内记录当前阶段决策，不修改冻结上游。finalization 完成最终取舍且不重编号无关工作。
 5. commit 最小且连贯的 TASKS 变更，并 push 到同一分支/MR。绝不得创建 GitLab Issue、Task work item 或 TASKS MR。
-6. normal 卡用 v3 pass metadata，并提交严格 v7 `repository_evidence`；
+6. normal 卡用 v3 pass metadata，绑定共享 `mr_iid`、`mr_url`、当前
+   `head_sha`，并提交严格 v7 `repository_evidence`；
    finalization 发布 forced-advance 评论及完整最终基线、决策和风险证据。不得以
    业务缺口 fail，不得实现、审查、创建卡片或合并。
 7. 调用完成工具前，必须重新读取当前卡片并逐项原样复制 Controller 上下文：
