@@ -540,6 +540,88 @@ class GitAuthenticationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_gitlab_host"):
             profile_credential(cfg, "dispatcher")
 
+    def test_deep_writer_preflight_uses_blobless_commit_tree(self) -> None:
+        cfg = config(self.root)
+        cfg.preflight_project_path = "group/project"
+        cfg.state_dir.mkdir(parents=True)
+        login_bin = self.root / "login-bin"
+        login_bin.mkdir()
+        cfg.agent_git_command = str(login_bin / "git")
+        (login_bin / "git").write_text("#!/bin/sh\n", encoding="utf-8")
+        (login_bin / "git").chmod(0o755)
+        profile_root = cfg.profiles_root / "coder"
+        (profile_root / "home").mkdir(parents=True)
+        env_file = profile_root / ".env"
+        env_file.write_text(
+            "HERMES_PROFILE=coder\n"
+            "GITLAB_HOST=green-git.hollysys.net\n"
+            "GITLAB_ALLOWED_GROUPS=group\n"
+            "GITLAB_TOKEN=profile-token\n",
+            encoding="utf-8",
+        )
+        env_file.chmod(0o600)
+        tree_sha = "a" * 40
+        commit_sha = "b" * 40
+        commands = (
+            subprocess.CompletedProcess(
+                ["sh"], 0, f"{login_bin / 'git'}\n", ""
+            ),
+            subprocess.CompletedProcess(
+                ["sh"], 0, f"{login_bin / 'glab'}\n", ""
+            ),
+            subprocess.CompletedProcess(
+                ["sh"], 0, f"{login_bin / 'lark-cli'}\n", ""
+            ),
+            subprocess.CompletedProcess(
+                ["glab"], 0, '{"id": 54}\n', ""
+            ),
+            subprocess.CompletedProcess(
+                ["glab"], 0, '{"access_level": 30}\n', ""
+            ),
+            subprocess.CompletedProcess(["git"], 0, "head\n", ""),
+            subprocess.CompletedProcess(
+                ["git"],
+                0,
+                "username=oauth2\npassword=profile-token\n",
+                "",
+            ),
+            subprocess.CompletedProcess(["git"], 0, "", ""),
+            subprocess.CompletedProcess(
+                ["git"],
+                0,
+                "https://green-git.hollysys.net/group/project.git\n",
+                "",
+            ),
+            subprocess.CompletedProcess(["git"], 0, f"{tree_sha}\n", ""),
+            subprocess.CompletedProcess(["git"], 0, f"{commit_sha}\n", ""),
+            subprocess.CompletedProcess(["git"], 0, "", ""),
+        )
+
+        with patch(
+            "hollysys_controller.git_auth._run",
+            side_effect=commands,
+        ) as run:
+            result = profile_preflight(cfg, "coder", deep=True)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["repository_write_ok"])
+        invoked = [call.args[0] for call in run.call_args_list]
+        clone = next(command for command in invoked if "clone" in command)
+        self.assertEqual(
+            clone[1:6],
+            [
+                "clone",
+                "--depth=1",
+                "--filter=blob:none",
+                "--no-checkout",
+                "--single-branch",
+            ],
+        )
+        self.assertTrue(any("mktree" in command for command in invoked))
+        self.assertTrue(any("commit-tree" in command for command in invoked))
+        push = next(command for command in invoked if "push" in command)
+        self.assertTrue(push[-1].startswith(f"{commit_sha}:"))
+
     def test_deep_preflight_checks_the_real_login_shell_cli_paths(self) -> None:
         cfg = config(self.root)
         cfg.profiles_root = self.root / "profiles"
