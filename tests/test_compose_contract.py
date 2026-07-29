@@ -47,5 +47,12 @@ class ComposeContractTests(unittest.TestCase):
         )
         self.assertNotIn("exec python -m hollysys_controller.cli", wrapper)
 
+    def test_write_tools_allow_runtime_data_and_managed_worktrees(self) -> None:
+        environment = self.compose["services"]["hermes"]["environment"]
+        self.assertEqual(
+            environment["HERMES_WRITE_SAFE_ROOT"],
+            "/opt/data:/workspace/projects",
+        )
+
 if __name__ == "__main__":
     unittest.main()

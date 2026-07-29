@@ -89,6 +89,11 @@ Compose 只有一个 `hermes` service：
 | `./templates` | `/opt/fleet/templates` | 只读 |
 | `./schemas` | `/opt/fleet/schemas` | 只读 |
 
+`HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace/projects` 将通用文件写入工具限制在
+Hermes 运行数据与 Controller 管理的 checkout/worktree。Hermes 自带的凭据、会话状态
+和项目 `.env` denylist 仍然生效；不要把该变量缩回 `/opt/data`，否则 producer 无法
+修改工作树，也不要取消变量而放开整个容器文件系统。
+
 不要让两个运行中的容器共享同一个 `HERMES_DATA_DIR` 或 `PROJECTS_DIR`。
 
 ### 1.1 国内软件源与 .NET SDK 8 启动检查
