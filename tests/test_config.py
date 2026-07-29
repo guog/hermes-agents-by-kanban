@@ -66,6 +66,10 @@ class ConfigTests(unittest.TestCase):
             defaults["lark_command"].default,
             "/usr/local/bin/lark-cli",
         )
+        self.assertEqual(
+            defaults["preflight_command_timeout_seconds"].default,
+            120,
+        )
 
     def test_gitlab_endpoint_rejects_unsafe_or_mistyped_origins(self) -> None:
         valid = normalize_gitlab_endpoint(

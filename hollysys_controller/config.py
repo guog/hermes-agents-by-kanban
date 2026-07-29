@@ -82,7 +82,7 @@ class ControllerConfig(BaseModel):
     gitlab_host: str = ""
     allowed_groups: list[str] = Field(default_factory=list)
     preflight_project_path: str = ""
-    preflight_command_timeout_seconds: int = Field(default=15, ge=2, le=120)
+    preflight_command_timeout_seconds: int = Field(default=120, ge=2, le=120)
     stage_assignees: dict[Stage, str]
     stage_skills: dict[Stage, list[str]]
     artifact_patterns: dict[str, list[str]]

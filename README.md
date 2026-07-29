@@ -846,7 +846,7 @@ cache、pending 或 worktree。新主机只复制明确需要的认证和配置�
 静态检查，再在用户批准的独立测试项目执行 `hollysysctl preflight --deep`：逐 Profile
 验证真实登录 Shell 中 `git`、`glab`、`lark-cli` 精确命中 `/usr/local/bin`，
 API identity/membership、HTTPS `ls-remote`、root-owned askpass、无落盘 token、
-token-free origin、Writer 本地空提交身份与
+token-free origin、120 秒内完成的 shallow/blobless/no-checkout clone、Writer 本地空提交身份与
 `push --dry-run`，以及
 Reviewer 本地拒绝。只有报告全部通过后才将
 模式改为 `active` 并全新重建容器。deep preflight 的成功结果和当前 Controller/Profile
