@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import sqlite3
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
+from hollysys_controller.errors import ControllerFatalError
 from hollysys_controller.store import ControllerStore
 
 
@@ -29,7 +29,10 @@ class StoreTests(unittest.TestCase):
         read_only = ControllerStore(self.store.path, read_only=True)
 
         self.assertEqual(read_only.cursor("b"), 9)
-        with self.assertRaises(sqlite3.OperationalError):
+        with self.assertRaisesRegex(
+            ControllerFatalError,
+            "controller_store_database_error",
+        ):
             read_only.set_cursor("b", 10)
 
     def test_managed_card_upsert_does_not_create_business_state(self) -> None:
@@ -180,7 +183,7 @@ class StoreTests(unittest.TestCase):
 
     def test_merge_wait_is_reconstructable_and_clearable(self) -> None:
         run_key = "hollysys-abcdefghijklmnopqrst"
-        self.store.set_merge_wait(
+        first = self.store.set_merge_wait(
             run_key,
             mr_iid=2,
             head_sha="a" * 40,
@@ -188,11 +191,22 @@ class StoreTests(unittest.TestCase):
             blocker="pipeline is running",
             retry_seconds=30,
         )
+        changed = self.store.set_merge_wait(
+            run_key,
+            mr_iid=2,
+            head_sha="a" * 40,
+            blocker_kind="pipeline_pending",
+            blocker="pipeline is still running",
+            blocker_updated_at="2026-07-29T12:00:00Z",
+            retry_seconds=30,
+        )
         waiting = self.store.merge_wait(run_key)
         self.assertEqual(waiting["mr_iid"], 2)
         self.assertEqual(waiting["head_sha"], "a" * 40)
         self.assertEqual(waiting["blocker_kind"], "pipeline_pending")
-        self.assertEqual(waiting["blocker"], "pipeline is running")
+        self.assertEqual(waiting["blocker"], "pipeline is still running")
+        self.assertEqual(changed["first_seen_at"], first["first_seen_at"])
+        self.assertTrue(changed["changed"])
         self.store.clear_merge_wait(run_key)
         self.assertIsNone(self.store.merge_wait(run_key))
 

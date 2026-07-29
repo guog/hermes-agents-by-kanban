@@ -33,6 +33,8 @@ data/profiles/*/state-snapshots/
 data/profiles/*/*.db
 data/profiles/*/*.jsonl
 data/controller/
+data/.dotnet/
+data/.dotnet-stage.*/
 projects/*
 !projects/.gitkeep
 /cli/

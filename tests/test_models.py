@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from hollysys_controller.models import (
@@ -32,20 +33,30 @@ class CompletionMetadataTests(unittest.TestCase):
             CompletionMetadata.model_validate(payload)
 
     def test_gate_phase_requires_contract_and_requirement_refs(self) -> None:
-        with self.assertRaisesRegex(ValueError, "requires contract_refs"):
+        with self.assertRaisesRegex(ValueError, "requires decision"):
             completion(
                 self.root,
                 Stage.IMPLEMENT,
-                gate_phase="deployment",
+                gate_phase="deployment_entry",
             )
         metadata = completion(
             self.root,
             Stage.IMPLEMENT,
-            gate_phase="deployment",
+            gate_phase="deployment_entry",
+            gate_decision="approved",
+            gate_reviewer="id:42",
+            gate_reviewed_at="2026-07-29T12:00:00+08:00",
+            gate_reason="deployment entry evidence is complete",
+            gate_evidence_refs=[
+                "docs/evidence/deployment-entry.md",
+            ],
+            gate_artifact_paths=["docs/tasks/feature/tasks.md"],
+            gate_artifact_commit_sha="c" * 40,
+            gate_artifact_digest="b" * 64,
             contract_refs=["PLAN-BLK-001"],
             requirement_ids=["OP-001"],
         )
-        self.assertEqual(metadata.gate_phase.value, "deployment")
+        self.assertEqual(metadata.gate_phase.value, "deployment_entry")
 
     def test_runtime_worker_session_stamp_is_not_a_worker_schema_field(self) -> None:
         payload = completion(self.root).model_dump(mode="json")
@@ -56,6 +67,16 @@ class CompletionMetadataTests(unittest.TestCase):
 
         parsed = validate_persisted_completion_metadata(payload)
         self.assertEqual(parsed.kanban_card_id, payload["kanban_card_id"])
+
+    def test_authoring_pass_requires_shared_mr_and_current_head(self) -> None:
+        payload = completion(
+            self.root,
+            Stage.IMPLEMENT,
+        ).model_dump(mode="json")
+        payload["mr_iid"] = None
+
+        with self.assertRaisesRegex(ValueError, "shared delivery MR"):
+            CompletionMetadata.model_validate(payload)
 
     def test_persisted_completion_rejects_other_extras_and_invalid_stamp(self) -> None:
         payload = completion(self.root).model_dump(mode="json")
@@ -178,6 +199,76 @@ class CompletionMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "skipped test requires pass"):
             CompletionMetadata.model_validate(missing_reason)
 
+    def test_json_schema_and_runtime_agree_on_test_disposition_matrix(
+        self,
+    ) -> None:
+        Draft202012Validator.check_schema(generated_schema())
+        validator = Draft202012Validator(generated_schema())
+        plan = completion(
+            self.root,
+            Stage.PLAN_WRITE,
+        ).model_dump(mode="json")
+        executed_test = completion(
+            self.root,
+            Stage.TEST,
+            mr_iid=2,
+            mr_url=(
+                "https://gitlab.example.com/group/project/"
+                "-/merge_requests/2"
+            ),
+            head_sha="d" * 40,
+        ).model_dump(mode="json")
+        skipped_test = completion(
+            self.root,
+            Stage.TEST,
+            mr_iid=2,
+            mr_url=(
+                "https://gitlab.example.com/group/project/"
+                "-/merge_requests/2"
+            ),
+            head_sha="d" * 40,
+            test_disposition="skipped_unavailable",
+            skip_reason="browser runtime is unavailable",
+            verification=["unit tests passed", "browser preflight failed"],
+            residual_risk=["browser interaction remains unverified"],
+        ).model_dump(mode="json")
+        cases = (
+            ("plan", plan, True),
+            (
+                "plan-with-test-disposition",
+                {**plan, "test_disposition": "executed"},
+                False,
+            ),
+            (
+                "plan-with-skip-reason",
+                {**plan, "skip_reason": "build succeeded"},
+                False,
+            ),
+            ("executed-test", executed_test, True),
+            (
+                "executed-test-with-skip-reason",
+                {**executed_test, "skip_reason": "not a skip"},
+                False,
+            ),
+            ("skipped-test", skipped_test, True),
+            (
+                "skipped-test-without-reason",
+                {**skipped_test, "skip_reason": None},
+                False,
+            ),
+        )
+        for name, payload, expected_valid in cases:
+            with self.subTest(name=name):
+                schema_valid = not list(validator.iter_errors(payload))
+                try:
+                    CompletionMetadata.model_validate(payload)
+                except ValidationError:
+                    runtime_valid = False
+                else:
+                    runtime_valid = True
+                self.assertEqual(schema_valid, expected_valid)
+                self.assertEqual(runtime_valid, expected_valid)
+
     def test_authoring_pass_requires_repository_evidence(self) -> None:
         valid = completion(self.root, Stage.IMPLEMENT)
         self.assertEqual(
@@ -276,17 +367,41 @@ class CompletionMetadataTests(unittest.TestCase):
             r"^hollysys-[a-z0-9]{20}$",
         )
         conditions = schema["allOf"]
-        self.assertEqual(len(conditions), 8)
+        self.assertEqual(len(conditions), 12)
         self.assertEqual(conditions[0]["then"]["properties"]["issues"]["minItems"], 1)
         self.assertEqual(
             conditions[1]["then"]["properties"]["artifact_paths"]["minItems"],
             1,
         )
-        self.assertIn("head_sha", conditions[3]["then"]["required"])
-        self.assertIn("test_disposition", conditions[4]["then"]["required"])
-        self.assertIn("repository_evidence", conditions[5]["then"]["required"])
-        self.assertIn("skip_reason", conditions[6]["then"]["required"])
-        self.assertIn("forced_advance", conditions[7]["then"]["required"])
+        self.assertIn("head_sha", conditions[4]["then"]["required"])
+        self.assertIn("test_disposition", conditions[5]["then"]["required"])
+        self.assertEqual(
+            conditions[5]["else"]["properties"]["test_disposition"],
+            {"type": "null"},
+        )
+        self.assertEqual(
+            conditions[5]["else"]["properties"]["skip_reason"],
+            {"type": "null"},
+        )
+        self.assertIn("repository_evidence", conditions[6]["then"]["required"])
+        self.assertIn("skip_reason", conditions[7]["then"]["required"])
+        self.assertEqual(
+            conditions[7]["else"]["properties"]["skip_reason"],
+            {"type": "null"},
+        )
+        self.assertIn("forced_advance", conditions[8]["then"]["required"])
+        authoring = next(
+            condition
+            for condition in conditions
+            if condition["if"].get("properties", {})
+            .get("stage", {})
+            .get("enum")
+            == ["spec-write", "plan-write", "tasks-write", "implement"]
+        )
+        self.assertEqual(
+            set(authoring["then"]["required"]),
+            {"mr_iid", "mr_url", "head_sha"},
+        )
 
 
 if __name__ == "__main__":

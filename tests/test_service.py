@@ -131,7 +131,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             "evidence: target snapshot is missing\n"
             "required_action: provide an explicit safe implementation boundary\n"
             "resume_check: the answer preserves the deployment gate\n"
-            "gate_phase: deployment\n"
+            "gate_phase: implementation_entry\n"
             "requirement_ids: BLK-001\n"
             "contract_refs: PLAN-BLK-001"
         )
@@ -1316,6 +1316,13 @@ class ServiceRecoveryTests(unittest.TestCase):
             status["code_modifications"],
             {"used": 0, "remaining": 5, "limit": 5},
         )
+        active_history = history
+        history = history[:2]
+        idle_status = service.status(self.run.run_key)
+        self.assertEqual(idle_status["phase"], "active")
+        self.assertEqual(idle_status["stage"], "active")
+        self.assertNotIn("reconciling", json.dumps(idle_status))
+        history = active_history
 
         service.gitlab = type(
             "UnexpectedGitLab",
@@ -1620,6 +1627,19 @@ class ServiceRecoveryTests(unittest.TestCase):
                 ("abort-request:om_abort_request",),
             ).fetchone()
         self.assertNotIn(requested["confirmation_token"], stored["response"])
+        replayed = service.abort_request(
+            {
+                "run_key": self.run.run_key,
+                "message_id": "om_abort_request",
+                "sender": self.run.origin.initiator_open_id,
+                "chat_id": self.run.origin.chat_id,
+                "thread_id": self.run.origin.thread_id,
+                "reason": "stop this delivery",
+            }
+        )
+        self.assertEqual(replayed["error_code"], "token_unavailable")
+        self.assertTrue(replayed["reissue_required"])
+        self.assertNotIn("confirmation_token", replayed)
         confirmed = service.abort_confirm(
             {
                 "run_key": self.run.run_key,
@@ -1631,18 +1651,264 @@ class ServiceRecoveryTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(confirmed["state"], "aborted")
+        self.assertEqual(confirmed["state"], "abort_requested")
+        self.assertEqual(confirmed["continuation"], "pending-reconcile")
+        self.assertEqual(calls, [])
+        service._continue_abort(self.run.run_key)
+        self.assertEqual(
+            service.store.run_control(self.run.run_key)["state"],
+            "aborted",
+        )
         self.assertEqual(
             calls[0],
             ("abort-task", self.run.workspace.board, task.id),
         )
-        self.assertEqual(confirmed["continuation"], "finished")
         with service.store.connect() as conn:
             stored_confirm = conn.execute(
                 "SELECT payload FROM requests WHERE request_key=?",
                 ("abort-confirm:om_abort_confirm",),
             ).fetchone()
         self.assertNotIn(requested["confirmation_token"], stored_confirm["payload"])
+
+    def test_restart_closes_sensitive_requests_without_replaying_tokens(self) -> None:
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "sensitive-restart.db")
+        service.store.ensure_run_control(self.run.run_key)
+        abort_request_key = "abort-request:om_interrupted"
+        service.store.begin_request(
+            abort_request_key,
+            "abort-request",
+            {
+                "run_key": self.run.run_key,
+                "message_id": "om_interrupted",
+            },
+        )
+
+        service._recover_sensitive_request(
+            service.store.running_requests()[0],
+        )
+
+        unavailable = service.store.begin_request(
+            abort_request_key,
+            "abort-request",
+            {
+                "run_key": self.run.run_key,
+                "message_id": "om_interrupted",
+            },
+        )
+        self.assertEqual(unavailable["error_code"], "token_unavailable")
+        self.assertTrue(unavailable["reissue_required"])
+
+        confirm_key = "abort-confirm:om_committed"
+        confirm_payload = {
+            "run_key": self.run.run_key,
+            "message_id": "om_committed",
+            "token_hash": "a" * 64,
+        }
+        service.store.begin_request(
+            confirm_key,
+            "abort-confirm",
+            confirm_payload,
+        )
+        with service.store.connect() as conn:
+            conn.execute(
+                """
+                UPDATE run_control
+                SET state='abort_requested', state_version=state_version+1,
+                    abort_requested_by=?, abort_reason=?,
+                    abort_requested_at=?, updated_at=?
+                WHERE run_key=?
+                """,
+                (
+                    self.run.origin.initiator_open_id,
+                    "stop",
+                    1,
+                    1,
+                    self.run.run_key,
+                ),
+            )
+
+        committed = next(
+            request
+            for request in service.store.running_requests()
+            if request["request_key"] == confirm_key
+        )
+        service._recover_sensitive_request(committed)
+
+        recovered = service.store.begin_request(
+            confirm_key,
+            "abort-confirm",
+            confirm_payload,
+        )
+        self.assertEqual(recovered["state"], "abort_requested")
+        self.assertEqual(recovered["continuation"], "pending-reconcile")
+
+    def test_exception_recovery_is_authorized_and_versioned(self) -> None:
+        exception = task_record(
+            task_id="t_exception",
+            body="exception evidence",
+            status="blocked",
+            assignee="dispatcher",
+            idempotency_key="exception-key",
+            tenant=self.run.run_key,
+            skills=["hollysys-dispatch-kanban"],
+            parents=["t_parent"],
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=exception.id,
+            run_key=self.run.run_key,
+            stage="exception",
+            iteration=1,
+            idempotency_key="exception-key",
+            parent_card_id="t_parent",
+            purpose="exception",
+            created_at=1,
+        )
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / "recover-controller.db")
+        service.store.ensure_run_control(self.run.run_key)
+        service.store.set_run_exception(self.run.run_key, "pipeline skipped")
+        service._history = lambda _: ([HistoryItem(managed, exception)], self.run)
+        calls: list[tuple] = []
+        service.kanban = type(
+            "RecoveryKanban",
+            (),
+            {
+                "abort_task": staticmethod(
+                    lambda board, task_id, reason: calls.append(
+                        ("archive", board, task_id)
+                    )
+                )
+            },
+        )()
+        recovered = service.recover(
+            {
+                "run_key": self.run.run_key,
+                "message_id": "om_recover",
+                "sender": self.run.origin.initiator_open_id,
+                "chat_id": self.run.origin.chat_id,
+                "thread_id": self.run.origin.thread_id,
+                "reason": "pipeline policy fixed and verified",
+            }
+        )
+
+        self.assertEqual(recovered["state"], "active")
+        self.assertEqual(recovered["continuation"], "pending-reconcile")
+        self.assertEqual(
+            calls,
+            [
+                ("archive", self.run.workspace.board, exception.id),
+            ],
+        )
+
+    def test_watchdog_redispatches_only_after_confirmed_exit_and_identity_checks(
+        self,
+    ) -> None:
+        task = task_record(
+            task_id="t_stale",
+            body="worker body",
+            status="running",
+            assignee="coder",
+            idempotency_key="stale-work",
+            tenant=self.run.run_key,
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=Stage.IMPLEMENT.value,
+            iteration=1,
+            idempotency_key="stale-work",
+            parent_card_id="t_parent",
+            purpose="work",
+            created_at=1,
+        )
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / "watchdog-controller.db")
+        service.store.ensure_run_control(self.run.run_key)
+        service.store.add_managed_card(
+            board=managed.board,
+            card_id=managed.card_id,
+            run_key=managed.run_key,
+            stage=managed.stage,
+            iteration=managed.iteration,
+            idempotency_key=managed.idempotency_key,
+            parent_card_id=managed.parent_card_id,
+            purpose=managed.purpose,
+            created_at=managed.created_at,
+        )
+        service.store.register_card_attempt(
+            board=managed.board,
+            card_id=managed.card_id,
+            profile="coder",
+            dispatch_key=managed.idempotency_key,
+            worktree=self.run.workspace.worktree,
+            branch=self.run.workspace.branch,
+        )
+        service.store.record_card_runtime_event(
+            board=managed.board,
+            card_id=managed.card_id,
+            kind="worker_started",
+            created_at=1,
+            worker_session_id="session-stale",
+            worker_pid=999_999,
+            lease_seconds=300,
+        )
+        service.reader = type(
+            "WatchdogReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: task)},
+        )()
+        service._history = lambda _: ([HistoryItem(managed, task)], self.run)
+        live_mr: list[dict | None] = [
+            {"iid": 2, "sha": "e" * 40},
+        ]
+        service.gitlab = type(
+            "WatchdogGitLab",
+            (),
+            {
+                "local_workspace_state": staticmethod(
+                    lambda run: {
+                        "ok": True,
+                        "branch": run.workspace.branch,
+                        "head_sha": "d" * 40,
+                    }
+                ),
+                "delivery_mr": staticmethod(
+                    lambda run, mr_iid=None: live_mr[0]
+                ),
+            },
+        )()
+        redispatched: list[str] = []
+        service.kanban = type(
+            "WatchdogKanban",
+            (),
+            {
+                "redispatch_stale_worker": staticmethod(
+                    lambda board, task_id, reason: redispatched.append(task_id)
+                )
+            },
+        )()
+        service._worker_process_state = lambda worker_pid: "exited"
+
+        service._enqueue_stale_worker_notices()
+
+        self.assertEqual(redispatched, [])
+        self.assertIn(
+            "mr_head_mismatch",
+            service.store.pending_outbox()[0]["payload"],
+        )
+        live_mr[0] = None
+        service._enqueue_stale_worker_notices()
+
+        self.assertEqual(redispatched, [task.id])
+        runtime = service.store.card_runtime(managed.board, managed.card_id)
+        self.assertEqual(runtime["attempt_status"], "redispatch_requested")
+        self.assertEqual(runtime["redispatch_count"], 1)
+        self.assertEqual(len(service.store.pending_outbox()), 2)
 
     def test_verbose_level_notifies_agent_start_but_standard_does_not(self) -> None:
         task = task_record(
@@ -1668,10 +1934,22 @@ class ServiceRecoveryTests(unittest.TestCase):
             update={"notification_level": NotificationLevel.VERBOSE}
         )
         service._history = lambda _: ([], self.run)
+        second_task = task_record(
+            task_id="t_review",
+            body="body",
+            status="running",
+            assignee="code-reviewer",
+        )
         service.reader = type(
             "LifecycleReader",
             (),
-            {"task": staticmethod(lambda board, card_id: task)},
+            {
+                "task": staticmethod(
+                    lambda board, card_id: (
+                        task if card_id == task.id else second_task
+                    )
+                )
+            },
         )()
         event = EventRecord(
             id=7,
@@ -1686,6 +1964,29 @@ class ServiceRecoveryTests(unittest.TestCase):
         pending = service.store.pending_outbox()
         self.assertEqual(len(pending), 1)
         self.assertIn("Agent 已开始工作", pending[0]["payload"])
+        second_managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=second_task.id,
+            run_key=self.run.run_key,
+            stage=Stage.CODE_REVIEW.value,
+            iteration=1,
+            idempotency_key="review",
+            parent_card_id=task.id,
+            purpose="work",
+            created_at=2,
+        )
+        service._record_agent_lifecycle_event(
+            second_managed,
+            EventRecord(
+                id=8,
+                task_id=second_task.id,
+                run_id=9,
+                kind="claimed",
+                payload={},
+                created_at=10,
+            ),
+        )
+        self.assertEqual(len(service.store.pending_outbox()), 2)
 
         service.config = service.config.model_copy(
             update={"notification_level": NotificationLevel.STANDARD}
@@ -1701,7 +2002,28 @@ class ServiceRecoveryTests(unittest.TestCase):
                 created_at=12,
             ),
         )
-        self.assertEqual(len(service.store.pending_outbox()), 1)
+        self.assertEqual(len(service.store.pending_outbox()), 2)
+
+    def test_minimal_level_only_keeps_explicit_human_action_progress(
+        self,
+    ) -> None:
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "minimal-controller.db")
+        service.config = config(self.root).model_copy(
+            update={"notification_level": NotificationLevel.MINIMAL}
+        )
+
+        service._enqueue_progress(self.run, "phase", "ordinary progress")
+        service._enqueue_progress(
+            self.run,
+            "approval",
+            "human approval required",
+            allow_minimal=True,
+        )
+
+        pending = service.store.pending_outbox()
+        self.assertEqual(len(pending), 1)
+        self.assertIn("human approval required", pending[0]["payload"])
 
 
 if __name__ == "__main__":
