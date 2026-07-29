@@ -92,9 +92,10 @@ def profile_credential(config: ControllerConfig, profile: str) -> ProfileCredent
         raise ValueError(f"profile_allowed_groups_missing:{profile}")
     if values["HERMES_PROFILE"] != profile:
         raise ValueError(f"profile_identity_mismatch:{profile}")
-    if values["GITLAB_HOST"] != config.gitlab_base_url:
-        raise ValueError(f"invalid_gitlab_host:{profile}")
-    endpoint = config.normalize_gitlab_endpoint(values["GITLAB_HOST"])
+    try:
+        endpoint = config.normalize_gitlab_endpoint(values["GITLAB_HOST"])
+    except ValueError as exc:
+        raise ValueError(f"invalid_gitlab_host:{profile}") from exc
     if endpoint.hostname != config.gitlab_hostname:
         raise ValueError(f"remote_host_mismatch:{profile}")
     groups = tuple(
