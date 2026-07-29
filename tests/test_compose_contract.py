@@ -80,6 +80,30 @@ class ComposeContractTests(unittest.TestCase):
             script,
         )
 
+    def test_feishu_adapter_dependencies_are_pinned_and_verified(self) -> None:
+        service = self.compose["services"]["hermes"]
+        self.assertIn(
+            "./container/ensure-feishu.sh:/etc/cont-init.d/02-hollysys-feishu:ro",
+            service["volumes"],
+        )
+        script = (self.root / "container/ensure-feishu.sh").read_text(
+            encoding="utf-8"
+        )
+        for requirement in (
+            "lark-oapi==1.6.8",
+            "qrcode==7.4.2",
+            "requests-toolbelt==1.0.0",
+        ):
+            self.assertIn(requirement, script)
+        self.assertIn("/opt/data/.cache/uv", script)
+        self.assertIn("import lark_oapi", script)
+        self.assertEqual(
+            (self.root / "container/mirrors/uv.toml")
+            .read_text(encoding="utf-8")
+            .strip(),
+            'index-url = "https://mirrors.aliyun.com/pypi/simple/"',
+        )
+
     def test_dashboard_is_published_on_configured_port(self) -> None:
         service = self.compose["services"]["hermes"]
         self.assertEqual(
