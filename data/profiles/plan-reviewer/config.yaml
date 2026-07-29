@@ -11,7 +11,9 @@ terminal:
   cwd: /workspace/projects
   home_mode: profile
   env_passthrough:
+    - HERMES_PROFILE
     - GITLAB_HOST
+    - GITLAB_ALLOWED_GROUPS
     - GITLAB_TOKEN
 approvals:
   mode: off

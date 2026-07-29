@@ -1,0 +1,295 @@
+#!/bin/sh
+set -eu
+
+REAL_GIT=/usr/bin/git
+TARGET_HOST=green-git.hollysys.net
+ASKPASS=/usr/local/bin/gitlab-askpass
+WRITERS=" prd-writer spec-writer planner tasker coder "
+READERS=" dispatcher fde spec-reviewer plan-reviewer task-reviewer tester code-reviewer "
+
+die() {
+  code=$1
+  exit_code=$2
+  profile=${HERMES_PROFILE:-unknown}
+  operation=${network_operation:-${invoked_command:-unknown}}
+  project=${remote_project:-unknown}
+  echo \
+    "hollysys-git error=$code profile=$profile host=$TARGET_HOST project=$project operation=$operation" \
+    >&2
+  exit "$exit_code"
+}
+
+git_context=
+expect_context=false
+for argument in "$@"; do
+  if [ "$expect_context" = true ]; then
+    git_context=$argument
+    expect_context=false
+  elif [ "$argument" = "-C" ]; then
+    expect_context=true
+  else
+    case "$argument" in
+      -C?*) git_context=${argument#-C} ;;
+    esac
+  fi
+done
+
+git_query() {
+  if [ -n "$git_context" ]; then
+    "$REAL_GIT" -C "$git_context" "$@"
+  else
+    "$REAL_GIT" "$@"
+  fi
+}
+
+validate_url_rewrites() {
+  rewrite_rules=$(
+    git_query config --get-regexp \
+      '^url\..*\.(insteadof|pushinsteadof)$' 2>/dev/null || true
+  )
+  [ -z "$rewrite_rules" ] || die git_url_rewrite_forbidden 71
+}
+
+validate_remote_list() {
+  remote_list=$1
+  [ -z "$remote_list" ] && return 0
+  old_ifs=$IFS
+  IFS='
+'
+  for listed_url in $remote_list; do
+    validate_remote_url "$listed_url"
+  done
+  IFS=$old_ifs
+}
+
+invoked_command=
+before_command=true
+expect_global_value=
+for argument in "$@"; do
+  if [ -n "$expect_global_value" ]; then
+    if [ "$expect_global_value" = config ]; then
+      case "$argument" in
+        alias.*=*) die git_config_override_forbidden 71 ;;
+      esac
+    fi
+    expect_global_value=
+    continue
+  fi
+  if [ "$before_command" = true ]; then
+    case "$argument" in
+      -C|--git-dir|--work-tree|--namespace|--super-prefix)
+        expect_global_value=option
+        ;;
+      -c)
+        expect_global_value=config
+        ;;
+      -calias.*=*|--config-env=alias.*=*)
+        die git_config_override_forbidden 71
+        ;;
+      --config-env)
+        expect_global_value=config
+        ;;
+      -*) ;;
+      *)
+        invoked_command=$argument
+        before_command=false
+        ;;
+    esac
+  fi
+done
+if [ -n "$invoked_command" ]; then
+  alias_value=$(
+    git_query config --get "alias.$invoked_command" 2>/dev/null || true
+  )
+  [ -z "$alias_value" ] || die git_alias_forbidden 71
+fi
+
+validate_allowed_path() {
+  remote_path=$1
+  [ -n "${GITLAB_ALLOWED_GROUPS:-}" ] || return 0
+  clean_path=${remote_path#/}
+  lowercase_path=$(printf '%s' "$clean_path" | tr '[:upper:]' '[:lower:]')
+  case "/$lowercase_path/" in
+    *"/../"*|*"/./"*|*"//"*|*"%2f"*|*"%2e"*|*"\\"*|*"?"*|*"#"*)
+      die project_access_denied 69
+      ;;
+  esac
+  remote_project=${clean_path%.git}
+  allowed=false
+  old_ifs=$IFS
+  IFS=,
+  for group in ${GITLAB_ALLOWED_GROUPS:-}; do
+    group=$(printf '%s' "$group" | tr -d ' ')
+    case "$clean_path" in
+      "$group"/*) allowed=true ;;
+    esac
+  done
+  IFS=$old_ifs
+  [ "$allowed" = true ] || die project_access_denied 69
+}
+
+validate_remote_url() {
+  remote_url=$1
+  case "$remote_url" in
+    "$TARGET_HOST":*|*@"$TARGET_HOST":*|ssh://*@"$TARGET_HOST"/*|git+ssh://"$TARGET_HOST"/*|git+ssh://*@"$TARGET_HOST"/*)
+      die ssh_disabled 68
+      ;;
+    http://"$TARGET_HOST"/*)
+      die invalid_gitlab_host 66
+      ;;
+    https://"$TARGET_HOST"/*)
+      validate_allowed_path "${remote_url#https://$TARGET_HOST}"
+      target_remote=true
+      ;;
+    *://*|git@*:*)
+      die remote_host_mismatch 70
+      ;;
+  esac
+}
+
+command_name=$invoked_command
+network_operation=
+case "$command_name" in
+  clone|fetch|pull|push|ls-remote|submodule)
+    network_operation=$command_name
+    ;;
+  send-pack|http-push)
+    network_operation=push
+    ;;
+  fetch-pack|http-fetch|remote-http|remote-https)
+    network_operation=fetch
+    ;;
+esac
+case "$command_name" in
+  clone|fetch|pull|push|ls-remote|submodule|send-pack|http-push|fetch-pack|http-fetch|remote-http|remote-https)
+    validate_url_rewrites
+    if [ -n "${GIT_CONFIG+x}${GIT_CONFIG_COUNT+x}${GIT_CONFIG_PARAMETERS+x}${GIT_CONFIG_GLOBAL+x}${GIT_CONFIG_SYSTEM+x}${GIT_CONFIG_NOSYSTEM+x}${GIT_EXEC_PATH+x}${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_INDEX_FILE+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}${GIT_COMMON_DIR+x}${GIT_SSH+x}${GIT_SSH_COMMAND+x}${GIT_PROXY_COMMAND+x}${GIT_SSL_NO_VERIFY+x}${GIT_PROTOCOL_FROM_USER+x}${GIT_ALLOW_PROTOCOL+x}" ]; then
+      die git_environment_override_forbidden 71
+    fi
+    target_remote=false
+    remote_selected=false
+    for argument in "$@"; do
+      case "$argument" in
+        -c|-c?*|--config-env|--config-env=*)
+          die git_config_override_forbidden 71
+          ;;
+        --git-dir|--git-dir=*|--work-tree|--work-tree=*|--bare|--exec-path|--exec-path=*)
+          die git_context_override_forbidden 71
+          ;;
+      esac
+    done
+
+    # Validate explicit URLs and named remotes. Ref names simply fail the
+    # remote lookup and are ignored here.
+    for argument in "$@"; do
+      case "$argument" in
+        *://*|git@*:*) remote_selected=true ;;
+      esac
+      validate_remote_url "$argument"
+      remote_urls=$(git_query remote get-url --all "$argument" 2>/dev/null || true)
+      push_urls=$(git_query remote get-url --all --push "$argument" 2>/dev/null || true)
+      if [ -n "$remote_urls$push_urls" ]; then
+        remote_selected=true
+        validate_remote_list "$remote_urls"
+        validate_remote_list "$push_urls"
+      fi
+    done
+
+    # pull/fetch/push may omit the remote. Submodules keep their URLs in Git
+    # config rather than argv, so inspect both sources before authentication.
+    origin_url=
+    if [ "$remote_selected" = false ] && {
+      [ "$command_name" = "fetch" ] \
+        || [ "$command_name" = "pull" ] \
+        || [ "$command_name" = "push" ]
+    }; then
+      current_branch=$(git_query symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+      upstream_remote=
+      if [ -n "$current_branch" ]; then
+        upstream_remote=$(
+          git_query config --get "branch.$current_branch.remote" 2>/dev/null \
+            || true
+        )
+      fi
+      [ -n "$upstream_remote" ] || upstream_remote=origin
+      origin_urls=$(
+        git_query remote get-url --all "$upstream_remote" 2>/dev/null || true
+      )
+      push_urls=$(
+        git_query remote get-url --all --push "$upstream_remote" 2>/dev/null \
+          || true
+      )
+      validate_remote_list "$origin_urls"
+      validate_remote_list "$push_urls"
+    fi
+    if [ "$command_name" = "submodule" ]; then
+      origin_urls=$(git_query remote get-url --all origin 2>/dev/null || true)
+      push_urls=$(git_query remote get-url --all --push origin 2>/dev/null || true)
+      validate_remote_list "$origin_urls"
+      validate_remote_list "$push_urls"
+      configured_submodule_urls=$(
+        git_query config --get-regexp '^submodule\..*\.url$' 2>/dev/null \
+          | awk '{print $2}' || true
+      )
+      declared_submodule_urls=$(
+        git_query config -f .gitmodules --get-regexp '^submodule\..*\.url$' \
+          2>/dev/null | awk '{print $2}' || true
+      )
+      submodule_urls=$(printf '%s\n%s\n' \
+        "$configured_submodule_urls" "$declared_submodule_urls")
+      if [ -n "$submodule_urls" ]; then
+        old_ifs=$IFS
+        IFS='
+'
+        for remote_url in $submodule_urls; do
+          case "$remote_url" in
+            ../*|./*|/*) die remote_host_mismatch 70 ;;
+          esac
+          validate_remote_url "$remote_url"
+        done
+        IFS=$old_ifs
+      fi
+    fi
+
+    if [ "$target_remote" = true ]; then
+      profile=${HERMES_PROFILE:-}
+      token=${GITLAB_TOKEN:-}
+      configured=${GITLAB_HOST:-}
+      allowed_groups=${GITLAB_ALLOWED_GROUPS:-}
+      [ -n "$profile" ] || die missing_profile_identity 64
+      case "$WRITERS$READERS" in
+        *" $profile "*) ;;
+        *) die missing_profile_identity 64 ;;
+      esac
+      [ -n "$token" ] || die missing_gitlab_token 65
+      [ -n "$allowed_groups" ] || die project_access_denied 69
+      [ "$configured" = "https://$TARGET_HOST" ] \
+        || die invalid_gitlab_host 66
+      for argument in "$@"; do
+        validate_remote_url "$argument"
+        remote_urls=$(git_query remote get-url --all "$argument" 2>/dev/null || true)
+        push_urls=$(git_query remote get-url --all --push "$argument" 2>/dev/null || true)
+        validate_remote_list "$remote_urls"
+        validate_remote_list "$push_urls"
+      done
+      validate_remote_list "${origin_urls:-}"
+      validate_remote_list "${push_urls:-}"
+      if [ "$network_operation" = "push" ]; then
+        case "$WRITERS" in
+          *" $profile "*) ;;
+          *) die push_forbidden_for_role 67 ;;
+        esac
+      fi
+      unset GIT_TRACE GIT_TRACE_PACKET GIT_TRACE_CURL GIT_CURL_VERBOSE
+      export GIT_TERMINAL_PROMPT=0
+      export GIT_ASKPASS="$ASKPASS"
+    fi
+
+    # Ignore repository/global credential helpers for remote operations. This
+    # preserves GITLAB_TOKEN as the only password source even if an Agent can
+    # modify its checkout or profile HOME.
+    exec "$REAL_GIT" -c credential.helper= -c http.extraHeader= "$@"
+    ;;
+esac
+
+exec "$REAL_GIT" "$@"
