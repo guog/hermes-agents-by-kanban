@@ -23,7 +23,8 @@ def config(tmp_path: Path) -> ControllerConfig:
         profiles_root=tmp_path / "profiles",
         projects_root=tmp_path / "projects",
         token_file=tmp_path / "token",
-        gitlab_host="gitlab.example.com",
+        gitlab_host="green-git.hollysys.net",
+        controller_mode="active",
         allowed_groups=["group"],
         stage_assignees={
             Stage.SPEC_WRITE: "spec-writer",
@@ -66,7 +67,7 @@ def run_record(tmp_path: Path) -> RunRecord:
     return RunRecord(
         run_key="hollysys-abcdefghijklmnopqrst",
         project=ProjectFacts(
-            host="gitlab.example.com",
+            host="green-git.hollysys.net",
             project_id=12,
             project_path="group/project",
             project_display_name="项目",
@@ -77,11 +78,13 @@ def run_record(tmp_path: Path) -> RunRecord:
             prd_commit_sha="a" * 40,
             prd_blob_sha="f" * 40,
             prd_blob_url=(
-                "https://gitlab.example.com/group/project/-/blob/"
+                "https://green-git.hollysys.net/group/project/-/blob/"
                 + "a" * 40
                 + "/docs/prds/example.md"
             ),
-            prd_mr_url=("https://gitlab.example.com/group/project/-/merge_requests/1"),
+            prd_mr_url=(
+                "https://green-git.hollysys.net/group/project/-/merge_requests/1"
+            ),
         ),
         workspace=WorkspaceFacts(
             board="gitlab-p12",
@@ -137,19 +140,70 @@ def completion(
             Stage.IMPLEMENT,
         }
         and data["outcome"] == "pass"
-        and "repository_evidence" not in overrides
     ):
-        data["repository_evidence"] = {
-            "repository_base_sha": run.workspace.repository_base_sha,
-            "inspected_paths": ["src/existing-module", "docs/architecture.md"],
-            "existing_capabilities": ["existing MES application framework"],
-            "change_strategy": "extend_existing",
-            "reuse_decisions": ["reuse the existing module and conventions"],
-        }
+        data.setdefault("mr_iid", 2)
+        data.setdefault(
+            "mr_url",
+            "https://gitlab.example.com/group/project/-/merge_requests/2",
+        )
+        data.setdefault("head_sha", "d" * 40)
+        if "repository_evidence" not in overrides:
+            data["repository_evidence"] = {
+                "repository_base_sha": run.workspace.repository_base_sha,
+                "inspected_paths": [
+                    "src/existing-module",
+                    "docs/architecture.md",
+                ],
+                "existing_capabilities": ["existing MES application framework"],
+                "change_strategy": "extend_existing",
+                "reuse_decisions": [
+                    "reuse the existing module and conventions"
+                ],
+            }
     if (
         stage == Stage.TEST
         and data["outcome"] in {"pass", "fail"}
         and "test_disposition" not in overrides
     ):
         data["test_disposition"] = "executed"
+    if (
+        stage in {Stage.TASKS_REVIEW, Stage.CODE_REVIEW}
+        and data["outcome"] == "pass"
+        and "gate_phase" not in overrides
+    ):
+        is_entry = stage == Stage.TASKS_REVIEW
+        data.update(
+            {
+                "gate_phase": (
+                    "implementation_entry"
+                    if is_entry
+                    else "implementation_completion"
+                ),
+                "gate_decision": "approved",
+                "gate_reviewer": (
+                    "id:11" if is_entry else "id:10"
+                ),
+                "gate_reviewed_at": "2026-07-28T00:00:00+08:00",
+                "gate_reason": "frozen TASKS contract is satisfied",
+                "gate_evidence_refs": [
+                    (
+                        "https://green-git.hollysys.net/group/project/"
+                        f"-/merge_requests/2#note_{21 if is_entry else 22}"
+                    )
+                ],
+                "gate_artifact_paths": (
+                    data.get("artifact_paths")
+                    if is_entry
+                    else ["docs/tasks/feature/tasks.md"]
+                ),
+                "gate_artifact_commit_sha": (
+                    data.get("artifact_commit_sha") if is_entry else "c" * 40
+                ),
+                "gate_artifact_digest": (
+                    data.get("artifact_digest") if is_entry else "b" * 64
+                ),
+                "contract_refs": ["PLAN-BLK-001"],
+                "requirement_ids": ["OP-001"],
+            }
+        )
     return CompletionMetadata.model_validate(data)

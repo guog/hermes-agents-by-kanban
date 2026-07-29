@@ -34,10 +34,51 @@ class ComposeContractTests(unittest.TestCase):
             "/opt/hermes/.venv/bin/python -m hollysys_controller.daemon",
             run_script,
         )
+        self.assertIn(
+            "./container/install-git-wrapper.sh:/etc/cont-init.d/01-hollysys-git-wrapper:ro",
+            service["volumes"],
+        )
+        self.assertTrue(service["environment"]["PATH"].startswith(
+            "/run/hollysys/bin:"
+        ))
+        install_script = (
+            self.root / "container/install-git-wrapper.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("-o root", install_script)
+        self.assertIn("-g root", install_script)
+        self.assertIn("-m 0555", install_script)
+        self.assertIn('"/usr/local/bin/$executable"', install_script)
+
+        finish_script = (
+            self.root / "container/services.d/hollysys-controller/finish"
+        ).read_text(encoding="utf-8")
+        self.assertIn("HOLLYSYS_FATAL_RESTART_BACKOFF_SECONDS", finish_script)
 
     def test_container_health_uses_local_liveness_probe(self) -> None:
         healthcheck = self.compose["services"]["hermes"]["healthcheck"]
+        self.assertEqual(
+            healthcheck["test"][1],
+            "/opt/hermes/.venv/bin/python",
+        )
         self.assertEqual(healthcheck["test"][-2:], ["--probe", "liveness"])
+
+    def test_dotnet_sdk_is_reused_from_persistent_runtime_data(self) -> None:
+        script = (
+            self.root / "container/ensure-dotnet8.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "PERSISTENT_DOTNET_ROOT=/opt/data/.dotnet",
+            script,
+        )
+        self.assertIn(
+            "mktemp -d /opt/data/.dotnet-stage.XXXXXX",
+            script,
+        )
+        self.assertIn('mv "$persistent_stage" "$PERSISTENT_DOTNET_ROOT"', script)
+        self.assertIn(
+            "persistent .NET root exists but does not contain a valid SDK 8",
+            script,
+        )
 
     def test_dashboard_is_published_on_configured_port(self) -> None:
         service = self.compose["services"]["hermes"]
@@ -62,6 +103,31 @@ class ComposeContractTests(unittest.TestCase):
             wrapper,
         )
         self.assertNotIn("exec python -m hollysys_controller.cli", wrapper)
+
+    def test_write_tools_allow_runtime_data_and_managed_worktrees(self) -> None:
+        environment = self.compose["services"]["hermes"]["environment"]
+        self.assertEqual(
+            environment["HERMES_WRITE_SAFE_ROOT"],
+            "/opt/data:/workspace/projects",
+        )
+
+    def test_locked_clis_are_installed_for_login_shells(self) -> None:
+        install_script = (
+            self.root / "container/install-git-wrapper.sh"
+        ).read_text(encoding="utf-8")
+        for executable in (
+            "git",
+            "gitlab-askpass",
+            "gitlab-credential",
+            "glab",
+            "lark-cli",
+        ):
+            with self.subTest(executable=executable):
+                self.assertIn(executable, install_script)
+        self.assertIn("/usr/local/bin", install_script)
+        self.assertIn("-o root", install_script)
+        self.assertIn("-g root", install_script)
+        self.assertIn("-m 0555", install_script)
 
 if __name__ == "__main__":
     unittest.main()

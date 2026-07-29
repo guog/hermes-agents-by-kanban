@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import base64
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess, TimeoutExpired
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from hollysys_controller.errors import (
+    ControllerFatalError,
+    DependencyAuthError,
+    DependencyContractError,
+    DependencyRateLimitedError,
+    DependencyTransientError,
+    ErrorContext,
+    MergeBlocked,
+)
 from hollysys_controller.gitlab import CheckedHeadConflict, GitLabClient
-from hollysys_controller.kanban import CommandError
 from hollysys_controller.models import Stage
 from tests.helpers import completion, config, run_record
 
@@ -22,12 +34,15 @@ class FakeGitLab(GitLabClient):
             "draft": False,
             "work_in_progress": False,
             "detailed_merge_status": "mergeable",
+            "source_branch": "feature/example-aaaaaaaa",
+            "target_branch": "main",
         }
         self.pipeline_status = "success"
         self.unresolved = False
         self.notes = []
         self.merge_fields = None
         self.merge_error = False
+        self.run_branch = "feature/example-aaaaaaaa"
         self.refs = [{"type": "branch", "name": "feature/example-aaaaaaaa"}]
         self.artifact_path_result = ["docs/specs/feature/spec.md"]
         self.artifact_digest_result = "b" * 64
@@ -40,6 +55,11 @@ class FakeGitLab(GitLabClient):
         self.api_calls.append((endpoint, method, fields))
         if "/notes?" in endpoint:
             return self.notes
+        if "/notes/" in endpoint and method == "GET":
+            note_id = int(endpoint.rsplit("/", 1)[1])
+            return next(
+                note for note in self.notes if int(note.get("id") or 0) == note_id
+            )
         if endpoint.endswith("/notes") and method == "POST":
             self.notes.append({"body": fields["body"]})
             return {"id": 99, "body": fields["body"]}
@@ -49,16 +69,41 @@ class FakeGitLab(GitLabClient):
         if "/refs?" in endpoint:
             return self.refs
         if "/pipelines?" in endpoint:
-            return [{"status": self.pipeline_status}]
+            return [
+                {
+                    "status": self.pipeline_status,
+                    "sha": self.mr["sha"],
+                    "ref": self.run_branch,
+                }
+            ]
         if "/discussions?" in endpoint:
             return (
-                [{"notes": [{"resolvable": True, "resolved": False}]}]
+                [
+                    {
+                        "notes": [
+                            {
+                                "id": 31,
+                                "resolvable": True,
+                                "resolved": False,
+                                "author": {"username": "review-owner"},
+                                "updated_at": "2026-07-29T09:30:00Z",
+                            }
+                        ]
+                    }
+                ]
                 if self.unresolved
                 else []
             )
         if endpoint.endswith("/merge"):
             if self.merge_error:
-                raise CommandError(["glab", "api"], 1, "409 Conflict")
+                raise DependencyContractError(
+                    "409 Conflict",
+                    context=ErrorContext(
+                        dependency="gitlab",
+                        endpoint="merge",
+                        status_code=409,
+                    ),
+                )
             self.merge_fields = fields
             return {
                 **self.mr,
@@ -96,6 +141,7 @@ class GitLabGateTests(unittest.TestCase):
         )
         self.client.notes = [
             {
+                "id": 21,
                 "author": {"id": 9, "username": "tester", "name": "Tester"},
                 "body": (
                     "HOLLYSYS-GATE: v=5 run=hollysys-abcdefghijklmnopqrst "
@@ -104,6 +150,7 @@ class GitLabGateTests(unittest.TestCase):
                 ),
             },
             {
+                "id": 22,
                 "author": {
                     "id": 10,
                     "username": "code-reviewer",
@@ -113,6 +160,10 @@ class GitLabGateTests(unittest.TestCase):
                     "HOLLYSYS-GATE: v=5 run=hollysys-abcdefghijklmnopqrst "
                     "stage=code-review result=pass digest=na artifact=na "
                     f"head={'d' * 40} test=na task=t_abc"
+                    "\nHOLLYSYS-SEMANTIC-GATE: v=1 "
+                    "run=hollysys-abcdefghijklmnopqrst "
+                    "phase=implementation_completion decision=approved "
+                    f"artifact={'c' * 40} digest={'b' * 64}"
                 ),
             },
         ]
@@ -135,6 +186,64 @@ class GitLabGateTests(unittest.TestCase):
         self.client.notes[0]["author"]["username"] = "wrong-user"
         with self.assertRaisesRegex(ValueError, "allowed GitLab identity"):
             self.client.validate_gate(self.run, self.test_meta)
+
+    def test_start_rejects_noncanonical_urls_before_api_or_persistence(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        valid_blob = (
+            "https://green-git.hollysys.net/group/project/-/blob/"
+            f"{sha}/docs/prds/feature.md"
+        )
+        valid_mr = (
+            "https://green-git.hollysys.net/group/project/-/merge_requests/2"
+        )
+        cases = (
+            (
+                valid_blob.replace(
+                    "https://",
+                    "https://oauth2:secret@",
+                ),
+                valid_mr,
+            ),
+            (
+                valid_blob.replace(
+                    "green-git.hollysys.net",
+                    "green-git.hollysys.net:8443",
+                ),
+                valid_mr,
+            ),
+            (valid_blob, valid_mr + "?private_token=secret"),
+            (
+                valid_blob.replace(
+                    "group/project",
+                    "group/%2e%2e/other",
+                ),
+                valid_mr.replace(
+                    "group/project",
+                    "group/%2e%2e/other",
+                ),
+            ),
+            (
+                valid_blob.replace(
+                    "docs/prds/feature.md",
+                    "docs/%2e%2e/secret.md",
+                ),
+                valid_mr,
+            ),
+        )
+        for blob_url, mr_url in cases:
+            with self.subTest(blob_url=blob_url, mr_url=mr_url), patch.object(
+                self.client,
+                "api",
+            ) as api:
+                with self.assertRaises(ValueError):
+                    self.client.validate_start(
+                        prd_blob_url=blob_url,
+                        prd_mr_url=mr_url,
+                        origin=self.run.origin,
+                    )
+                api.assert_not_called()
 
     def test_abort_delivery_comments_once_and_closes_open_mr(self) -> None:
         first = self.client.abort_delivery(
@@ -241,6 +350,23 @@ class GitLabGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not exist at base"):
             self.client.validate_repository_evidence(self.run, invalid)
 
+    def test_authoring_pass_must_match_shared_delivery_mr_head(self) -> None:
+        metadata = completion(self.root, Stage.IMPLEMENT)
+        self.client.validate_author_completion(self.run, metadata)
+
+        self.client.mr["sha"] = "e" * 40
+        with self.assertRaisesRegex(ValueError, "current shared delivery"):
+            self.client.validate_author_completion(self.run, metadata)
+
+    def test_explicit_delivery_mr_must_belong_to_run_branch(self) -> None:
+        self.client.mr["source_branch"] = "feature/another-run"
+        with patch.object(
+            self.client,
+            "api",
+            return_value=dict(self.client.mr),
+        ), self.assertRaisesRegex(ValueError, "run branch/target"):
+            GitLabClient.delivery_mr(self.client, self.run, 2)
+
     def test_document_gate_artifact_commit_must_be_on_delivery_branch(self) -> None:
         metadata = completion(
             self.root,
@@ -340,16 +466,51 @@ class GitLabGateTests(unittest.TestCase):
                 self.run, mr_iid=2, test=self.test_meta, code_review=changed
             )
         self.client.pipeline_status = "failed"
-        with self.assertRaisesRegex(ValueError, "pipeline"):
+        with self.assertRaises(MergeBlocked) as pipeline:
             self.client.validate_merge(
                 self.run,
                 mr_iid=2,
                 test=self.test_meta,
                 code_review=self.review_meta,
             )
+        self.assertEqual(pipeline.exception.kind, "pipeline_failed")
+        self.assertTrue(pipeline.exception.immediate_exception)
         self.client.pipeline_status = "success"
         self.client.unresolved = True
-        with self.assertRaisesRegex(ValueError, "unresolved"):
+        self.client.mr["detailed_merge_status"] = "discussions_not_resolved"
+        with self.assertRaises(MergeBlocked) as discussion:
+            self.client.validate_merge(
+                self.run,
+                mr_iid=2,
+                test=self.test_meta,
+                code_review=self.review_meta,
+            )
+        self.assertEqual(discussion.exception.kind, "discussion_unresolved")
+        self.assertTrue(str(discussion.exception.url).endswith("#note_31"))
+        self.assertEqual(discussion.exception.owner, "review-owner")
+        self.assertEqual(
+            discussion.exception.updated_at,
+            "2026-07-29T09:30:00Z",
+        )
+
+    def test_pipeline_skipped_is_an_immediate_exception(self) -> None:
+        self.client.pipeline_status = "skipped"
+        with self.assertRaises(MergeBlocked) as failure:
+            self.client.validate_merge(
+                self.run,
+                mr_iid=2,
+                test=self.test_meta,
+                code_review=self.review_meta,
+            )
+        self.assertEqual(failure.exception.kind, "pipeline_skipped")
+        self.assertTrue(failure.exception.immediate_exception)
+
+    def test_pipeline_must_match_delivery_head_and_branch(self) -> None:
+        self.client.run_branch = "feature/another-run"
+        with self.assertRaisesRegex(
+            DependencyContractError,
+            "delivery head/ref",
+        ):
             self.client.validate_merge(
                 self.run,
                 mr_iid=2,
@@ -357,10 +518,274 @@ class GitLabGateTests(unittest.TestCase):
                 code_review=self.review_meta,
             )
 
+    def test_http_failures_have_stable_recovery_classes(self) -> None:
+        cases = (
+            ("HTTP 401 unauthorized", DependencyAuthError),
+            (
+                "HTTP 429 rate limited Retry-After: 45",
+                DependencyRateLimitedError,
+            ),
+            ("HTTP 422 invalid request", DependencyContractError),
+            ("HTTP 503 unavailable", DependencyTransientError),
+        )
+        for stderr, expected in cases:
+            with self.subTest(stderr=stderr):
+                error = self.client._api_error(
+                    "projects/12",
+                    CompletedProcess(["glab"], 1, "", stderr),
+                )
+                self.assertIsInstance(error, expected)
+        limited = self.client._api_error(
+            "projects/12",
+            CompletedProcess(
+                ["glab"],
+                1,
+                "",
+                "HTTP 429 rate limited Retry-After: 45",
+            ),
+        )
+        self.assertEqual(limited.context.retry_after_seconds, 45)
+
+    def test_api_errors_redact_controller_token(self) -> None:
+        token = "controller-secret-token"
+        self.client.config.token_file.write_text(token, encoding="utf-8")
+        self.client.config.token_file.chmod(0o600)
+        error = self.client._api_error(
+            "user",
+            CompletedProcess(
+                ["glab"],
+                1,
+                "",
+                f"HTTP 401 Authorization: Bearer {token}",
+            ),
+        )
+        self.assertNotIn(token, str(error))
+        self.assertIn("[REDACTED]", str(error))
+
+    def test_invalid_controller_token_file_is_local_fatal(self) -> None:
+        self.client.config.token_file.write_text(
+            "controller-token",
+            encoding="utf-8",
+        )
+        self.client.config.token_file.chmod(0o644)
+        with self.assertRaisesRegex(
+            ControllerFatalError,
+            "controller_gitlab_token_invalid",
+        ), patch("hollysys_controller.gitlab.subprocess.run") as run:
+            self.client._run(["glab", "api", "user"])
+        run.assert_not_called()
+
+    def test_controller_git_environment_ignores_user_git_configuration(self) -> None:
+        self.client.config.token_file.write_text(
+            "controller-token",
+            encoding="utf-8",
+        )
+        self.client.config.token_file.chmod(0o600)
+        inherited = {
+            "GLAB_TOKEN": "wrong-token",
+            "PRIVATE_TOKEN": "wrong-private-token",
+            "GIT_ASKPASS": "/tmp/untrusted-askpass",
+            "GIT_CONFIG_GLOBAL": "/tmp/untrusted-gitconfig",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "url.ssh://attacker/.insteadOf",
+            "GIT_CONFIG_VALUE_0": "https://green-git.hollysys.net/",
+            "GIT_SSH_COMMAND": "ssh -F /tmp/untrusted",
+        }
+        with patch.dict(os.environ, inherited, clear=False):
+            env = self.client._env()
+
+        self.assertEqual(env["GITLAB_TOKEN"], "controller-token")
+        for key in inherited:
+            self.assertNotIn(key, env)
+
+    def test_existing_checkout_origin_must_be_https(self) -> None:
+        checkout = Path(self.run.workspace.checkout)
+        (checkout / ".git").mkdir(parents=True)
+        for origin in (
+            "http://green-git.hollysys.net/group/project.git",
+            "https://green-git.hollysys.net/other/group/project.git",
+            "https://green-git.hollysys.net:8443/group/project.git",
+        ):
+            with self.subTest(origin=origin):
+                self.client._git = lambda *args, origin=origin, **kwargs: CompletedProcess(
+                    ["git"],
+                    0,
+                    f"{origin}\n",
+                    "",
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "token-free project URL",
+                ):
+                    self.client.ensure_workspace(
+                        self.run,
+                    self.run.workspace.repository_base_sha,
+                )
+
+    def test_existing_worktree_must_belong_to_validated_checkout(self) -> None:
+        checkout = Path(self.run.workspace.checkout)
+        worktree = Path(self.run.workspace.worktree)
+        (checkout / ".git").mkdir(parents=True)
+        worktree.mkdir(parents=True)
+
+        def git_result(cwd, args, tolerate=False):
+            if args == ["remote", "get-url", "origin"]:
+                stdout = (
+                    "https://green-git.hollysys.net/"
+                    f"{self.run.project.project_path}.git\n"
+                )
+            elif args[:2] == ["cat-file", "-e"]:
+                stdout = ""
+            elif args == ["branch", "--show-current"]:
+                stdout = f"{self.run.workspace.branch}\n"
+            elif args == ["rev-parse", "--git-common-dir"]:
+                stdout = f"{self.root / 'other-checkout' / '.git'}\n"
+            else:
+                self.fail(f"unexpected git invocation: {args}")
+            return CompletedProcess(["git", *args], 0, stdout, "")
+
+        self.client._git = git_result
+
+        with self.assertRaisesRegex(ValueError, "validated checkout"):
+            self.client.ensure_workspace(
+                self.run,
+                self.run.workspace.repository_base_sha,
+            )
+
+    def test_api_command_timeout_is_a_transient_dependency_error(self) -> None:
+        self.client.config.token_file.write_text("controller-token", encoding="utf-8")
+        self.client.config.token_file.chmod(0o600)
+        client = GitLabClient(self.client.config)
+        with patch(
+            "hollysys_controller.gitlab.subprocess.run",
+            side_effect=TimeoutExpired(["glab"], 10),
+        ), self.assertRaises(DependencyTransientError) as raised:
+            client.api("user")
+        self.assertEqual(raised.exception.context.error_code, "timeout")
+
+    def test_semantic_gate_requires_frozen_requirement_and_contract(self) -> None:
+        self.client.artifact_digest_result = "b" * 64
+        document = (
+            "# TASKS\n"
+            "- [ ] T001 在 `src/order.py` 实现 OP-001 和 PLAN-BLK-001\n"
+            "  - 动作：modify\n"
+            "  - depends_on：[]\n"
+            "  - 验收：行为可验证\n"
+            "  - 测试：`python -m unittest`\n"
+            "evidence: docs/evidence/deployment-entry.md\n"
+        )
+        self.client.file = lambda project_id, path, ref: {
+            "encoding": "base64",
+            "content": base64.b64encode(document.encode()).decode(),
+            "blob_id": "f" * 40,
+        }
+        metadata = completion(
+            self.root,
+            Stage.IMPLEMENT,
+            gate_phase="deployment_entry",
+            gate_decision="approved",
+            gate_reviewer="id:42",
+            gate_reviewed_at="2026-07-29T12:00:00+08:00",
+            gate_reason="approved in the isolated deployment environment",
+            gate_evidence_refs=[
+                (
+                    "https://green-git.hollysys.net/group/project/"
+                    "-/merge_requests/2#note_42"
+                ),
+                "docs/evidence/deployment-entry.md",
+            ],
+            gate_artifact_paths=["docs/tasks/feature/tasks.md"],
+            gate_artifact_commit_sha="c" * 40,
+            gate_artifact_digest="b" * 64,
+            contract_refs=["PLAN-BLK-001"],
+            requirement_ids=["OP-001"],
+        )
+        self.client.notes = [
+            {
+                "id": 42,
+                "author": {"id": 42, "username": "release-reviewer"},
+                "body": (
+                    "HOLLYSYS-SEMANTIC-GATE: v=1 "
+                    "run=hollysys-abcdefghijklmnopqrst "
+                    "phase=deployment_entry decision=approved "
+                    f"artifact={'c' * 40} digest={'b' * 64}"
+                ),
+            }
+        ]
+        self.client.validate_semantic_gate(self.run, metadata)
+
+        self.client.notes[0]["author"]["id"] = 41
+        with self.assertRaisesRegex(ValueError, "author or frozen identity"):
+            self.client.validate_semantic_gate(self.run, metadata)
+        self.client.notes[0]["author"]["id"] = 42
+
+        unverified_url = metadata.model_copy(
+            update={
+                "gate_evidence_refs": [
+                    (
+                        "https://green-git.hollysys.net/group/project/"
+                        "-/merge_requests/2"
+                    )
+                ]
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "exact delivery MR note"):
+            self.client.validate_semantic_gate(self.run, unverified_url)
+
+        missing = metadata.model_copy(
+            update={"requirement_ids": ["OP-MISSING"]}
+        )
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self.client.validate_semantic_gate(self.run, missing)
+
+        false_prefix = document.replace("OP-001", "OP-0010")
+        self.client.file = lambda project_id, path, ref: {
+            "encoding": "base64",
+            "content": base64.b64encode(false_prefix.encode()).decode(),
+            "blob_id": "f" * 40,
+        }
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self.client.validate_semantic_gate(self.run, metadata)
+
+    def test_implementation_entry_rejects_task_cycles_and_upstream_rewrites(
+        self,
+    ) -> None:
+        cyclic = (
+            "- [ ] T001 在 `src/a.py` 实现 OP-001 PLAN-BLK-001\n"
+            "  - 动作：modify\n"
+            "  - depends_on：[T002]\n"
+            "- [ ] T002 在 `src/b.py` 实现辅助行为\n"
+            "  - 动作：extend\n"
+            "  - depends_on：[T001]\n"
+        )
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            self.client._validate_task_graph([cyclic])
+
+        inversion = (
+            "- [ ] T001 在 `docs/prds/order/specs/spec-order.md` 补写需求\n"
+            "  - 动作：modify\n"
+            "  - depends_on：[]\n"
+        )
+        with self.assertRaisesRegex(ValueError, "frozen"):
+            self.client._validate_task_graph([inversion])
+
     def test_merge_always_sends_checked_head(self) -> None:
         result = self.client.merge(self.run, 2, "d" * 40)
         self.assertEqual(result["state"], "merged")
+        self.assertTrue(result["_hollysys_controller_merge_submitted_v3"])
         self.assertEqual(self.client.merge_fields, {"sha": "d" * 40})
+
+    def test_merge_readback_before_submission_is_not_claimed(self) -> None:
+        self.client.mr["state"] = "merged"
+        result = self.client.merge(self.run, 2, "d" * 40)
+        self.assertFalse(result["_hollysys_controller_merge_submitted_v3"])
+        self.assertIsNone(self.client.merge_fields)
+
+    def test_merge_rejects_a_merged_response_for_another_head(self) -> None:
+        self.client.mr["sha"] = "f" * 40
+        self.client.mr["state"] = "merged"
+        with self.assertRaises(CheckedHeadConflict):
+            self.client.merge(self.run, 2, "d" * 40)
 
     def test_merge_sha_conflict_is_distinguished_from_other_errors(self) -> None:
         self.client.merge_error = True

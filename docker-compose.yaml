@@ -17,12 +17,13 @@ services:
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: "0.0.0.0"
       HERMES_HOME: /opt/data
+      HERMES_WRITE_SAFE_ROOT: /opt/data:/workspace/projects
       PYTHONPATH: /opt/hollysys-controller-src
       HOLLYSYS_CONTROLLER_CONFIG: /opt/hollysys-controller/config.yaml
       HOLLYSYS_CONTROLLER_STATE_DIR: /opt/data/controller
       HOLLYSYS_CONTROLLER_SOCKET: /opt/data/controller/controller.sock
       HOLLYSYS_GITLAB_TOKEN_FILE: /opt/data/controller/gitlab-token
-      PATH: /opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.dotnet:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PATH: /run/hollysys/bin:/opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.dotnet:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       PIP_CONFIG_FILE: /etc/pip.conf
       NPM_CONFIG_USERCONFIG: /opt/fleet/container/mirrors/npmrc
     ports:
@@ -37,6 +38,7 @@ services:
       - ./hollysysctl:/usr/local/bin/hollysysctl:ro
       - ./container:/opt/fleet/container:ro
       - ./container/ensure-dotnet8.sh:/etc/cont-init.d/00-hollysys-dotnet8:ro
+      - ./container/install-git-wrapper.sh:/etc/cont-init.d/01-hollysys-git-wrapper:ro
       - ./container/services.d/hollysys-controller:/run/service/hollysys-controller:ro
       - ./container/mirrors/debian.sources:/etc/apt/sources.list.d/debian.sources:ro
       - ./container/mirrors/sources.list:/etc/apt/sources.list:ro
@@ -45,7 +47,7 @@ services:
       - ./templates:/opt/fleet/templates:ro
       - ./schemas:/opt/fleet/schemas:ro
     healthcheck:
-      test: ["CMD", "python", "-m", "hollysys_controller.cli", "health", "--probe", "liveness"]
+      test: ["CMD", "/opt/hermes/.venv/bin/python", "-m", "hollysys_controller.cli", "health", "--probe", "liveness"]
       interval: 30s
       timeout: 10s
       retries: 3

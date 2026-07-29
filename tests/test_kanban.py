@@ -8,6 +8,11 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
+from hollysys_controller.errors import (
+    ControllerFatalError,
+    DependencyContractError,
+    DependencyTransientError,
+)
 from hollysys_controller.kanban import (
     KanbanCLI,
     KanbanReader,
@@ -86,6 +91,18 @@ class KanbanReaderTests(unittest.TestCase):
         self.assertEqual(task.latest_metadata, {"protocol_version": "bad"})
         self.assertEqual(task.parents, ["t_root"])
         self.assertEqual(task.event_kinds, ["completed", "gave_up"])
+
+    def test_missing_or_corrupt_board_is_a_kanban_dependency_error(self) -> None:
+        with self.assertRaises(DependencyTransientError) as missing:
+            self.reader.max_event_id("missing")
+        self.assertEqual(missing.exception.context.error_code, "board_missing")
+
+        corrupt = self.reader.board_db("corrupt")
+        corrupt.parent.mkdir(parents=True)
+        corrupt.write_bytes(b"not a sqlite database")
+        with self.assertRaises(DependencyContractError) as damaged:
+            self.reader.max_event_id("corrupt")
+        self.assertEqual(damaged.exception.context.dependency, "kanban")
 
     def test_card_and_root_bodies_round_trip(self) -> None:
         run = run_record(self.root)
@@ -189,6 +206,85 @@ class KanbanReaderTests(unittest.TestCase):
         self.assertIn("t_work", commands[0])
         self.assertIn("archive", commands[1])
         self.assertIn("t_work", commands[1])
+
+    def test_redispatch_stale_worker_reclaims_without_archiving(self) -> None:
+        statuses = iter(["running", "ready"])
+
+        def current_task(board: str, task_id: str) -> TaskRecord:
+            return TaskRecord(
+                id=task_id,
+                title="work",
+                body="body",
+                assignee="coder",
+                status=next(statuses),
+                created_by="hollysys-controller",
+                created_at=1,
+                completed_at=None,
+                idempotency_key="key",
+                tenant="run",
+                workspace_path="/worktree",
+                branch_name="feature/run",
+                skills=[],
+                current_run_id=4,
+                latest_summary=None,
+                latest_metadata=None,
+                latest_outcome=None,
+                parents=["t_root"],
+                comments=[],
+                event_kinds=[],
+            )
+
+        reader = type("RedispatchReader", (), {"task": staticmethod(current_task)})()
+        cli = KanbanCLI(config(self.root), reader)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            return_value=completed,
+        ) as run:
+            result = cli.redispatch_stale_worker(
+                "gitlab-p12",
+                "t_work",
+                "confirmed exit",
+            )
+
+        self.assertEqual(result.status, "ready")
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("reclaim", commands[0])
+        self.assertNotIn("archive", commands[0])
+
+    def test_cli_timeout_is_a_transient_kanban_failure(self) -> None:
+        cli = KanbanCLI(config(self.root), self.reader)
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["hermes"], 30),
+        ), self.assertRaises(DependencyTransientError) as raised:
+            cli._run(["boards", "list"])
+        self.assertEqual(raised.exception.context.dependency, "kanban")
+        self.assertEqual(raised.exception.context.error_code, "timeout")
+
+    def test_cli_busy_and_contract_failures_are_distinct(self) -> None:
+        cli = KanbanCLI(config(self.root), self.reader)
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                [], 1, "", "database is locked"
+            ),
+        ), self.assertRaises(DependencyTransientError):
+            cli._run(["boards", "list"])
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 2, "", "invalid option"),
+        ), self.assertRaises(DependencyContractError):
+            cli._run(["boards", "list"])
+
+    def test_missing_hermes_binary_is_controller_fatal(self) -> None:
+        cli = KanbanCLI(config(self.root), self.reader)
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            side_effect=FileNotFoundError("hermes"),
+        ), self.assertRaises(ControllerFatalError):
+            cli._run(["boards", "list"])
 
 
 if __name__ == "__main__":

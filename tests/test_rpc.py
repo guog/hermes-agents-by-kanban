@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from hollysys_controller.cli import (
     build_parser,
     controller_snapshot_config,
     params_for,
 )
+from hollysys_controller.daemon import ControllerDaemon
+from hollysys_controller.errors import ControllerFatalError
 from hollysys_controller.models import RpcRequest
 from hollysys_controller.rpc import RpcServer, rpc_call
 from tests.helpers import config
@@ -36,6 +40,34 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(response.ok)
         self.assertEqual(response.result, {"method": "health", "probe": True})
+
+    async def test_rpc_controller_fatal_signals_daemon_exit(self) -> None:
+        daemon = ControllerDaemon.__new__(ControllerDaemon)
+        daemon.service = SimpleNamespace(
+            health=lambda probe: (_ for _ in ()).throw(
+                ControllerFatalError("controller_store_database_error")
+            )
+        )
+        daemon.fatal_event = asyncio.Event()
+        daemon.rpc_fatal_error = None
+
+        with self.assertRaisesRegex(
+            ControllerFatalError,
+            "controller_store_database_error",
+        ):
+            await daemon.handle_rpc(
+                RpcRequest(
+                    id="fatal-1",
+                    method="health",
+                    params={"probe": "liveness"},
+                )
+            )
+
+        self.assertTrue(daemon.fatal_event.is_set())
+        self.assertIsInstance(
+            daemon.rpc_fatal_error,
+            ControllerFatalError,
+        )
 
     def test_status_summary_is_a_local_cli_command(self) -> None:
         args = build_parser().parse_args(
@@ -91,6 +123,29 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
                 },
             ),
         )
+
+    def test_recover_cli_method_is_allowed_by_rpc_contract(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "recover",
+                "--run-key",
+                "hollysys-abcdefghijklmnopqrst",
+                "--message-id",
+                "om_recover",
+                "--sender",
+                "ou_admin",
+                "--chat-id",
+                "oc_origin",
+                "--reason",
+                "credential rotation verified",
+            ]
+        )
+        method, params = params_for(args)
+
+        request = RpcRequest(id="recover-1", method=method, params=params)
+
+        self.assertEqual(request.method, "recover")
+        self.assertEqual(request.params["sender"], "ou_admin")
 
 
 if __name__ == "__main__":
