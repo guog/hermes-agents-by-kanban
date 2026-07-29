@@ -405,6 +405,53 @@ class GitLabClient:
             raise RuntimeError("more than one delivery MR exists for the run branch")
         return matches[0] if matches else None
 
+    def abort_delivery(
+        self,
+        run: RunRecord,
+        *,
+        requested_by: str,
+        reason: str,
+    ) -> dict:
+        """Write one abort audit note and close an unmerged delivery MR."""
+        mr = self.delivery_mr(run)
+        if mr is None:
+            return {"state": "absent", "iid": None, "web_url": None}
+        if mr.get("state") == "merged":
+            return {
+                "state": "merged",
+                "iid": mr.get("iid"),
+                "web_url": mr.get("web_url"),
+                "merge_commit_sha": mr.get("merge_commit_sha"),
+            }
+        iid = int(mr["iid"])
+        project = self._project_endpoint(run.project.project_id)
+        marker = f"[hollysys-aborted:v3] run={run.run_key}"
+        notes = self.paginated_list(
+            f"{project}/merge_requests/{iid}/notes"
+        )
+        if not any(marker in str(note.get("body") or "") for note in notes):
+            self.api(
+                f"{project}/merge_requests/{iid}/notes",
+                method="POST",
+                fields={
+                    "body": (
+                        f"{marker}\n"
+                        f"requested_by={requested_by}\n"
+                        f"reason={reason[:1000]}\n"
+                        "Controller stopped all managed work and preserved "
+                        "the branch/worktree for human inspection."
+                    )
+                },
+            )
+        current = self.delivery_mr(run, iid)
+        if current and current.get("state") == "opened":
+            current = self.api(
+                f"{project}/merge_requests/{iid}",
+                method="PUT",
+                fields={"state_event": "close"},
+            )
+        return current if isinstance(current, dict) else mr
+
     def validate_gate(self, run: RunRecord, metadata: CompletionMetadata) -> str | None:
         if metadata.stage not in {
             Stage.SPEC_REVIEW,

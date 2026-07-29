@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -76,6 +78,156 @@ class StoreTests(unittest.TestCase):
         pending = self.store.pending_outbox()
         self.assertEqual(len(pending), 1)
         self.assertIn('"x": 1', pending[0]["payload"])
+
+    def test_abort_confirmation_is_bound_to_requester_and_channel(self) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        token_hash = hashlib.sha256(b"SAFE2345").hexdigest()
+        self.store.ensure_run_control(run_key)
+        self.store.create_abort_request(
+            request_id="abort-request:om_request",
+            run_key=run_key,
+            token_hash=token_hash,
+            sender="ou_owner",
+            chat_id="oc_origin",
+            thread_id="omt_origin",
+            reason="human stopped the delivery",
+            expires_at=int(time.time()) + 600,
+        )
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "requester, and channel",
+        ):
+            self.store.confirm_abort_request(
+                run_key=run_key,
+                token_hash=token_hash,
+                sender="ou_other",
+                chat_id="oc_origin",
+                thread_id="omt_origin",
+                message_id="om_wrong",
+            )
+
+        control = self.store.confirm_abort_request(
+            run_key=run_key,
+            token_hash=token_hash,
+            sender="ou_owner",
+            chat_id="oc_origin",
+            thread_id="omt_origin",
+            message_id="om_confirm",
+        )
+        self.assertEqual(control["state"], "abort_requested")
+        self.store.mark_aborting(run_key)
+        self.store.finish_abort(run_key)
+        self.assertEqual(self.store.run_control(run_key)["state"], "aborted")
+
+    def test_abort_confirmation_token_expires(self) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        token_hash = hashlib.sha256(b"SAFE2345").hexdigest()
+        self.store.ensure_run_control(run_key)
+        self.store.create_abort_request(
+            request_id="abort-request:expired",
+            run_key=run_key,
+            token_hash=token_hash,
+            sender="ou_owner",
+            chat_id="oc_origin",
+            thread_id=None,
+            reason="stop",
+            expires_at=int(time.time()) - 1,
+        )
+        with self.assertRaisesRegex(ValueError, "expired"):
+            self.store.confirm_abort_request(
+                run_key=run_key,
+                token_hash=token_hash,
+                sender="ou_owner",
+                chat_id="oc_origin",
+                thread_id=None,
+                message_id="om_confirm",
+            )
+
+    def test_dependency_outage_backoff_is_persisted_and_recovers(self) -> None:
+        first = self.store.record_dependency_failure(
+            "gitlab",
+            "503 unavailable",
+            initial_backoff_seconds=5,
+            maximum_backoff_seconds=20,
+        )
+        second = self.store.record_dependency_failure(
+            "gitlab",
+            "503 unavailable",
+            initial_backoff_seconds=5,
+            maximum_backoff_seconds=20,
+        )
+        self.assertEqual(first["failures"], 1)
+        self.assertEqual(second["failures"], 2)
+        self.assertEqual(first["outage_id"], second["outage_id"])
+        self.assertGreaterEqual(
+            second["next_retry_at"] - second["updated_at"],
+            10,
+        )
+        self.assertEqual(len(self.store.open_dependency_outages()), 1)
+        self.store.associate_outage_run(
+            "gitlab",
+            first["outage_id"],
+            "hollysys-abcdefghijklmnopqrst",
+        )
+        self.assertEqual(
+            self.store.outage_run_keys("gitlab", first["outage_id"]),
+            ["hollysys-abcdefghijklmnopqrst"],
+        )
+        recovered = self.store.recover_dependency("gitlab")
+        self.assertEqual(recovered["outage_id"], first["outage_id"])
+        self.assertEqual(self.store.open_dependency_outages(), [])
+
+    def test_merge_wait_is_reconstructable_and_clearable(self) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.set_merge_wait(
+            run_key,
+            mr_iid=2,
+            head_sha="a" * 40,
+            blocker_kind="pipeline_pending",
+            blocker="pipeline is running",
+            retry_seconds=30,
+        )
+        waiting = self.store.merge_wait(run_key)
+        self.assertEqual(waiting["mr_iid"], 2)
+        self.assertEqual(waiting["head_sha"], "a" * 40)
+        self.assertEqual(waiting["blocker_kind"], "pipeline_pending")
+        self.assertEqual(waiting["blocker"], "pipeline is running")
+        self.store.clear_merge_wait(run_key)
+        self.assertIsNone(self.store.merge_wait(run_key))
+
+    def test_worker_runtime_envelope_tracks_session_and_progress_lease(self) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.add_managed_card(
+            board="gitlab-p12",
+            card_id="t_work",
+            run_key=run_key,
+            stage="implement",
+            iteration=1,
+            idempotency_key="work",
+            parent_card_id="t_root",
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_work",
+            kind="claimed",
+            created_at=100,
+            worker_session_id="session-1",
+            lease_seconds=600,
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_work",
+            kind="heartbeat",
+            created_at=200,
+            worker_session_id="session-1",
+            lease_seconds=600,
+        )
+        runtime = self.store.card_runtime("gitlab-p12", "t_work")
+        self.assertEqual(runtime["worker_started_at"], 100)
+        self.assertEqual(runtime["worker_session_id"], "session-1")
+        self.assertEqual(runtime["last_heartbeat_at"], 200)
+        self.assertEqual(runtime["deadline_at"], 800)
 
 
 if __name__ == "__main__":

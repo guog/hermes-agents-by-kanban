@@ -17,7 +17,7 @@ version: 2.0.1
 - PRD 遗漏、歧义或自相矛盾不得阻塞。依次按安全/数据完整性、明确验收、具体规则优先于一般描述、仓库契约与兼容性、最小可逆范围作出决定，并写入 SPEC 与 MR 的关键决策；保留未采用方案、影响和回退方式。
 - 只有权限、凭据、环境/能力缺失、自动重试不再安全或破坏性动作待授权时才执行“人类阻塞协议”：写幂等 `[human-block:v1]` 评论后 `kanban_block`。Controller outbox 负责原渠道通知；不得自行发飞书、管理订阅、unblock 或创建恢复卡。
 
-1. 调用 `kanban_show()` 并要求 `created_by=hollysys-controller`，且卡片 JSON 的 v2 protocol/mode/run/stage/iteration/assignee/parent、冻结基线和可选 repair_context 与当前卡一致；对照 GitLab 验证项目、worktree/分支、PRD blob 和运行键。绝不得发现或克隆另一个仓库。
+1. 调用 `kanban_show()` 并要求 `created_by=hollysys-controller`，且卡片 JSON 的 v3 protocol/mode/run/stage/iteration/assignee/parent、冻结基线和可选 repair_context 与当前卡一致；对照 GitLab 验证项目、worktree/分支、PRD blob 和运行键。绝不得发现或克隆另一个仓库。
 2. 读取准确 commit 上的 PRD，并在 `repository_base_sha` 上盘点相关现有能力。至少检查
    仓库规则/架构文档、相邻业务模块、数据或接口契约、已有测试；记录精确路径、当前
    可观察行为、可复用点和 PRD 要求的差异。若没有同类业务能力，也必须识别将承载
@@ -28,7 +28,7 @@ version: 2.0.1
    但不泄漏技术实现选择。键必须稳定，替换全部占位符。
 4. `repair_context.kind=review_failure` 时逐项处理 findings，保留稳定键；`frozen_artifact_violation` 时只按卡片 baseline 恢复冻结文件，再在 SPEC 内吸收当前阶段适配。不得修改 PRD。
 5. 按仓库的约定式提交规则 commit 最小且连贯的 SPEC 变更，并 push 到共享分支。首次有效 SPEC commit 后，先对账，再填充 MR 描述（包括 `## 关键自主决策`；没有时填写 `无`），然后使用 `/opt/fleet/templates/mr-description.md` 创建且只创建一个 `Draft: [PRD] <prd-basename>.md` MR；此后只更新该 MR 及其决策章节。
-6. 普通/重写卡以 `mode=normal,outcome=pass` 提交严格 v6 metadata，并以
+6. 普通/重写卡以 `mode=normal,outcome=pass` 提交严格 v7 metadata，并以
    `repository_evidence` 绑定仓库基线、检查路径、现有能力、变更类型和复用决策；
    不得用业务问题返回 fail。若 `mode=finalization`，尽量修复第三次 findings，在
    SPEC 中记录最终取舍，并按 `/opt/fleet/templates/forced-advance-comment.md`
@@ -40,3 +40,6 @@ version: 2.0.1
    metadata。`repository_evidence.inspected_paths` 只允许
    `repository_base_sha` 上已存在的精确路径；逐项执行
    `git cat-file -e "$repository_base_sha:$path"`，不得把本轮新增工件路径列入其中。
+- 调用完成工具前，必须将业务 metadata 保存为 JSON，并执行
+  `hollysysctl validate-completion --card-id '<当前卡 ID>' --metadata '<json-file>'`；
+  只有 Controller 返回 `ok=true` 才能完成卡片。

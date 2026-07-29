@@ -108,7 +108,7 @@ def completion(
 ) -> CompletionMetadata:
     run = run_record(tmp_path)
     data = {
-        "protocol_version": "hollysys-controller/v2",
+        "protocol_version": "hollysys-controller/v3",
         "run_key": run.run_key,
         "stage": stage,
         "iteration": 1,

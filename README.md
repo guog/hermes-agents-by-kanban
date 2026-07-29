@@ -4,8 +4,8 @@
 部署运行固定版本 tag 的官方 Hermes 镜像，通过只读挂载加载无 LLM 的 Python Hollysys
 Controller、国内软件源配置和启动检查脚本；不构建定制镜像、不修改 `/opt/hermes`。
 
-人类通过飞书 Dispatcher 启动一次正式交付；Dispatcher 是唯一命令、状态和异常入口，
-并通过飞书汇报阶段事件。Controller 独立于 Dispatcher/Gateway 会话，持续监听 Kanban
+人类通过飞书 Dispatcher 启动或废止一次正式交付；Dispatcher 是唯一命令、状态和异常入口，
+并通过飞书汇报 Agent/阶段事件。Controller 独立于 Dispatcher/Gateway 会话，持续监听 Kanban
 事件、验证 metadata/GitLab 门禁和冻结基线，再创建唯一下一张工作卡：
 
 ```text
@@ -18,14 +18,17 @@ Controller、国内软件源配置和启动检查脚本；不构建定制镜像�
 
 正式交付采用一个 `run_key`、一个共享分支、一个共享 worktree 和一个 MR。GitLab
 保存工件、MR、head、门禁与合并事实；Kanban 保存 card、attempt、重试、blocked 和恢复
-事实；Controller 只保存事件游标、受管 card ID、幂等请求/操作和 outbox，不保存独立当前阶段。
+事实；Controller 只保存可重建的运行控制、事件游标、受管 card ID、幂等请求/操作、依赖
+故障和 outbox，不把聊天会话当作运行状态。
 
 ## 1. 部署结构
 
 Compose 只有一个 `hermes` service：
 
 - 使用官方Docker镜像 `nousresearch/hermes-agent:v2026.7.20`。
-- 以挂载的 s6 root 初始化脚本先检查 .NET SDK 8，再由官方 wrapper 降权，以 `python -m hollysys_controller.daemon` 作为容器前台主进程；Controller 退出会触发容器重启，Gateway 和 Dashboard 仍由官方 s6 监督。
+- 以挂载的 root 初始化脚本先检查 .NET SDK 8；容器前台只运行 `sleep infinity`，
+  Controller 挂载到官方 `/run/service` 并由 s6 独立监督。Controller 重启不会中断
+  Dashboard 或各 Profile Gateway。
 - Dashboard 发布到宿主机所有网卡，局域网用户使用同一组固定账号访问。
 - 首次缺少镜像时由 Compose 自动拉取，不执行构建。
 - 不覆盖镜像 entrypoint，不修改 `/opt/hermes`；只向 `/etc/cont-init.d` 挂载一份
@@ -65,7 +68,7 @@ Compose 只有一个 `hermes` service：
 │   ├── install-external-assets.mjs
 │   └── generate_completion_schema.py
 ├── templates/                  # 中文自动交付、MR、评论、Kanban card 模板
-├── schemas/                    # Controller v2 模型生成的严格 metadata v6 Schema
+├── schemas/                    # Controller v3 模型生成的严格 metadata v7 Schema
 └── tests/                      # 状态机、SQLite、适配和 Compose 契约测试
 ```
 
@@ -82,6 +85,7 @@ Compose 只有一个 `hermes` service：
 | `./hollysysctl` | `/usr/local/bin/hollysysctl` | 只读 |
 | `./container` | `/opt/fleet/container` | 只读 |
 | `./container/ensure-dotnet8.sh` | `/etc/cont-init.d/00-hollysys-dotnet8` | 只读、root 初始化 |
+| `./container/services.d/hollysys-controller` | `/run/service/hollysys-controller` | 只读、s6 长运行服务 |
 | `./container/mirrors/debian.sources` | `/etc/apt/sources.list.d/debian.sources` | 只读 |
 | `./container/mirrors/sources.list` | `/etc/apt/sources.list` | 只读 |
 | `./container/mirrors/pip.conf` | `/etc/pip.conf` | 只读 |
@@ -595,8 +599,12 @@ spec-write → spec-review → plan-write → plan-review
 不创建 continuation、spec/plan/tasks/test/code gate 或 merge 卡。Controller 每两秒
 读取各 board 的 append-only `task_events`，每 30 秒执行完整事实对账。阶段由受管
 Kanban 卡和 GitLab 实时事实复算；Controller DB 没有 current-stage/head/gate 列。
-进程使用文件锁拒绝第二个 Controller；同一后台循环连续失败 5 次会退出，由 Compose
-重启。可归属到 run 的对账错误先写入幂等 outbox，避免只留在容器日志。
+进程使用文件锁拒绝第二个 Controller。GitLab、Kanban 或飞书短时故障会写入持久
+`dependency_outages`，按配置指数退避并保持 Controller 存活；恢复后关闭同一 outage。
+共享 GitLab circuit 在退避窗口内不按 Run 数重复请求，并对每个受影响 Run 只发送一条
+故障通知和一条引用同一 outage ID 的恢复通知。
+只有本地启动、配置、数据库或进程级故障才由 s6 单独重启 Controller。可归属到 run 的
+对账错误先写入幂等 outbox，避免只留在容器日志。
 
 每次只创建一张下一阶段实质工作卡，幂等键：
 
@@ -610,15 +618,17 @@ Kanban 卡和 GitLab 实时事实复算；Controller DB 没有 current-stage/hea
 `kanban_block` 事件，不代表人类阻塞。每个外部步骤都有 operation key；进程在步骤前后
 崩溃时，卡片 idempotency、状态回读和全量对账共同避免重复建卡。
 
-### 6.5 Protocol v2、单向冻结与代码门禁
+### 6.5 Protocol v3、运行时合同、单向冻结与代码门禁
 
 - `hollysys_controller.models.CompletionMetadata` 使用 Pydantic `extra=forbid`；
   `scripts/generate_completion_schema.py` 生成仓库 Schema，测试要求两者完全相等。
-- 必填 `protocol_version=hollysys-controller/v2`、卡片 mode/iteration、
+- 必填 `protocol_version=hollysys-controller/v3`、卡片 mode/iteration、
   `prd_blob_sha` 和全部身份字段；outcome 只允许 pass/fail/cancelled，fail 必须给
   非空 findings，并绑定被检查的 artifact digest 或 MR head。
 - Hermes 官方入口仍保存 free-form metadata。Worker 先自检，Controller 在 done 事件后
-  强制验证；非法对象不推进，创建同阶段新 attempt，最多自动重试两次。
+  强制验证；每个正式角色在 `kanban_complete` 前还必须调用
+  `hollysysctl validate-completion`，由 Controller 预检当前 card/run/stage/iteration/
+  worktree/branch/MR 上下文。非法对象不推进，创建同阶段新 attempt，最多自动重试两次。
 - run 启动时固定 PRD blob SHA。SPEC/PLAN/TASKS gate 会按配置 pattern 枚举 artifact
   commit 上的完整路径集合，重算排序后的 `<path>\0<blob-sha>\n` digest，并核对
   MR note 作者、artifact commit 与 card ID。
@@ -653,17 +663,42 @@ Kanban 卡和 GitLab 实时事实复算；Controller DB 没有 current-stage/hea
 - 合并前重读 MR ready、pipeline、讨论、所有最新 gate 和当前 head，只调用
   `sha=<checked_head>` merge。SHA 变化只从 test 重派，绝不无 SHA 重试。
 
+v3 completion 还可携带 `gate_phase`、`contract_refs` 和 `requirement_ids`，让测试、
+迁移、部署与发布证据可以追溯到 PLAN/TASKS 中的合同与需求。它们不能替代 GitLab
+checked-head、pipeline、review identity 与外部运行证据门禁。
+
+Controller 还按卡持久化 Agent 的 started/session/heartbeat/progress/deadline
+运行时信封。超过 `HOLLYSYS_WORKER_PROGRESS_LEASE_SECONDS` 只产生幂等证据告警，不会
+仅按总运行时长杀死仍可能有真实进展的 Agent。
+
 `hollysysctl status --run-key ...` 返回精确 phase/stage、review 已用/剩余次数、当前
 Agent/card/mode、各冻结工件的 disposition 与当前 head 完整性、关键决策/未解决
 findings/残余风险、MR/head、test/code-review gate 和 merge blocker。
 
 ### 6.6 飞书进度、阻塞与持久 outbox
 
-Dispatcher 不把普通 heartbeat 转发到飞书。Controller 只在下列业务事件写入持久
+Dispatcher 不把普通 heartbeat 转发到飞书。试运行默认
+`HOLLYSYS_NOTIFICATION_LEVEL=verbose`，Controller 在每个 Agent 被领取/开始以及完成协议
+被接受时通知原会话，并继续在下列业务事件写入持久
 outbox：run 受理、阶段开始、每次 review fail、第三次失败进入 finalization、阶段冻结、
 CODE 开始、同一 head 双门禁汇总失败后的第 n/5 次重实现、测试结构化跳过、
 修改上限耗尽、checked-head merge 和最终摘要。事件键稳定，
 发送成功前保持 pending/failed；Controller 或 Gateway 重启后重试而不重复创建事件。
+`standard` 关闭逐 Agent 开始/完成通知，保留阶段、门禁、阻塞和异常；`minimal` 只保留
+终态及必须由人类处理的通知。
+
+#### 人类随时废止
+
+原发起人或 `.env` 中 `HOLLYSYS_ABORT_ADMIN_OPEN_IDS` 配置的管理员可在飞书发送
+`废止流程 <run_key> <reason>`。Dispatcher 调用 `abort-request` 后只返回影响说明和
+一次性 token；在默认 10 分钟内，同一发送人必须在同一 chat/thread 发送新的
+`确认废止 <run_key> <token>` 消息。
+
+确认后 Controller 先持久化 `abort_requested`，阻止正常对账继续发卡，再对运行中受管
+卡调用 Hermes 官方 `reclaim` 停止 worker 并归档卡；随后向未合并交付 MR 写入唯一
+`[hollysys-aborted:v3]` 审计评论并关闭 MR。branch、worktree、任务、run、评论和日志证据
+全部保留供人检查，不删除、不回滚。若 MR 已合并，则终态为
+`completed_before_abort`；若外部依赖中断，状态保持 `aborting` 并由后台对账重试。
 
 #### Blocked 的原渠道人类闭环
 
@@ -685,7 +720,10 @@ Worker 阻塞前先在卡片写入幂等 `[human-block:v1]` 评论，包含 run�
 
 `kind` 只允许 `permission`、`credential`、`environment`、`unsafe_retry` 或
 `destructive_approval`。Controller 会拒绝业务歧义或字段不完整的 block，写入
-`[controller-block-rejected:v2]` 并重新释放原卡继续自主决策，不通知人类。
+`[controller-block-rejected:v3]` 并重新释放原卡继续自主决策，不通知人类。
+其中 `environment` 与 `destructive_approval` 必须额外给出
+`gate_phase=migration|deployment|release`、冻结 `requirement_ids` 和
+`contract_refs`；发布/完成门禁不得被扩张成禁止仓库内编码、测试或脚本准备。
 
 ```text
 @发起人 自动交付在 <stage> 暂停：<一个问题或动作>。
@@ -696,7 +734,7 @@ Worker 阻塞前先在卡片写入幂等 `[human-block:v1]` 评论，包含 run�
 Dispatcher 不能直接恢复。它把真实 sender/chat/thread/message/answer 交给
 `hollysysctl resolve`。Controller 验证 root origin、blocked 状态和匹配的
 `[human-block:v1]` 评论，以 `block_id + message_id` 幂等创建一张同阶段新 attempt；
-新卡创建完成后，旧 blocked 尝试以严格 v6 `outcome=cancelled` 结束并释放新卡。不会
+新卡创建完成后，旧 blocked 尝试以严格 v7 `outcome=cancelled` 结束并释放新卡。不会
 对同一卡盲目 unblock，也不会创建 continuation/恢复 gate。
 
 部署后必须用真实飞书和 Kanban 做一次受控验收，不能用静态检查代替：
@@ -724,7 +762,7 @@ Dispatcher 不能直接恢复。它把真实 sender/chat/thread/message/answer �
 
 - 官方 Kanban 仍允许其他 Profile/人类创建非受管卡；Controller 会忽略，但不能阻止其被
   Gateway 调度。生产 board 应限制 Dashboard/主机访问并监控非受管 ready 卡。
-- Hermes CLI/Tool 本身不校验 v6；强制发生在 Controller 消费完成事实时。
+- Hermes CLI/Tool 本身不校验 v7；强制发生在 Controller 消费完成事实时。
 - bundled/角色 Skill 的 fleet 定制不可变保护。
 - Profile 不等于文件系统 sandbox；Developer/Reporter token、protected branch 和独立
   GitLab 身份仍是权限边界。
@@ -735,28 +773,25 @@ Dashboard plugin REST 路由绕过 Basic Auth，且当前端口有意发布到�
 官方 CLI 写入。Controller outbox 统一负责阶段进度、blocked、最终成功、工作卡失败熔断和
 控制器级故障，均使用稳定事件 key 与 lark-cli idempotency key 去重。
 
-## 8. 部署、回滚与不迁移约束
+## 8. 全新部署与验收约束
 
-备份：
+v3 只支持全新部署，不读取、不迁移、不续跑旧 Controller DB、Kanban、session、日志、
+cache、pending 或 worktree。新主机只复制明确需要的认证和配置，创建全新的 `data/` 与
+`projects/`；旧部署由人类独立结束和处置。不得把旧运行数据挂入 v3 做兼容验证。
 
-- 完整 `data/`：Kanban DB、Controller DB/token、profiles、sessions、memories、pending、Gateway 和 lark-cli 状态。
-- 完整 `projects/`：checkout、共享 worktree 和本地未推送状态。
-- 根 `.env` 和各 Profile `.env` 应进入单独的秘密备份，不进入 Git。
-- `cli/` 与 `skills/` 是可重建下载物，不需要备份；恢复时运行 `npm ci && npm run assets:install`。
+首次启动前执行 `hollysysctl preflight` 检查 Hermes/glab/lark/git、私有 token 文件、
+状态目录与 Profile 根目录。运行时：
 
-本版本不迁移活动 v1 运行：
-
-1. 部署 v2 前必须结束所有活动 v1 run。旧 v1 Kanban/GitLab/Controller 数据只读保留，
-   不迁移活动状态；v2 Controller 不继续或认领 v1 卡，`status` 标记
-   `historical_read_only`，`health.active_v1_runs` 非空时健康检查降级。
-2. 不做 shadow 双跑。先在测试 board 完成完整 E2E 和故障注入，再在空闲生产 board 启用。
-3. 回滚时停止容器，恢复改造前 Compose、`data/` 和 `projects/` 快照。v2 run 不回灌
-   v1 状态。
-4. v2 只支持单机、单 Controller 和固定完整流程；active-active、快速/标准通道、
-   外部工作流 API、跨项目事务不在范围内。
+- 容器 healthcheck 调用 `health --probe liveness`，只验证本地 Controller/store/RPC，
+  不因 GitLab/Kanban 短时故障重启整个容器；
+- 运维与 Dispatcher 调用 `health --probe readiness`，查看最近对账、Kanban/GitLab、
+  outbox 和持久 dependency outage；
+- 当前版本只支持单机、单 Controller 和固定完整流程；active-active、外部工作流 API
+  与跨项目事务不在范围内。
 
 静态测试与 Compose 解析不是生产 E2E。发布门禁必须额外完成一次真实
 PRD→SPEC→PLAN→TASKS→implement→test→code-review→checked-head merge，并验证非法
 metadata、三次 review/finalization、冻结文件恢复、同 head 代码门禁、blocked/resume、
-通知幂等、重复答复和 Controller/Gateway 重启。E2E 的 PRD 必须包含遗漏、模糊和
+verbose Agent 开始/完成通知、两阶段废止、通知幂等、重复答复、依赖断连恢复和
+Controller 独立重启。E2E 的 PRD 必须包含遗漏、模糊和
 相互矛盾内容，以证明流程不中途回退并最终完成 checked-head merge。

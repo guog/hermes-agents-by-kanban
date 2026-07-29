@@ -10,7 +10,6 @@ from pydantic import ValidationError
 
 from hollysys_controller.kanban import (
     EventRecord,
-    LEGACY_RUN_MARKER,
     TaskRecord,
     render_card_body,
     render_run_body,
@@ -19,6 +18,7 @@ from hollysys_controller.models import (
     BaselineDisposition,
     CardRecord,
     CompletionMetadata,
+    NotificationLevel,
     Phase,
     RepairContext,
     RepairKind,
@@ -130,7 +130,10 @@ class ServiceRecoveryTests(unittest.TestCase):
             "summary: target database evidence is unavailable\n"
             "evidence: target snapshot is missing\n"
             "required_action: provide an explicit safe implementation boundary\n"
-            "resume_check: the answer preserves the deployment gate"
+            "resume_check: the answer preserves the deployment gate\n"
+            "gate_phase: deployment\n"
+            "requirement_ids: BLK-001\n"
+            "contract_refs: PLAN-BLK-001"
         )
         card = CardRecord(
             run=self.run,
@@ -284,7 +287,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             created_at=1,
         )
         service = object.__new__(ControllerService)
-        service._run_protocol_version = lambda _: "hollysys-controller/v2"
+        service._run_protocol_version = lambda _: "hollysys-controller/v3"
         service._history = lambda _: ([HistoryItem(managed, root)], self.run)
         service.gitlab = type(
             "NoMergeRequest",
@@ -351,7 +354,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             created_at=2,
         )
         service = object.__new__(ControllerService)
-        service._run_protocol_version = lambda _: "hollysys-controller/v2"
+        service._run_protocol_version = lambda _: "hollysys-controller/v3"
         service._history = lambda _: (
             [
                 HistoryItem(root_managed, root),
@@ -420,7 +423,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         service = object.__new__(ControllerService)
         service.config = config(self.root)
-        service._run_protocol_version = lambda _: "hollysys-controller/v2"
+        service._run_protocol_version = lambda _: "hollysys-controller/v3"
         service._history = lambda _: ([HistoryItem(managed, task)], self.run)
         service.gitlab = type(
             "CurrentHead",
@@ -535,7 +538,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         ]
         service = object.__new__(ControllerService)
         service.config = config(self.root)
-        service._run_protocol_version = lambda _: "hollysys-controller/v2"
+        service._run_protocol_version = lambda _: "hollysys-controller/v3"
         service._history = lambda _: (history, self.run)
         service.gitlab = type(
             "CurrentHead",
@@ -904,7 +907,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             created_at=2,
         )
         service = object.__new__(ControllerService)
-        service._run_protocol_version = lambda _: "hollysys-controller/v2"
+        service._run_protocol_version = lambda _: "hollysys-controller/v3"
         service._history = lambda _: (
             [
                 HistoryItem(root_managed, root),
@@ -935,7 +938,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         service.reconcile_run(self.run.run_key)
 
         self.assertEqual(released, ["t_blocked"])
-        self.assertIn("[controller-block-rejected:v2]", comments[0])
+        self.assertIn("[controller-block-rejected:v3]", comments[0])
 
     def test_finalization_freezes_reconstructable_baseline(self) -> None:
         root_task = task_record(
@@ -982,8 +985,10 @@ class ServiceRecoveryTests(unittest.TestCase):
                 artifact_digest=f"{attempt}" * 64,
                 artifact_commit_sha=f"{attempt}" * 40,
                 gitlab_urls=[
-                    "https://gitlab.example.com/group/project/"
-                    f"-/merge_requests/2#note_{20 + attempt}"
+                    (
+                        "https://gitlab.example.com/group/project/"
+                        f"-/merge_requests/2#note_{20 + attempt}"
+                    )
                 ],
             )
             prior_task = task_record(
@@ -1260,7 +1265,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         service = object.__new__(ControllerService)
         service._lock = threading.RLock()
         service.config = config(self.root)
-        service._run_protocol_version = lambda _: "hollysys-controller/v2"
+        service._run_protocol_version = lambda _: "hollysys-controller/v3"
         service._history = lambda _: (history, self.run)
         service.gitlab = type(
             "StatusGitLab",
@@ -1403,7 +1408,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             tenant=self.run.run_key,
             skills=card.skills,
             parents=[card.parent_card_id],
-            comments=[{"body": "[controller-protocol-error:v2]\nreason: bad metadata"}],
+            comments=[{"body": "[controller-protocol-error:v3]\nreason: bad metadata"}],
         )
         managed = ManagedCard(
             board=self.run.workspace.board,
@@ -1497,67 +1502,6 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(service._review_attempts_by_stage(history), {})
 
-    def test_v1_history_is_read_only_and_not_reconciled(self) -> None:
-        payload = self.run.model_dump(mode="json")
-        payload["protocol_version"] = "hollysys-controller/v1"
-        payload["source"].pop("prd_blob_sha")
-        root = task_record(
-            task_id="t_root",
-            body=(
-                f"{LEGACY_RUN_MARKER}\n\nlegacy\n\n"
-                f"```json\n{json.dumps(payload)}\n```\n"
-            ),
-            status="done",
-            idempotency_key=f"{self.run.run_key}:run-init",
-            tenant=self.run.run_key,
-        )
-        legacy_work = task_record(
-            task_id="t_legacy",
-            body="legacy v1 work card",
-            status="todo",
-            assignee="coder",
-            idempotency_key=f"{self.run.run_key}:implement:1:work",
-            tenant=self.run.run_key,
-        )
-        service = object.__new__(ControllerService)
-        service._lock = threading.RLock()
-        service.store = ControllerStore(self.root / "controller.db")
-        for card_id, stage, iteration, purpose, parent in (
-            ("t_root", "run-init", 0, "root", None),
-            ("t_legacy", "implement", 1, "work", "t_root"),
-        ):
-            service.store.add_managed_card(
-                board=self.run.workspace.board,
-                card_id=card_id,
-                run_key=self.run.run_key,
-                stage=stage,
-                iteration=iteration,
-                idempotency_key=(
-                    f"{self.run.run_key}:run-init"
-                    if purpose == "root"
-                    else f"{self.run.run_key}:implement:1:work"
-                ),
-                parent_card_id=parent,
-                purpose=purpose,
-                created_at=iteration + 1,
-            )
-        tasks = {root.id: root, legacy_work.id: legacy_work}
-        service.reader = type(
-            "LegacyReader",
-            (),
-            {"task": staticmethod(lambda board, task_id: tasks[task_id])},
-        )()
-        service._history = lambda _: (_ for _ in ()).throw(
-            AssertionError("v1 history must not enter v2 reconciliation")
-        )
-
-        status = service.status(self.run.run_key)
-        service.reconcile_run(self.run.run_key)
-
-        self.assertEqual(status["state"], "historical_read_only")
-        self.assertEqual(status["active_card"]["id"], "t_legacy")
-        self.assertIn("not migrated", status["warning"])
-
     def test_controller_failure_notification_uses_root_origin(self) -> None:
         service = object.__new__(ControllerService)
         service.store = ControllerStore(self.root / "controller.db")
@@ -1592,6 +1536,172 @@ class ServiceRecoveryTests(unittest.TestCase):
         pending = service.store.pending_outbox()
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["event"], "controller-failure")
+
+    def test_human_abort_requires_confirmation_and_preserves_evidence(self) -> None:
+        card = CardRecord(
+            run=self.run,
+            stage=Stage.IMPLEMENT,
+            iteration=1,
+            idempotency_key=f"{self.run.run_key}:implement:1:normal:work",
+            parent_card_id="t_root",
+            assignee="coder",
+            skills=["hollysys-implement", "glab"],
+        )
+        task = task_record(
+            task_id="t_work",
+            body=render_card_body(card),
+            status="running",
+            assignee=card.assignee,
+            idempotency_key=card.idempotency_key,
+            tenant=self.run.run_key,
+            skills=card.skills,
+            parents=[card.parent_card_id],
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=card.stage.value,
+            iteration=card.iteration,
+            idempotency_key=card.idempotency_key,
+            parent_card_id=card.parent_card_id,
+            purpose="work",
+            created_at=1,
+        )
+        calls: list[tuple] = []
+        service = object.__new__(ControllerService)
+        service._lock = threading.RLock()
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / "abort-controller.db")
+        service._history = lambda _: ([HistoryItem(managed, task)], self.run)
+        service.kanban = type(
+            "AbortKanban",
+            (),
+            {
+                "abort_task": staticmethod(
+                    lambda board, task_id, reason: calls.append(
+                        ("abort-task", board, task_id)
+                    )
+                )
+            },
+        )()
+        service.gitlab = type(
+            "AbortGitLab",
+            (),
+            {
+                "abort_delivery": staticmethod(
+                    lambda run, requested_by, reason: {
+                        "state": "closed",
+                        "web_url": "https://gitlab.example/mr/2",
+                    }
+                )
+            },
+        )()
+        service.flush_outbox = lambda: calls.append(("flush",))
+        service.last_reconcile_error = None
+
+        requested = service.abort_request(
+            {
+                "run_key": self.run.run_key,
+                "message_id": "om_abort_request",
+                "sender": self.run.origin.initiator_open_id,
+                "chat_id": self.run.origin.chat_id,
+                "thread_id": self.run.origin.thread_id,
+                "reason": "stop this delivery",
+            }
+        )
+        self.assertEqual(
+            service.store.run_control(self.run.run_key)["state"],
+            "active",
+        )
+        with service.store.connect() as conn:
+            stored = conn.execute(
+                "SELECT response FROM requests WHERE request_key=?",
+                ("abort-request:om_abort_request",),
+            ).fetchone()
+        self.assertNotIn(requested["confirmation_token"], stored["response"])
+        confirmed = service.abort_confirm(
+            {
+                "run_key": self.run.run_key,
+                "token": requested["confirmation_token"],
+                "message_id": "om_abort_confirm",
+                "sender": self.run.origin.initiator_open_id,
+                "chat_id": self.run.origin.chat_id,
+                "thread_id": self.run.origin.thread_id,
+            }
+        )
+
+        self.assertEqual(confirmed["state"], "aborted")
+        self.assertEqual(
+            calls[0],
+            ("abort-task", self.run.workspace.board, task.id),
+        )
+        self.assertEqual(confirmed["continuation"], "finished")
+        with service.store.connect() as conn:
+            stored_confirm = conn.execute(
+                "SELECT payload FROM requests WHERE request_key=?",
+                ("abort-confirm:om_abort_confirm",),
+            ).fetchone()
+        self.assertNotIn(requested["confirmation_token"], stored_confirm["payload"])
+
+    def test_verbose_level_notifies_agent_start_but_standard_does_not(self) -> None:
+        task = task_record(
+            task_id="t_work",
+            body="body",
+            status="running",
+            assignee="coder",
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=Stage.IMPLEMENT.value,
+            iteration=2,
+            idempotency_key="work",
+            parent_card_id="t_root",
+            purpose="work",
+            created_at=1,
+        )
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "notify-controller.db")
+        service.config = config(self.root).model_copy(
+            update={"notification_level": NotificationLevel.VERBOSE}
+        )
+        service._history = lambda _: ([], self.run)
+        service.reader = type(
+            "LifecycleReader",
+            (),
+            {"task": staticmethod(lambda board, card_id: task)},
+        )()
+        event = EventRecord(
+            id=7,
+            task_id=task.id,
+            run_id=8,
+            kind="claimed",
+            payload={},
+            created_at=9,
+        )
+
+        service._record_agent_lifecycle_event(managed, event)
+        pending = service.store.pending_outbox()
+        self.assertEqual(len(pending), 1)
+        self.assertIn("Agent 已开始工作", pending[0]["payload"])
+
+        service.config = service.config.model_copy(
+            update={"notification_level": NotificationLevel.STANDARD}
+        )
+        service._record_agent_lifecycle_event(
+            managed,
+            EventRecord(
+                id=10,
+                task_id=task.id,
+                run_id=11,
+                kind="claimed",
+                payload={},
+                created_at=12,
+            ),
+        )
+        self.assertEqual(len(service.store.pending_outbox()), 1)
 
 
 if __name__ == "__main__":

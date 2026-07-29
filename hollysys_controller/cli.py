@@ -57,7 +57,33 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--thread-id")
     resolve.add_argument("--answer", required=True)
 
-    sub.add_parser("health")
+    abort_request = sub.add_parser("abort-request")
+    abort_request.add_argument("--run-key", required=True)
+    abort_request.add_argument("--message-id", required=True)
+    abort_request.add_argument("--sender", required=True)
+    abort_request.add_argument("--chat-id", required=True)
+    abort_request.add_argument("--thread-id")
+    abort_request.add_argument("--reason", required=True)
+
+    abort_confirm = sub.add_parser("abort-confirm")
+    abort_confirm.add_argument("--run-key", required=True)
+    abort_confirm.add_argument("--token", required=True)
+    abort_confirm.add_argument("--message-id", required=True)
+    abort_confirm.add_argument("--sender", required=True)
+    abort_confirm.add_argument("--chat-id", required=True)
+    abort_confirm.add_argument("--thread-id")
+
+    validate_completion = sub.add_parser("validate-completion")
+    validate_completion.add_argument("--card-id", required=True)
+    validate_completion.add_argument("--metadata", required=True, type=Path)
+
+    sub.add_parser("preflight")
+    health = sub.add_parser("health")
+    health.add_argument(
+        "--probe",
+        choices=["liveness", "readiness"],
+        default="readiness",
+    )
     return parser
 
 
@@ -75,6 +101,11 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
             "chat_type": values["chat_type"],
             "initiator": values["initiator"],
         }
+    elif method == "validate-completion":
+        metadata_path = values.pop("metadata")
+        values["metadata"] = json.loads(
+            metadata_path.read_text(encoding="utf-8")
+        )
     return method, {key: value for key, value in values.items() if value is not None}
 
 
@@ -91,6 +122,11 @@ async def _run(args: argparse.Namespace) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+    if method == "preflight":
+        config = controller_snapshot_config(ControllerConfig.load())
+        result = ControllerService(config).preflight()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["ok"] else 1
     request = RpcRequest(id=str(uuid.uuid4()), method=method, params=params)
     response = await rpc_call(Path(args.socket), request)
     if not response.ok:

@@ -192,7 +192,7 @@ def generated_schema() -> dict:
     ]
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://hollysys.example/schemas/card-completion-v6.json",
+        "$id": "https://hollysys.example/schemas/card-completion-v7.json",
         **schema,
     }
 

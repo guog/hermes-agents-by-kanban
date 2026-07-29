@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import secrets
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -18,14 +21,17 @@ from .kanban import (
     TaskRecord,
     parse_card_body,
     parse_run_body,
-    parse_run_protocol_version,
 )
 from .models import (
+    AbortConfirmRequest,
+    AbortRequest,
     ArtifactBaseline,
     BaselineDisposition,
     CardRecord,
     CompletionMetadata,
+    CompletionValidationRequest,
     FeishuOrigin,
+    NotificationLevel,
     Outcome,
     Phase,
     RepairContext,
@@ -49,6 +55,7 @@ from .workflow import (
 )
 
 ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "blocked"}
+LOG = logging.getLogger(__name__)
 TERMINAL_EVENT_KINDS = {
     "completed",
     "blocked",
@@ -81,6 +88,14 @@ REQUIRED_HUMAN_BLOCK_FIELDS = {
     "required_action",
     "resume_check",
 }
+GATED_HUMAN_BLOCK_FIELDS = {
+    "gate_phase",
+    "requirement_ids",
+    "contract_refs",
+}
+PARSED_HUMAN_BLOCK_FIELDS = (
+    REQUIRED_HUMAN_BLOCK_FIELDS | GATED_HUMAN_BLOCK_FIELDS
+)
 
 
 @dataclass
@@ -108,6 +123,7 @@ class ControllerService:
         self.gitlab = gitlab or GitLabClient(config)
         self.notifier = notifier or LarkNotifier(config)
         self._lock = threading.RLock()
+        self._audit_lock = threading.Lock()
         self.last_reconcile_at: int | None = None
         self.last_reconcile_error: str | None = None
 
@@ -137,6 +153,7 @@ class ControllerService:
                 origin=origin,
             )
             run = facts.run
+            self.store.ensure_run_control(run.run_key)
             existing = self.store.cards_for_run(run.run_key)
             if existing:
                 self.reconcile_run(run.run_key)
@@ -213,10 +230,10 @@ class ControllerService:
             raise
 
     def status(self, run_key: str) -> dict:
-        with self._lock:
-            protocol_version = self._run_protocol_version(run_key)
-            if protocol_version != "hollysys-controller/v2":
-                return self._historical_status(run_key, protocol_version)
+        # Full GitLab audit may be slow. Serialize audits separately so a
+        # Dispatcher status request cannot block Kanban transitions, aborts,
+        # local status-summary, or the outbox.
+        with getattr(self, "_audit_lock", threading.Lock()):
             history, run = self._history(run_key)
             active = [item for item in history if item.task.status in ACTIVE_STATUSES]
             attempts = self._attempts_by_stage(history)
@@ -409,8 +426,10 @@ class ControllerService:
                 if exact_stage == "checked-head-merge"
                 else "reconciling"
             )
+            control = self._run_control(run_key)
             return {
                 "run_key": run_key,
+                "control": control,
                 "phase": phase,
                 "stage": exact_stage,
                 "active_card": (
@@ -466,16 +485,6 @@ class ControllerService:
 
     def status_summary(self, run_key: str) -> dict:
         """Return the authoritative local workflow snapshot without GitLab I/O."""
-        protocol_version = self._run_protocol_version(run_key)
-        if protocol_version != "hollysys-controller/v2":
-            return {
-                **self._historical_status(run_key, protocol_version),
-                "snapshot": {
-                    "authority": "controller-store+kanban",
-                    "gitlab_audit": "not_requested",
-                },
-            }
-
         history, run = self._history(run_key)
         active = [item for item in history if item.task.status in ACTIVE_STATUSES]
         current = active[-1] if active else None
@@ -513,12 +522,25 @@ class ControllerService:
             if blocked_comment is None and current.managed.purpose == "exception":
                 blocked_comment = current.task.body
 
-        exact_stage = current.managed.stage if current else "reconciling"
+        merge_wait = (
+            self.store.merge_wait(run_key)
+            if hasattr(self.store, "merge_wait")
+            else None
+        )
+        exact_stage = (
+            current.managed.stage
+            if current
+            else "merge-wait"
+            if merge_wait
+            else "reconciling"
+        )
         phase = (
             PHASE_FOR_STAGE[Stage(current.managed.stage)].value
             if current and current.managed.purpose == "work"
             else "exception"
             if current
+            else Phase.CODE.value
+            if merge_wait
             else "reconciling"
         )
         code_modifications = self._code_modification_count(history)
@@ -530,6 +552,8 @@ class ControllerService:
 
         return {
             "run_key": run_key,
+            "control": self._run_control(run_key),
+            "notification_level": self.config.notification_level.value,
             "phase": phase,
             "stage": exact_stage,
             "active_card": (
@@ -560,6 +584,12 @@ class ControllerService:
                 stage.value: count for stage, count in protocol_failures.items()
             },
             "blocked": blocked_comment,
+            "merge_wait": merge_wait,
+            "worker_runtime": (
+                self.store.runtime_for_run(run_key)
+                if hasattr(self.store, "runtime_for_run")
+                else []
+            ),
             "board": run.workspace.board,
             "worktree": run.workspace.worktree,
             "repository_base_sha": run.workspace.repository_base_sha,
@@ -569,10 +599,205 @@ class ControllerService:
                 "controller_event_cursor": controller_cursor,
                 "kanban_max_event_id": kanban_max_event_id,
                 "event_lag": max(0, kanban_max_event_id - controller_cursor),
+                "event_lag_warning": (
+                    max(0, kanban_max_event_id - controller_cursor)
+                    >= self.config.event_lag_warning_threshold
+                ),
                 "outbox_pending": store_health["outbox_pending"],
                 "failed_operations": store_health["failed_operations"],
+                "dependency_outages": store_health.get(
+                    "dependency_outages",
+                    [],
+                ),
             },
         }
+
+    def preflight(self) -> dict:
+        checks: dict[str, dict] = {}
+        for name, command in {
+            "hermes": self.config.hermes_command,
+            "glab": self.config.glab_command,
+            "lark": self.config.lark_command,
+            "git": "git",
+        }.items():
+            resolved = shutil.which(command)
+            checks[name] = {"ok": resolved is not None, "path": resolved}
+        try:
+            self.config.read_token()
+            checks["gitlab_token"] = {"ok": True, "mode": "private-file"}
+        except Exception as exc:  # noqa: BLE001 - structured preflight result
+            checks["gitlab_token"] = {
+                "ok": False,
+                "error": self._error_text(exc),
+            }
+        checks["state_dir"] = {
+            "ok": self.config.state_dir.is_dir()
+            and self.config.state_dir.stat().st_mode & 0o200 != 0,
+            "path": str(self.config.state_dir),
+        }
+        checks["profiles_root"] = {
+            "ok": self.config.profiles_root.is_dir(),
+            "path": str(self.config.profiles_root),
+        }
+        return {
+            "ok": all(item["ok"] for item in checks.values()),
+            "checks": checks,
+        }
+
+    def validate_completion(self, raw: dict) -> dict:
+        request = CompletionValidationRequest.model_validate(raw)
+        matches = [
+            card
+            for run_key in self.store.run_keys()
+            for card in self.store.cards_for_run(run_key)
+            if card.card_id == request.card_id and card.purpose == "work"
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "card_id must identify exactly one managed Hollysys work card"
+            )
+        managed = matches[0]
+        history, run = self._history(managed.run_key)
+        item = next(
+            entry for entry in history if entry.task.id == request.card_id
+        )
+        metadata = CompletionMetadata.model_validate(request.metadata)
+        self._validate_completion_context(run, item, metadata)
+        self._validate_finalization_context(history, item, metadata)
+        if metadata.repository_evidence is not None:
+            self.gitlab.validate_repository_evidence(run, metadata)
+        if metadata.stage in {
+            Stage.SPEC_REVIEW,
+            Stage.PLAN_REVIEW,
+            Stage.TASKS_REVIEW,
+            Stage.TEST,
+            Stage.CODE_REVIEW,
+        }:
+            self.gitlab.validate_gate(run, metadata)
+        return {
+            "ok": True,
+            "run_key": run.run_key,
+            "card_id": item.task.id,
+            "stage": metadata.stage.value,
+            "iteration": metadata.iteration,
+            "context": "controller-verified",
+        }
+
+    def abort_request(self, raw: dict) -> dict:
+        request = AbortRequest.model_validate(raw)
+        key = f"abort-request:{request.message_id}"
+        previous = self.store.begin_request(
+            key, "abort-request", request.model_dump(mode="json")
+        )
+        if previous is not None:
+            return previous
+        try:
+            _, run = self._history(request.run_key)
+            if (
+                request.sender != run.origin.initiator_open_id
+                and request.sender not in self.config.abort_admin_open_ids
+            ):
+                raise PermissionError(
+                    "only the run initiator or configured abort administrator "
+                    "may abort this run"
+                )
+            control = self.store.run_control(request.run_key)
+            if control and control["state"] != "active":
+                raise ValueError(
+                    f"run is already {control['state']}"
+                )
+            alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+            token = "".join(secrets.choice(alphabet) for _ in range(8))
+            token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+            expires_at = (
+                int(time.time()) + self.config.abort_confirmation_ttl_seconds
+            )
+            created = self.store.create_abort_request(
+                request_id=key,
+                run_key=request.run_key,
+                token_hash=token_hash,
+                sender=request.sender,
+                chat_id=request.chat_id,
+                thread_id=request.thread_id,
+                reason=request.reason,
+                expires_at=expires_at,
+            )
+            response = {
+                **created,
+                "confirmation_token": token,
+                "confirmation_command": (
+                    f"确认废止 {request.run_key} {token}"
+                ),
+                "impact": {
+                    "active_cards": [
+                        item.task.id
+                        for item in self._history(request.run_key)[0]
+                        if item.task.status in ACTIVE_STATUSES
+                    ],
+                    "mr_action": "close-if-open",
+                    "branch_worktree": "preserve",
+                },
+            }
+            persisted_response = dict(response)
+            persisted_response.pop("confirmation_token", None)
+            persisted_response.pop("confirmation_command", None)
+            persisted_response["confirmation_required"] = True
+            self.store.finish_request(key, persisted_response)
+            return response
+        except Exception as exc:
+            self.store.fail_request(key, str(exc))
+            raise
+
+    def abort_confirm(self, raw: dict) -> dict:
+        request = AbortConfirmRequest.model_validate(raw)
+        key = f"abort-confirm:{request.message_id}"
+        request_payload = request.model_dump(
+            mode="json",
+            exclude={"token"},
+        )
+        request_payload["token_hash"] = hashlib.sha256(
+            request.token.encode("ascii")
+        ).hexdigest()
+        previous = self.store.begin_request(
+            key, "abort-confirm", request_payload
+        )
+        if previous is not None:
+            return previous
+        try:
+            control = self.store.confirm_abort_request(
+                run_key=request.run_key,
+                token_hash=hashlib.sha256(
+                    request.token.encode("ascii")
+                ).hexdigest(),
+                sender=request.sender,
+                chat_id=request.chat_id,
+                thread_id=request.thread_id,
+                message_id=request.message_id,
+            )
+            continuation_error: str | None = None
+            try:
+                with self._lock:
+                    self._continue_abort(request.run_key)
+            except Exception as exc:  # noqa: BLE001 - durable retry boundary
+                continuation_error = self._error_text(exc)
+                self.last_reconcile_error = continuation_error
+                self._enqueue_controller_failure(request.run_key, exc)
+            result = self.store.run_control(request.run_key) or control
+            response = {
+                "run_key": request.run_key,
+                "state": result["state"],
+                "reason": result.get("abort_reason"),
+                "continuation": (
+                    "pending-retry" if continuation_error else "finished"
+                ),
+            }
+            if continuation_error:
+                response["continuation_error"] = continuation_error
+            self.store.finish_request(key, response)
+            return response
+        except Exception as exc:
+            self.store.fail_request(key, str(exc))
+            raise
 
     def resolve(self, raw: dict) -> dict:
         request = ResolveRequest.model_validate(raw)
@@ -620,14 +845,9 @@ class ControllerService:
                 if block_comment is None:
                     raise ValueError("matching [human-block:v1] comment was not found")
                 block_fields = self._human_block_fields(block_comment)
-                missing = REQUIRED_HUMAN_BLOCK_FIELDS - block_fields.keys()
-                if (
-                    missing
-                    or block_fields.get("kind")
-                    not in ALLOWED_HUMAN_BLOCK_KINDS
-                ):
+                if not self._valid_human_block(block_fields):
                     raise ValueError(
-                        "human block is not an allowed v2 technical/safety block"
+                        "human block is not an allowed v3 technical/safety block"
                     )
                 stage = Stage(managed.stage)
                 original_record = parse_card_body(task.body)
@@ -735,13 +955,9 @@ class ControllerService:
                 cursor = self.store.cursor(board)
                 for event in self.reader.events_after(board, cursor):
                     managed = self.store.managed_card(board, event.task_id)
+                    if managed:
+                        self._record_agent_lifecycle_event(managed, event)
                     if managed and event.kind in TERMINAL_EVENT_KINDS:
-                        if (
-                            self._run_protocol_version(managed.run_key)
-                            != "hollysys-controller/v2"
-                        ):
-                            self.store.set_cursor(board, event.id)
-                            continue
                         try:
                             if event.kind in {"gave_up", "spawn_auto_blocked"}:
                                 _, run = self._history(managed.run_key)
@@ -761,28 +977,94 @@ class ControllerService:
                         self.start(request["payload"])
                     elif request["kind"] == "resolve":
                         self.resolve(request["payload"])
-                run_errors: list[str] = []
-                for run_key in self.store.run_keys():
+                    elif request["kind"] == "abort-request":
+                        self.abort_request(request["payload"])
+                    elif request["kind"] == "abort-confirm":
+                        self.abort_confirm(request["payload"])
+                for run_key in self.store.active_abort_run_keys():
+                    self._continue_abort(run_key)
+                self._enqueue_stale_worker_notices()
+                if self._dependency_retry_blocked("gitlab"):
+                    self.last_reconcile_at = int(time.time())
+                    self.last_reconcile_error = "gitlab circuit is in backoff"
+                    self.flush_outbox()
+                    return
+                run_errors: list[tuple[str, Exception]] = []
+                active_run_keys = [
+                    run_key
+                    for run_key in self.store.run_keys()
                     if (
-                        self._run_protocol_version(run_key)
-                        != "hollysys-controller/v2"
-                    ):
-                        continue
+                        self.store.run_control(run_key) is None
+                        or self.store.run_control(run_key)["state"] == "active"
+                    )
+                ]
+                for run_key in active_run_keys:
                     try:
                         self.reconcile_run(run_key)
                     except Exception as exc:  # noqa: BLE001 - isolate each run
-                        self._enqueue_controller_failure(run_key, exc)
-                        run_errors.append(f"{run_key}: {exc}")
+                        run_errors.append((run_key, exc))
+                        # GitLab is shared by all runs. One confirmed failure
+                        # opens the circuit instead of multiplying requests by
+                        # the number of active runs.
+                        break
                 if run_errors:
-                    raise RuntimeError("; ".join(run_errors))
+                    summary = "; ".join(
+                        f"{run_key}: {self._error_text(error)}"
+                        for run_key, error in run_errors
+                    )
+                    error_class = self._dependency_error_class(
+                        run_errors[0][1]
+                    )
+                    outage = self.store.record_dependency_failure(
+                        "gitlab",
+                        summary,
+                        initial_backoff_seconds=(
+                            self.config.dependency_backoff_initial_seconds
+                        ),
+                        maximum_backoff_seconds=(
+                            self.config.dependency_backoff_max_seconds
+                        ),
+                        error_class=error_class,
+                    )
+                    for run_key in active_run_keys:
+                        self.store.associate_outage_run(
+                            "gitlab",
+                            str(outage["outage_id"]),
+                            run_key,
+                        )
+                        self._enqueue_dependency_outage(run_key, outage)
+                    self.last_reconcile_at = int(time.time())
+                    self.last_reconcile_error = summary
+                    self.flush_outbox()
+                    return
+                recovered = self.store.recover_dependency("gitlab")
+                if recovered is not None:
+                    for run_key in self.store.outage_run_keys(
+                        "gitlab",
+                        str(recovered["outage_id"]),
+                    ):
+                        self._enqueue_dependency_recovered(run_key, recovered)
                 self.last_reconcile_at = int(time.time())
                 self.last_reconcile_error = None
+                self.flush_outbox()
             except Exception as exc:
                 self.last_reconcile_error = str(exc)
                 raise
 
     def reconcile_run(self, run_key: str) -> None:
-        if self._run_protocol_version(run_key) != "hollysys-controller/v2":
+        control = self._run_control(run_key)
+        if control and control["state"] in {
+            "abort_requested",
+            "aborting",
+        }:
+            self._continue_abort(run_key)
+            return
+        if control and control["state"] in {
+            "aborted",
+            "completed_before_abort",
+        }:
+            return
+        if self._dependency_retry_blocked("gitlab"):
             return
         history, run = self._history(run_key)
         mr = self.gitlab.delivery_mr(run)
@@ -832,11 +1114,7 @@ class ControllerService:
                         human_block_comment
                     )
                     missing = REQUIRED_HUMAN_BLOCK_FIELDS - block_fields.keys()
-                    if (
-                        missing
-                        or block_fields.get("kind")
-                        not in ALLOWED_HUMAN_BLOCK_KINDS
-                    ):
+                    if not self._valid_human_block(block_fields):
                         reason = (
                             "unsupported human block; business ambiguity must "
                             "be resolved autonomously"
@@ -844,14 +1122,14 @@ class ControllerService:
                         if missing:
                             reason += "; missing=" + ",".join(sorted(missing))
                         if not any(
-                            "[controller-block-rejected:v2]"
+                            "[controller-block-rejected:v3]"
                             in str(comment["body"])
                             for comment in item.task.comments
                         ):
                             self.kanban.comment(
                                 run.workspace.board,
                                 item.task.id,
-                                "[controller-block-rejected:v2]\n"
+                                "[controller-block-rejected:v3]\n"
                                 f"reason: {reason}",
                                 "hollysys-controller",
                             )
@@ -906,6 +1184,7 @@ class ControllerService:
         except (ValidationError, ValueError, TypeError) as exc:
             self._protocol_failure(run, history, latest, self._error_text(exc))
             return
+        self._enqueue_agent_completed(run, latest, metadata)
 
         if metadata.repository_evidence is not None:
             try:
@@ -1166,10 +1445,57 @@ class ControllerService:
                 )
             except ValueError as exc:
                 if "current MR head" in str(exc):
+                    self.store.clear_merge_wait(run.run_key)
                     self._create_work(run, Stage.TEST, latest.task.id)
+                else:
+                    waiting = self.store.set_merge_wait(
+                        run.run_key,
+                        mr_iid=int(mr["iid"]),
+                        head_sha=current_head,
+                        blocker_kind=self._merge_blocker_kind(exc),
+                        blocker=self._error_text(exc),
+                        retry_seconds=self.config.merge_wait_retry_seconds,
+                    )
+                    if waiting["changed"]:
+                        self._enqueue_progress(
+                            run,
+                            (
+                                "merge-wait:"
+                                f"{waiting['blocker_kind']}:{current_head}"
+                            ),
+                            self._mention(run.origin)
+                            + "代码门禁已完成，但合并条件尚未满足。\n"
+                            f"run={run.run_key} stage=merge-wait "
+                            f"blocker={waiting['blocker_kind']} "
+                            f"mr={mr.get('web_url')} head={current_head} "
+                            f"next_retry_at={waiting['next_retry_at']}",
+                        )
+                    if (
+                        int(time.time()) - int(waiting["first_seen_at"])
+                        >= self.config.merge_wait_timeout_seconds
+                    ):
+                        self.store.enqueue(
+                            (
+                                f"{run.run_key}:merge-wait-timeout:"
+                                f"{waiting['blocker_kind']}:{current_head}"
+                            ),
+                            run.run_key,
+                            "merge-wait-timeout",
+                            {
+                                "origin": run.origin.model_dump(mode="json"),
+                                "text": self._mention(run.origin)
+                                + "合并等待已超过时限，需要人类处理外部门禁。\n"
+                                f"run={run.run_key} "
+                                f"blocker={waiting['blocker_kind']} "
+                                f"mr={mr.get('web_url')} head={current_head}\n"
+                                "修复 Draft/pipeline/discussion/approval 后 "
+                                "Controller 会按 checked head 自动续跑；也可在飞书废止流程。",
+                            },
+                        )
                 # Pipeline/discussion/MR readiness is an external fact. Leave
                 # the run cardless and let the 30-second reconcile retry it.
                 return
+            self.store.clear_merge_wait(run.run_key)
             try:
                 merged = self._operation(
                     f"{run.run_key}:merge:{checked_head}",
@@ -1196,9 +1522,233 @@ class ControllerService:
             except Exception as exc:  # noqa: BLE001 - durable outbox boundary
                 self.store.fail_outbox(item["outbox_key"], str(exc))
 
-    def health(self) -> dict:
+    def _continue_abort(self, run_key: str) -> None:
+        control = self.store.run_control(run_key)
+        if control is None or control["state"] not in {
+            "abort_requested",
+            "aborting",
+        }:
+            return
+        history, run = self._history(run_key)
+        self.store.mark_aborting(run_key)
+        reason = str(control.get("abort_reason") or "human requested abort")
+        for item in history:
+            if (
+                item.managed.purpose in {"root", "work", "exception"}
+                and item.task.status in ACTIVE_STATUSES
+            ):
+                self.kanban.abort_task(
+                    run.workspace.board,
+                    item.task.id,
+                    f"run aborted by human: {reason}",
+                )
+        mr = self.gitlab.abort_delivery(
+            run,
+            requested_by=str(control.get("abort_requested_by") or "unknown"),
+            reason=reason,
+        )
+        terminal = (
+            "completed_before_abort"
+            if mr.get("state") == "merged"
+            else "aborted"
+        )
+        self.store.finish_abort(run_key, terminal)
+        self.store.enqueue(
+            f"{run_key}:aborted:{terminal}",
+            run_key,
+            "aborted",
+            {
+                "origin": run.origin.model_dump(mode="json"),
+                "text": self._mention(run.origin)
+                + (
+                    "废止请求到达前交付已经完成合并，未关闭已合并 MR。\n"
+                    if terminal == "completed_before_abort"
+                    else "自动交付已按人类确认废止。\n"
+                )
+                + f"run={run_key} requested_by="
+                f"{control.get('abort_requested_by')} reason={reason[:500]}\n"
+                f"mr={mr.get('web_url')} state={mr.get('state')} "
+                "branch_worktree=preserved",
+            },
+        )
+        self.flush_outbox()
+
+    def _run_control(self, run_key: str) -> dict:
+        store = getattr(self, "store", None)
+        if store is None or not hasattr(store, "run_control"):
+            return {"run_key": run_key, "state": "active"}
+        return store.run_control(run_key) or {
+            "run_key": run_key,
+            "state": "active",
+        }
+
+    def _dependency_retry_blocked(self, dependency: str) -> bool:
+        store = getattr(self, "store", None)
+        if store is None or not hasattr(store, "open_dependency_outages"):
+            return False
+        now = int(time.time())
+        return any(
+            outage["dependency"] == dependency
+            and int(outage["next_retry_at"]) > now
+            for outage in store.open_dependency_outages()
+        )
+
+    def _record_agent_lifecycle_event(
+        self, managed: ManagedCard, event: EventRecord
+    ) -> None:
+        if managed.purpose != "work":
+            return
+        worker_session_id = None
+        if isinstance(event.payload, dict):
+            candidate = event.payload.get("worker_session_id")
+            if isinstance(candidate, str) and candidate.strip():
+                worker_session_id = candidate
+        if hasattr(self.store, "record_card_runtime_event"):
+            self.store.record_card_runtime_event(
+                board=managed.board,
+                card_id=managed.card_id,
+                kind=event.kind,
+                created_at=event.created_at,
+                worker_session_id=worker_session_id,
+                lease_seconds=self.config.worker_progress_lease_seconds,
+            )
+        try:
+            _, run = self._history(managed.run_key)
+            task = self.reader.task(managed.board, managed.card_id)
+        except Exception:  # noqa: BLE001 - lifecycle notices are best effort
+            return
+        if task is None:
+            return
+        if event.kind in {"claimed", "started", "worker_started"}:
+            if self.config.notification_level != NotificationLevel.VERBOSE:
+                return
+            self._enqueue_progress(
+                run,
+                f"agent:{managed.card_id}:started:{event.run_id or event.id}",
+                self._mention(run.origin)
+                + "Agent 已开始工作。\n"
+                f"run={run.run_key} stage={managed.stage} "
+                f"iteration={managed.iteration} agent={task.assignee} "
+                f"card={task.id}",
+            )
+        elif event.kind in {
+            "blocked",
+            "crashed",
+            "timed_out",
+            "gave_up",
+            "spawn_auto_blocked",
+        }:
+            if self.config.notification_level == NotificationLevel.MINIMAL and (
+                event.kind not in {"blocked", "gave_up", "spawn_auto_blocked"}
+            ):
+                return
+            self._enqueue_progress(
+                run,
+                f"agent:{managed.card_id}:interrupted:{event.id}",
+                self._mention(run.origin)
+                + "Agent 工作已中断。\n"
+                f"run={run.run_key} stage={managed.stage} "
+                f"iteration={managed.iteration} agent={task.assignee} "
+                f"card={task.id} event={event.kind}",
+            )
+
+    def _enqueue_stale_worker_notices(self) -> None:
+        if not hasattr(self.store, "runtime_for_run"):
+            return
+        now = int(time.time())
+        for run_key in self.store.run_keys():
+            control = self.store.run_control(run_key)
+            if control and control["state"] != "active":
+                continue
+            for runtime in self.store.runtime_for_run(run_key):
+                deadline = runtime.get("deadline_at")
+                if deadline is None or int(deadline) >= now:
+                    continue
+                task = self.reader.task(
+                    str(runtime["board"]),
+                    str(runtime["card_id"]),
+                )
+                if task is None or task.status != "running":
+                    continue
+                try:
+                    _, run = self._history(run_key)
+                except Exception as exc:  # noqa: BLE001 - best-effort notice
+                    LOG.warning(
+                        "worker lease evidence lookup failed for run %s: %s",
+                        run_key,
+                        self._error_text(exc),
+                    )
+                    continue
+                self.store.enqueue(
+                    f"{run_key}:worker-lease:{runtime['card_id']}:{deadline}",
+                    run_key,
+                    "worker-lease-expired",
+                    {
+                        "origin": run.origin.model_dump(mode="json"),
+                        "text": self._mention(run.origin)
+                        + "Agent 仍显示 running，但超过进展租约，需要检查运行证据。\n"
+                        f"run={run_key} stage={runtime['stage']} "
+                        f"card={runtime['card_id']} "
+                        f"last_event={runtime['last_event_kind']} "
+                        f"deadline_at={deadline}\n"
+                        "Controller 不会仅按总运行时长终止 Agent；请检查 session/PID/"
+                        "worktree 后再决定是否废止流程。",
+                    },
+                )
+
+    def _enqueue_agent_completed(
+        self,
+        run: RunRecord,
+        item: HistoryItem,
+        metadata: CompletionMetadata,
+    ) -> None:
+        if (
+            self.config.notification_level != NotificationLevel.VERBOSE
+            or not hasattr(self, "store")
+        ):
+            return
+        duration = (
+            max(0, item.task.completed_at - item.task.created_at)
+            if item.task.completed_at is not None
+            else None
+        )
+        self._enqueue_progress(
+            run,
+            f"agent:{item.task.id}:completed:{metadata.outcome.value}",
+            self._mention(run.origin)
+            + "Agent 已完成工作，Controller 已接受交付协议。\n"
+            f"run={run.run_key} stage={metadata.stage.value} "
+            f"iteration={metadata.iteration} agent={item.task.assignee} "
+            f"card={item.task.id} outcome={metadata.outcome.value} "
+            f"duration_seconds={duration if duration is not None else 'unknown'}",
+        )
+
+    def health(self, probe: str = "readiness") -> dict:
+        if probe not in {"liveness", "readiness"}:
+            raise ValueError(f"unsupported health probe {probe}")
         data = self.store.health()
-        boards = self.reader.discover_boards()
+        for outage in data["dependency_outages"]:
+            outage["circuit_open"] = (
+                int(outage["failures"])
+                >= self.config.dependency_circuit_failure_threshold
+            )
+        data["liveness"] = {
+            "ok": True,
+            "store": True,
+            "rpc": True,
+        }
+        if probe == "liveness":
+            data["probe"] = probe
+            data["status"] = "alive"
+            data["ok"] = True
+            return data
+        now = int(time.time())
+        try:
+            boards = self.reader.discover_boards()
+            discovery_error = None
+        except Exception as exc:  # noqa: BLE001 - readiness reports degradation
+            boards = []
+            discovery_error = self._error_text(exc)
         board_health: dict[str, dict] = {}
         for board in sorted(boards):
             try:
@@ -1208,38 +1758,49 @@ class ControllerService:
                 }
             except Exception as exc:  # noqa: BLE001 - health reports degradation
                 board_health[board] = {"ok": False, "error": str(exc)}
-        kanban_ok = all(item["ok"] for item in board_health.values()) and (
+        kanban_ok = discovery_error is None and all(
+            item["ok"] for item in board_health.values()
+        ) and (
             bool(boards) or not self.store.run_keys()
         )
-        historical_v1_runs: list[str] = []
-        active_v1_runs: list[str] = []
-        for run_key in self.store.run_keys():
-            if self._run_protocol_version(run_key) != "hollysys-controller/v1":
-                continue
-            historical_v1_runs.append(run_key)
-            if self._historical_status(run_key, "hollysys-controller/v1")[
-                "active_card"
-            ]:
-                active_v1_runs.append(run_key)
+        reconcile_fresh = (
+            self.last_reconcile_at is not None
+            and now - self.last_reconcile_at <= self.config.health_stale_seconds
+        )
         data.update(
             {
-                "ok": self.last_reconcile_error is None and not active_v1_runs,
+                "probe": probe,
                 "boards": sorted(boards),
+                "board_discovery_error": discovery_error,
                 "board_health": board_health,
                 "last_reconcile_at": self.last_reconcile_at,
                 "last_reconcile_error": self.last_reconcile_error,
+                "reconcile_fresh": reconcile_fresh,
                 "kanban_ok": kanban_ok,
-                "historical_v1_runs": historical_v1_runs,
-                "active_v1_runs": active_v1_runs,
             }
         )
-        data["ok"] = data["ok"] and kanban_ok
+        readiness_ok = (
+            self.last_reconcile_error is None
+            and reconcile_fresh
+            and kanban_ok
+            and data["outbox_pending"] < self.config.outbox_warning_threshold
+            and not data["dependency_outages"]
+        )
         try:
             data["gitlab"] = self.gitlab.health()
-            data["ok"] = data["ok"] and bool(data["gitlab"]["ok"])
+            readiness_ok = readiness_ok and bool(data["gitlab"]["ok"])
         except Exception as exc:  # noqa: BLE001 - health must return degraded state
             data["gitlab"] = {"ok": False, "error": str(exc)}
-            data["ok"] = False
+            readiness_ok = False
+        data["readiness"] = {"ok": readiness_ok}
+        data["status"] = (
+            "healthy"
+            if readiness_ok
+            else "degraded"
+            if data["liveness"]["ok"]
+            else "unhealthy"
+        )
+        data["ok"] = readiness_ok
         return data
 
     def _create_work(
@@ -1447,54 +2008,6 @@ class ControllerService:
             self._verify_work(item.task, record)
         return items, run
 
-    def _run_protocol_version(self, run_key: str) -> str:
-        cards = self.store.cards_for_run(run_key)
-        root = next((card for card in cards if card.purpose == "root"), None)
-        if root is None:
-            raise ValueError(f"run {run_key} has no managed root")
-        task = self.reader.task(root.board, root.card_id)
-        if task is None:
-            raise RuntimeError(f"managed root disappeared: {root.card_id}")
-        return parse_run_protocol_version(task.body)
-
-    def _historical_status(
-        self, run_key: str, protocol_version: str
-    ) -> dict:
-        cards = self.store.cards_for_run(run_key)
-        tasks = [
-            (card, self.reader.task(card.board, card.card_id))
-            for card in cards
-        ]
-        active = [
-            (card, task)
-            for card, task in tasks
-            if task is not None and task.status in ACTIVE_STATUSES
-        ]
-        current = active[-1] if active else None
-        return {
-            "run_key": run_key,
-            "protocol_version": protocol_version,
-            "state": "historical_read_only",
-            "phase": "legacy",
-            "stage": current[0].stage if current else "completed",
-            "active_card": (
-                {
-                    "id": current[1].id,
-                    "stage": current[0].stage,
-                    "iteration": current[0].iteration,
-                    "agent": current[1].assignee,
-                    "status": current[1].status,
-                }
-                if current
-                else None
-            ),
-            "warning": (
-                "active v1 state is not migrated; finish it before deploying v2"
-                if current
-                else "v1 history is retained read-only"
-            ),
-        }
-
     def _attempts_by_stage(self, history: list[HistoryItem]) -> dict[Stage, int]:
         result: dict[Stage, int] = {}
         for item in history:
@@ -1502,7 +2015,7 @@ class ControllerService:
                 continue
             stage = Stage(item.managed.stage)
             if any(
-                "[controller-protocol-error:v2]" in str(comment["body"])
+                "[controller-protocol-error:v3]" in str(comment["body"])
                 for comment in item.task.comments
             ):
                 continue
@@ -1525,7 +2038,7 @@ class ControllerService:
                 or item.managed.stage not in review_stage_values
                 or item.task.status != "done"
                 or any(
-                    "[controller-protocol-error:v2]" in str(comment["body"])
+                    "[controller-protocol-error:v3]" in str(comment["body"])
                     for comment in item.task.comments
                 )
             ):
@@ -1554,7 +2067,7 @@ class ControllerService:
             item for item in history if item.managed.purpose == "root"
         )
         prd_digest = hashlib.sha256(
-            f"{run.source.prd_path}\0{run.source.prd_blob_sha}\n".encode("utf-8")
+            f"{run.source.prd_path}\0{run.source.prd_blob_sha}\n".encode()
         ).hexdigest()
         baselines = [
             ArtifactBaseline(
@@ -1733,7 +2246,7 @@ class ControllerService:
             if item.managed.purpose != "work":
                 continue
             if any(
-                "[controller-protocol-error:v2]" in str(comment["body"])
+                "[controller-protocol-error:v3]" in str(comment["body"])
                 for comment in item.task.comments
             ):
                 stage = Stage(item.managed.stage)
@@ -1846,7 +2359,7 @@ class ControllerService:
         latest: HistoryItem,
         reason: str,
     ) -> None:
-        marker = "[controller-protocol-error:v2]"
+        marker = "[controller-protocol-error:v3]"
         already_marked = any(
             marker in str(comment["body"]) for comment in latest.task.comments
         )
@@ -1931,7 +2444,7 @@ class ControllerService:
         issues: list[str],
     ) -> dict:
         return CompletionMetadata(
-            protocol_version="hollysys-controller/v2",
+            protocol_version="hollysys-controller/v3",
             run_key=run.run_key,
             stage=Stage(managed.stage),
             iteration=managed.iteration,
@@ -2060,6 +2573,12 @@ class ControllerService:
     def _enqueue_progress(
         self, run: RunRecord, event_key: str, text: str
     ) -> None:
+        config = getattr(self, "config", None)
+        if (
+            config is not None
+            and config.notification_level == NotificationLevel.MINIMAL
+        ):
+            return
         self.store.enqueue(
             f"{run.run_key}:progress:{event_key}",
             run.run_key,
@@ -2181,7 +2700,7 @@ class ControllerService:
     ) -> None:
         fields = self._human_block_fields(comment)
         token = fields.get("block_id") or hashlib.sha256(
-            f"{item.task.id}\0{comment}".encode("utf-8")
+            f"{item.task.id}\0{comment}".encode()
         ).hexdigest()[:20]
         summary = fields.get("summary") or item.task.latest_summary or "工作卡暂停"
         evidence = fields.get("evidence") or "见 Kanban 脱敏阻塞评论"
@@ -2207,9 +2726,31 @@ class ControllerService:
         for raw_line in comment.splitlines():
             key, separator, value = raw_line.partition(":")
             normalized = key.strip()
-            if separator and normalized in REQUIRED_HUMAN_BLOCK_FIELDS:
+            if separator and normalized in PARSED_HUMAN_BLOCK_FIELDS:
                 fields[normalized] = value.strip()
         return fields
+
+    @staticmethod
+    def _valid_human_block(fields: dict[str, str]) -> bool:
+        if (
+            REQUIRED_HUMAN_BLOCK_FIELDS - fields.keys()
+            or fields.get("kind") not in ALLOWED_HUMAN_BLOCK_KINDS
+        ):
+            return False
+        if fields.get("kind") in {"environment", "destructive_approval"}:
+            if GATED_HUMAN_BLOCK_FIELDS - fields.keys():
+                return False
+            if fields.get("gate_phase") not in {
+                "migration",
+                "deployment",
+                "release",
+            }:
+                return False
+            if not fields.get("requirement_ids") or not fields.get(
+                "contract_refs"
+            ):
+                return False
+        return True
 
     def _enqueue_success(self, run: RunRecord, mr: dict) -> None:
         merge_sha = str(mr.get("merge_commit_sha") or "")
@@ -2274,6 +2815,85 @@ class ControllerService:
                 "action=修复 Controller/GitLab/Kanban 连通性后运行 health 和 status",
             },
         )
+
+    def _enqueue_dependency_outage(self, run_key: str, outage: dict) -> None:
+        try:
+            _, run = self._history(run_key)
+        except Exception:  # noqa: BLE001 - best-effort operator notice
+            return
+        outage_id = str(outage["outage_id"])
+        self.store.enqueue(
+            f"{run_key}:dependency-outage:{outage_id}",
+            run_key,
+            "dependency-outage",
+            {
+                "origin": run.origin.model_dump(mode="json"),
+                "text": self._mention(run.origin)
+                + "外部依赖暂时不可用，当前 Run 已进入自动退避。\n"
+                f"run={run_key} dependency=gitlab outage={outage_id} "
+                f"class={outage['error_class']} failures={outage['failures']} "
+                f"next_retry_at={outage['next_retry_at']}\n"
+                "Controller、状态查询及其他本地服务保持运行，无需重启容器。",
+            },
+        )
+
+    def _enqueue_dependency_recovered(
+        self,
+        run_key: str,
+        outage: dict,
+    ) -> None:
+        try:
+            _, run = self._history(run_key)
+        except Exception:  # noqa: BLE001 - best-effort operator notice
+            return
+        outage_id = str(outage["outage_id"])
+        duration = max(
+            0,
+            int(time.time()) - int(outage["started_at"]),
+        )
+        self.store.enqueue(
+            f"{run_key}:dependency-recovered:{outage_id}",
+            run_key,
+            "dependency-recovered",
+            {
+                "origin": run.origin.model_dump(mode="json"),
+                "text": self._mention(run.origin)
+                + "外部依赖已恢复，Controller 正按原 run/worktree/MR 继续对账。\n"
+                f"run={run_key} dependency=gitlab outage={outage_id} "
+                f"duration_seconds={duration} retries={outage['failures']}",
+            },
+        )
+
+    @staticmethod
+    def _dependency_error_class(error: Exception) -> str:
+        text = f"{type(error).__name__}: {error}".lower()
+        if any(
+            token in text
+            for token in ("401", "403", "unauthorized", "forbidden")
+        ):
+            return "dependency_auth"
+        if any(token in text for token in ("429", "rate limit", "retry-after")):
+            return "dependency_rate_limited"
+        if any(token in text for token in ("400", "404", "422")):
+            return "dependency_contract"
+        return "dependency_transient"
+
+    @staticmethod
+    def _merge_blocker_kind(error: Exception) -> str:
+        text = str(error).lower()
+        if "draft" in text or "work in progress" in text:
+            return "draft"
+        if "pipeline" in text and any(
+            token in text for token in ("failed", "skipped", "canceled")
+        ):
+            return "pipeline_failed"
+        if "pipeline" in text:
+            return "pipeline_pending"
+        if "discussion" in text:
+            return "unresolved_discussion"
+        if "merge" in text:
+            return "not_mergeable"
+        return "external_gate"
 
     @staticmethod
     def _mention(origin: FeishuOrigin) -> str:

@@ -31,13 +31,21 @@ class FakeGitLab(GitLabClient):
         self.refs = [{"type": "branch", "name": "feature/example-aaaaaaaa"}]
         self.artifact_path_result = ["docs/specs/feature/spec.md"]
         self.artifact_digest_result = "b" * 64
+        self.api_calls = []
 
     def delivery_mr(self, run, mr_iid=None):
         return dict(self.mr)
 
     def api(self, endpoint, *, method="GET", fields=None):
+        self.api_calls.append((endpoint, method, fields))
         if "/notes?" in endpoint:
             return self.notes
+        if endpoint.endswith("/notes") and method == "POST":
+            self.notes.append({"body": fields["body"]})
+            return {"id": 99, "body": fields["body"]}
+        if endpoint.endswith("/merge_requests/2") and method == "PUT":
+            self.mr["state"] = "closed"
+            return dict(self.mr)
         if "/refs?" in endpoint:
             return self.refs
         if "/pipelines?" in endpoint:
@@ -127,6 +135,34 @@ class GitLabGateTests(unittest.TestCase):
         self.client.notes[0]["author"]["username"] = "wrong-user"
         with self.assertRaisesRegex(ValueError, "allowed GitLab identity"):
             self.client.validate_gate(self.run, self.test_meta)
+
+    def test_abort_delivery_comments_once_and_closes_open_mr(self) -> None:
+        first = self.client.abort_delivery(
+            self.run,
+            requested_by="ou_owner",
+            reason="human requested stop",
+        )
+        second = self.client.abort_delivery(
+            self.run,
+            requested_by="ou_owner",
+            reason="human requested stop",
+        )
+
+        self.assertEqual(first["state"], "closed")
+        self.assertEqual(second["state"], "closed")
+        abort_notes = [
+            note
+            for note in self.client.notes
+            if "[hollysys-aborted:v3]" in str(note.get("body"))
+        ]
+        self.assertEqual(len(abort_notes), 1)
+        close_calls = [
+            call
+            for call in self.client.api_calls
+            if call[1] == "PUT"
+            and call[2] == {"state_event": "close"}
+        ]
+        self.assertEqual(len(close_calls), 1)
 
     def test_skipped_unavailable_test_is_bound_in_gate_marker(self) -> None:
         metadata = completion(

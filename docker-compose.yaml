@@ -5,7 +5,10 @@ services:
     pull_policy: missing
     container_name: hermes
     restart: unless-stopped
-    command: ["python", "-m", "hollysys_controller.daemon"]
+    # Keep the image's s6 tree alive. Hollysys Controller is independently
+    # supervised under /run/service so its restart does not interrupt gateways
+    # or the Dashboard.
+    command: ["sleep", "infinity"]
     # .env is both the Compose interpolation file and the container environment
     # file. User settings and mirror addresses live there to keep this file small.
     env_file:
@@ -34,6 +37,7 @@ services:
       - ./hollysysctl:/usr/local/bin/hollysysctl:ro
       - ./container:/opt/fleet/container:ro
       - ./container/ensure-dotnet8.sh:/etc/cont-init.d/00-hollysys-dotnet8:ro
+      - ./container/services.d/hollysys-controller:/run/service/hollysys-controller:ro
       - ./container/mirrors/debian.sources:/etc/apt/sources.list.d/debian.sources:ro
       - ./container/mirrors/sources.list:/etc/apt/sources.list:ro
       - ./container/mirrors/pip.conf:/etc/pip.conf:ro
@@ -41,7 +45,7 @@ services:
       - ./templates:/opt/fleet/templates:ro
       - ./schemas:/opt/fleet/schemas:ro
     healthcheck:
-      test: ["CMD", "python", "-m", "hollysys_controller.cli", "health"]
+      test: ["CMD", "python", "-m", "hollysys_controller.cli", "health", "--probe", "liveness"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -69,6 +69,29 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
             Path(self.temp.name) / "data",
         )
 
+    def test_validate_completion_reads_json_before_rpc(self) -> None:
+        metadata = Path(self.temp.name) / "completion.json"
+        metadata.write_text('{"outcome":"pass"}', encoding="utf-8")
+        args = build_parser().parse_args(
+            [
+                "validate-completion",
+                "--card-id",
+                "t_work",
+                "--metadata",
+                str(metadata),
+            ]
+        )
+        self.assertEqual(
+            params_for(args),
+            (
+                "validate-completion",
+                {
+                    "card_id": "t_work",
+                    "metadata": {"outcome": "pass"},
+                },
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

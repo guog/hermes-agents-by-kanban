@@ -4,7 +4,7 @@
 
 <!-- HOLLYSYS-RUN:BEGIN -->
 ```yaml
-protocol_version: hollysys-controller/v2
+protocol_version: hollysys-controller/v3
 run_key: <run_key>
 project_id: <gitlab-project-id>
 project_path: <group/project>
