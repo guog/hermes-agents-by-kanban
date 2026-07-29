@@ -87,6 +87,15 @@ class ComposeContractTests(unittest.TestCase):
             ["${HERMES_DASHBOARD_PORT:-9119}:9119"],
         )
 
+    def test_container_name_is_parameterized_for_colocated_deployments(
+        self,
+    ) -> None:
+        service = self.compose["services"]["hermes"]
+        self.assertEqual(
+            service["container_name"],
+            "${HERMES_CONTAINER_NAME:-hermes}",
+        )
+
     def test_image_uses_selected_release_tag_for_linux_amd64(self) -> None:
         service = self.compose["services"]["hermes"]
         self.assertEqual(service["platform"], "linux/amd64")

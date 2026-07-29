@@ -224,6 +224,7 @@ chmod 600 .env
 至少设置：
 
 - `PUID`、`PGID`：Ubuntu 部署用户的 UID/GID。
+- `HERMES_CONTAINER_NAME`：容器名；同机并存部署必须使用不同名称。
 - `HERMES_DASHBOARD_PORT`：Dashboard 在宿主机发布的端口，默认 `9119`。
 - `HOLLYSYS_GITLAB_HOST=https://green-git.hollysys.net`、
   `HOLLYSYS_GITLAB_ALLOWED_GROUPS` 和五类 reviewer/tester
