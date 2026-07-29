@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -68,7 +67,6 @@ class ControllerConfig(BaseModel):
     config_path: Path = Path("/opt/hollysys-controller/config.yaml")
     profiles_root: Path = Path("/opt/data/profiles")
     projects_root: Path = Path("/workspace/projects")
-    token_file: Path = Path("/opt/data/controller/gitlab-token")
     hermes_command: str = "hermes"
     glab_command: str = "/usr/local/bin/glab"
     lark_command: str = "/usr/local/bin/lark-cli"
@@ -115,6 +113,8 @@ class ControllerConfig(BaseModel):
         self.gitlab_host = endpoint.hostname
         if self.controller_mode not in {"preflight", "active"}:
             raise ValueError("controller_mode must be preflight or active")
+        if self.controller_profile != "dispatcher":
+            raise ValueError("controller_profile must be dispatcher")
         if not self.allowed_groups:
             raise ValueError("allowed_groups must contain at least one GitLab group")
         group_pattern = re.compile(
@@ -244,12 +244,6 @@ class ControllerConfig(BaseModel):
                 "projects_root": Path(
                     os.environ.get("HOLLYSYS_PROJECTS_ROOT", "/workspace/projects")
                 ),
-                "token_file": Path(
-                    os.environ.get(
-                        "HOLLYSYS_GITLAB_TOKEN_FILE",
-                        "/opt/data/controller/gitlab-token",
-                    )
-                ),
             }
         )
         env_map = {
@@ -360,18 +354,9 @@ class ControllerConfig(BaseModel):
         return cls.model_validate(data)
 
     def read_token(self) -> str:
-        if self.token_file.is_symlink():
-            raise PermissionError(f"{self.token_file} must not be a symlink")
-        info = self.token_file.stat()
-        if not stat.S_ISREG(info.st_mode):
-            raise PermissionError(f"{self.token_file} must be a regular file")
-        if info.st_uid not in trusted_runtime_uids():
-            raise PermissionError(
-                f"{self.token_file} must be owned by root or the controller user"
-            )
-        if info.st_mode & 0o177:
-            raise PermissionError(f"{self.token_file} must be mode 0600 (or stricter)")
-        token = self.token_file.read_text(encoding="utf-8").strip()
-        if not token:
-            raise ValueError(f"{self.token_file} is empty")
-        return token
+        # Controller and Dispatcher intentionally share one credential source.
+        # A function-local import avoids a module cycle while preserving the
+        # complete Profile identity, host, group, ownership, and mode checks.
+        from .git_auth import profile_credential
+
+        return profile_credential(self, "dispatcher").token

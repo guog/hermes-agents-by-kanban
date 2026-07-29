@@ -397,8 +397,6 @@ class GitAuthenticationTests(unittest.TestCase):
         cfg = config(self.root)
         cfg.gitlab_host = "green-git.hollysys.net"
         cfg.profiles_root = self.root / "profiles"
-        cfg.token_file.write_text("controller-only-token\n", encoding="utf-8")
-        cfg.token_file.chmod(0o600)
         for index, profile in enumerate(sorted(ALL_PROFILES), start=1):
             profile_root = cfg.profiles_root / profile
             (profile_root / "home").mkdir(parents=True)
@@ -420,7 +418,8 @@ class GitAuthenticationTests(unittest.TestCase):
         result = summarize_profile_preflight(cfg, deep=False)
         self.assertTrue(result["ok"])
         self.assertTrue(result["unique_profile_tokens"])
-        self.assertTrue(result["controller_token_isolated"])
+        self.assertTrue(result["controller_token_matches_dispatcher"])
+        self.assertEqual(result["controller_token_source"], "dispatcher")
         self.assertNotIn("token_fingerprint", str(result))
 
         duplicate = cfg.profiles_root / "tester" / ".env"

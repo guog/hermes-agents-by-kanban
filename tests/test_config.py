@@ -12,7 +12,7 @@ from hollysys_controller.config import (
     normalize_gitlab_endpoint,
     trusted_runtime_uids,
 )
-from tests.helpers import config
+from tests.helpers import config, write_profile_env
 
 
 class ConfigTests(unittest.TestCase):
@@ -24,20 +24,23 @@ class ConfigTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_controller_token_requires_private_regular_file(self) -> None:
-        self.config.token_file.write_text("secret\n", encoding="utf-8")
-        self.config.token_file.chmod(0o644)
+    def test_controller_uses_private_dispatcher_profile_token(self) -> None:
+        env_file = write_profile_env(
+            self.config,
+            token="secret",
+            mode=0o644,
+        )
         with self.assertRaises(PermissionError):
             self.config.read_token()
 
-        self.config.token_file.chmod(0o600)
+        env_file.chmod(0o600)
         self.assertEqual(self.config.read_token(), "secret")
 
-    def test_controller_token_rejects_symlink(self) -> None:
-        target = self.root / "actual-token"
-        target.write_text("secret\n", encoding="utf-8")
-        target.chmod(0o600)
-        self.config.token_file.symlink_to(target)
+    def test_controller_rejects_dispatcher_env_symlink(self) -> None:
+        env_file = write_profile_env(self.config, token="secret")
+        target = self.root / "actual-dispatcher-env"
+        env_file.replace(target)
+        env_file.symlink_to(target)
         with self.assertRaisesRegex(PermissionError, "symlink"):
             self.config.read_token()
 

@@ -22,7 +22,6 @@ def config(tmp_path: Path) -> ControllerConfig:
         lock_path=tmp_path / "state" / "controller.lock",
         profiles_root=tmp_path / "profiles",
         projects_root=tmp_path / "projects",
-        token_file=tmp_path / "token",
         gitlab_host="green-git.hollysys.net",
         controller_mode="active",
         allowed_groups=["group"],
@@ -51,6 +50,32 @@ def config(tmp_path: Path) -> ControllerConfig:
             "code-review": ["code-reviewer"],
         },
     )
+
+
+def write_profile_env(
+    cfg: ControllerConfig,
+    *,
+    profile: str = "dispatcher",
+    token: str = "controller-token",
+    mode: int = 0o600,
+) -> Path:
+    profile_root = cfg.profiles_root / profile
+    (profile_root / "home").mkdir(parents=True, exist_ok=True)
+    env_file = profile_root / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"HERMES_PROFILE={profile}",
+                f"GITLAB_HOST={cfg.gitlab_base_url}",
+                f"GITLAB_ALLOWED_GROUPS={','.join(cfg.allowed_groups)}",
+                f"GITLAB_TOKEN={token}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(mode)
+    return env_file
 
 
 def origin() -> FeishuOrigin:
