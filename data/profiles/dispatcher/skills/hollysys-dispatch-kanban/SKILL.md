@@ -1,7 +1,7 @@
 ---
 name: hollysys-dispatch-kanban
 description: 作为人类唯一入口，通过 hollysysctl 启动、查询、恢复和废止正式交付，并解释 Controller 的飞书进度、重试、冻结及异常通知。
-version: 3.0.0
+version: 3.1.0
 ---
 
 # Hollysys Controller 命令入口
@@ -15,7 +15,7 @@ version: 3.0.0
 - 不调用 `hermes kanban create/link/promote/unblock/complete` 塑造或推进正式流程。
 - 不创建 continuation、gate、merge 或恢复卡。
 - 不凭 MR 评论、聊天记忆或卡片标题自行判断下一阶段。
-- 不使用 Dispatcher 的群组级 Maintainer token 写评论、改 MR 或合并；同一 token 的受控写入只由 Controller 执行。
+- 不使用 Dispatcher 的只读 token 写评论、改 MR 或合并；Controller 的受控写入使用独立专用 Maintainer token。
 - 不绕过 Controller 直接向 worker 发任务。
 
 ## 启动
@@ -60,22 +60,10 @@ run 的 `repository_base_sha`、blocked 摘要，以及
 `snapshot.controller_event_cursor/kanban_max_event_id/event_lag`。明确说明这是
 Controller store + Kanban 的权威流程快照，`gitlab_audit=not_requested` 表示本次
 没有复查 MR/head/gates，并不表示门禁失败。
-Controller 返回 `reconciling` 时明确说正在基于 Kanban+GitLab复算，不猜下一阶段。
-
-只有人类明确要求“复查 GitLab MR/head/gates”“完整门禁审计”或工件冻结有效性时，
-才在快速摘要之后执行一次：
-
-```bash
-hollysysctl status --run-key '<run_key>'
-```
-
-展示 `frozen_artifacts` 的 `reviewed|forced_after_review_limit`、MR/head、gates、
-`key_decisions`、unresolved findings 和 residual risks。完整查询超时时，立即回退
-到 `status-summary`：报告流程快照，并说明 GitLab 完整审计繁忙。若 `health` 正常、
-`event_lag` 没有持续增加且 active card 仍在变化，不得建议重启 Controller。
-不得把“SPEC/PLAN/TASKS Review 是否完成”理解成完整 GitLab 审计；阶段是否完成以
-快速摘要中的当前 `phase/stage/active_card` 为准。流程已经进入后续 phase 时，可以
-据此确认上游 phase 已由 Controller 推进完成。
+Controller 不再用含糊的 `reconciling` 填补无当前卡状态；无当前卡时展示真实
+`merge_wait|dependency_degraded|exception|completed|aborted` 等 run state。
+`hollysysctl status` 同样只返回本地权威快照，不触发 GitLab I/O。需要外部 MR/head
+审计时，应说明长期版把它留给新的隔离环境准入/E2E，不在当前状态请求中临时访问远端。
 
 解释工件时说明它们是基于 `repository_base_sha` 的现有企业 MES 定制，不是绿地开发；
 不要把“新增功能”误解为新建独立系统。
@@ -85,7 +73,7 @@ hollysysctl status --run-key '<run_key>'
 Controller 使用 Dispatcher 飞书身份和持久 outbox，在原消息/话题幂等汇报。
 试运行默认 `HOLLYSYS_NOTIFICATION_LEVEL=verbose`：
 
-- run 受理、每个阶段开始、每个 Agent 开始工作和 Controller 接受其完成协议；
+- run 受理、每个阶段开始、每个 Agent 开始工作，以及 Controller 接受或拒绝其完成协议；
 - 文档 review 第 `n/3` 次失败、主要 findings、下一位 writer；
 - 第三次失败进入 finalization，以及阶段最终按 review 通过或强制收敛冻结；
 - tester 与 code-reviewer 对同一 head 的汇总结论、第 `n/5` 次 coder 修改、
@@ -152,10 +140,29 @@ hollysysctl resolve \
   --answer '<answer>'
 ```
 
-`block_id` 必须来自 `hollysysctl status-summary` 返回的阻塞事实或 Controller 异常提示；不得
+`block_id` 必须来自 `hollysysctl status-summary` 返回的 `[human-block:v1]` 事实；不得
 根据 run/card 自行编造。Controller 会验证 root origin、匹配的
 `[human-block:v1]` 评论、消息幂等和卡片状态，再创建新的同阶段 attempt。命令拒绝
 错误 sender/chat/thread、重复或不匹配的 block 时，只解释拒绝原因，不直接改 Kanban。
+
+## 异常状态恢复
+
+只有在管理员已经修复异常卡记录的根因、并由原发起人或管理员明确发送
+`恢复异常 <run_key> <reason>` 时，才执行：
+
+```bash
+hollysysctl recover \
+  --run-key '<run_key>' \
+  --message-id '<human-recovery-om_xxx>' \
+  --sender '<actual-ou_xxx>' \
+  --chat-id '<actual-oc_xxx>' \
+  --thread-id '<actual-omt_xxx>' \
+  --reason '<verified-fix-and-evidence>'
+```
+
+Controller 会归档活动异常卡、以 state-version CAS 将 `exception` 恢复为 `active`，
+并从原 run/worktree/MR 重新对账。非异常态、身份不匹配或未说明已验证修复时不得调用；
+不能用 `resolve`、人工建卡或直接改 SQLite 代替。
 
 ## 健康与异常
 
