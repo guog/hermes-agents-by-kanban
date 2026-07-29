@@ -1,2 +1,6 @@
 [credential]
-	helper = !glab auth git-credential
+	helper =
+[credential "https://green-git.hollysys.net"]
+	username = oauth2
+	useHttpPath = true
+	helper = !/usr/local/bin/gitlab-credential
