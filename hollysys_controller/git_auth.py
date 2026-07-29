@@ -522,14 +522,37 @@ def profile_preflight(
         if not result["origin_token_free"]:
             result.update({"ok": False, "error_code": "remote_host_mismatch"})
             return result
+        push_source = "HEAD"
         if profile in WRITER_PROFILES:
+            empty_tree = _run(
+                [
+                    config.agent_git_command,
+                    "-C",
+                    str(checkout),
+                    "mktree",
+                ],
+                input_text="",
+                env=env,
+                timeout=config.preflight_command_timeout_seconds,
+            )
+            tree_sha = empty_tree.stdout.strip()
+            if (
+                empty_tree.returncode != 0
+                or not re.fullmatch(r"[0-9a-f]{40,64}", tree_sha)
+            ):
+                result.update(
+                    {"ok": False, "error_code": "git_identity_invalid"}
+                )
+                return result
             identity_probe = _run(
                 [
                     config.agent_git_command,
                     "-C",
                     str(checkout),
-                    "commit",
-                    "--allow-empty",
+                    "commit-tree",
+                    tree_sha,
+                    "-p",
+                    "HEAD",
                     "-m",
                     "chore: verify Hollysys profile Git identity",
                 ],
@@ -537,6 +560,12 @@ def profile_preflight(
                 timeout=config.preflight_command_timeout_seconds,
             )
             if identity_probe.returncode != 0:
+                result.update(
+                    {"ok": False, "error_code": "git_identity_invalid"}
+                )
+                return result
+            push_source = identity_probe.stdout.strip()
+            if not re.fullmatch(r"[0-9a-f]{40,64}", push_source):
                 result.update(
                     {"ok": False, "error_code": "git_identity_invalid"}
                 )
@@ -553,7 +582,7 @@ def profile_preflight(
                 "push",
                 "--dry-run",
                 "origin",
-                f"HEAD:{canary_ref}",
+                f"{push_source}:{canary_ref}",
             ],
             env=env,
             timeout=max(30, config.preflight_command_timeout_seconds),
