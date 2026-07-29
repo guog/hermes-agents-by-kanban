@@ -13,6 +13,7 @@ from hollysys_controller.git_auth import (
     ALL_PROFILES,
     ProfileCredential,
     _failure_code,
+    _profile_token_is_persisted,
     _safe_env,
     profile_credential,
     profile_preflight,
@@ -393,6 +394,33 @@ class GitAuthenticationTests(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", env)
         self.assertNotIn("GLAB_TOKEN", env)
         self.assertNotIn("GIT_TRACE_CURL", env)
+
+    def test_empty_glab_token_placeholder_is_not_persisted_credential(
+        self,
+    ) -> None:
+        home = self.root / "home"
+        config_path = home / ".config" / "glab-cli" / "config.yml"
+        config_path.parent.mkdir(parents=True)
+        credential = ProfileCredential(
+            profile="dispatcher",
+            host_url="https://green-git.hollysys.net",
+            allowed_groups=("group",),
+            token="profile-token",
+            env_path=self.root / ".env",
+            home=home,
+        )
+        config_path.write_text(
+            "hosts:\n  gitlab.com:\n    token: null\n",
+            encoding="utf-8",
+        )
+
+        self.assertFalse(_profile_token_is_persisted(credential))
+
+        config_path.write_text(
+            "hosts:\n  green-git.hollysys.net:\n    token: another-token\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(_profile_token_is_persisted(credential))
 
     def test_static_preflight_enforces_unique_profile_tokens(self) -> None:
         cfg = config(self.root)

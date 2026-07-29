@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+import yaml
+
 from .config import ControllerConfig, trusted_runtime_uids
 
 WRITER_PROFILES = frozenset(
@@ -235,20 +237,40 @@ def _decoded_object(result: subprocess.CompletedProcess[str]) -> dict | None:
 
 
 def _profile_token_is_persisted(credential: ProfileCredential) -> bool:
-    candidates = (
-        credential.home / ".config" / "glab-cli" / "config.yml",
-        credential.home / ".gitconfig",
-    )
-    for path in candidates:
+    glab_config = credential.home / ".config" / "glab-cli" / "config.yml"
+    git_config = credential.home / ".gitconfig"
+    for path in (glab_config, git_config):
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         if (
             credential.token in text
-            or bool(re.search(r"(?m)^\s*token:\s*\S+", text))
             or bool(re.search(r"https://[^/\s:@]+:[^/\s@]+@", text))
         ):
             return True
+        if path == glab_config:
+            try:
+                decoded = yaml.safe_load(text)
+            except yaml.YAMLError:
+                return True
+
+            def contains_token(value: object) -> bool:
+                if isinstance(value, dict):
+                    return any(
+                        (
+                            str(key).lower() == "token"
+                            and child is not None
+                            and child != ""
+                        )
+                        or contains_token(child)
+                        for key, child in value.items()
+                    )
+                if isinstance(value, list):
+                    return any(contains_token(child) for child in value)
+                return False
+
+            if contains_token(decoded):
+                return True
     return False
 
 
