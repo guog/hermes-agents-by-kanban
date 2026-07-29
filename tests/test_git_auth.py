@@ -14,6 +14,7 @@ from hollysys_controller.git_auth import (
     ProfileCredential,
     _failure_code,
     _safe_env,
+    profile_credential,
     profile_preflight,
     read_profile_env,
     summarize_profile_preflight,
@@ -479,6 +480,37 @@ class GitAuthenticationTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "missing_profile_identity")
+
+    def test_profile_host_is_normalized_before_comparison(self) -> None:
+        cfg = config(self.root)
+        profile_root = cfg.profiles_root / "dispatcher"
+        (profile_root / "home").mkdir(parents=True)
+        env_file = profile_root / ".env"
+        env_file.write_text(
+            "HERMES_PROFILE=dispatcher\n"
+            'GITLAB_HOST=\"green-git.hollysys.net\"\n'
+            "GITLAB_ALLOWED_GROUPS=group\n"
+            "GITLAB_TOKEN=profile-token\n",
+            encoding="utf-8",
+        )
+        env_file.chmod(0o600)
+
+        credential = profile_credential(cfg, "dispatcher")
+
+        self.assertEqual(
+            credential.host_url,
+            "https://green-git.hollysys.net",
+        )
+
+        env_file.write_text(
+            env_file.read_text(encoding="utf-8").replace(
+                'GITLAB_HOST=\"green-git.hollysys.net\"',
+                "GITLAB_HOST=http://green-git.hollysys.net",
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "invalid_gitlab_host"):
+            profile_credential(cfg, "dispatcher")
 
     def test_deep_preflight_checks_the_real_login_shell_cli_paths(self) -> None:
         cfg = config(self.root)
