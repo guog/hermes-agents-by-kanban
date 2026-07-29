@@ -73,11 +73,24 @@ def build_parser() -> argparse.ArgumentParser:
     abort_confirm.add_argument("--chat-id", required=True)
     abort_confirm.add_argument("--thread-id")
 
+    recover = sub.add_parser("recover")
+    recover.add_argument("--run-key", required=True)
+    recover.add_argument("--message-id", required=True)
+    recover.add_argument("--sender", required=True)
+    recover.add_argument("--chat-id", required=True)
+    recover.add_argument("--thread-id")
+    recover.add_argument("--reason", required=True)
+
     validate_completion = sub.add_parser("validate-completion")
     validate_completion.add_argument("--card-id", required=True)
     validate_completion.add_argument("--metadata", required=True, type=Path)
 
-    sub.add_parser("preflight")
+    preflight = sub.add_parser("preflight")
+    preflight.add_argument(
+        "--deep",
+        action="store_true",
+        help="also verify isolated Profile API and repository access",
+    )
     health = sub.add_parser("health")
     health.add_argument(
         "--probe",
@@ -124,7 +137,9 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
     if method == "preflight":
         config = controller_snapshot_config(ControllerConfig.load())
-        result = ControllerService(config).preflight()
+        result = ControllerService(config).preflight(
+            deep=bool(params.get("deep", False))
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
     request = RpcRequest(id=str(uuid.uuid4()), method=method, params=params)
