@@ -5,9 +5,11 @@ import fcntl
 import logging
 import signal
 import sys
+import uuid
 from pathlib import Path
 
 from .config import ControllerConfig
+from .errors import ControllerFatalError, DependencyError
 from .models import RpcRequest
 from .rpc import RpcServer
 from .service import ControllerService
@@ -19,73 +21,132 @@ class ControllerDaemon:
     def __init__(self, config: ControllerConfig):
         self.config = config
         self.service = ControllerService(config)
+        self.boot_id = uuid.uuid4().hex
+        self.service.store.begin_boot(self.boot_id)
         self.rpc = RpcServer(config.socket_path, self.handle_rpc)
         self.stop_event = asyncio.Event()
+        self.fatal_event = asyncio.Event()
+        self.rpc_fatal_error: ControllerFatalError | None = None
 
     async def handle_rpc(self, request: RpcRequest) -> dict:
-        if request.method == "start":
-            return await asyncio.to_thread(self.service.start, request.params)
-        if request.method == "status":
-            run_key = str(request.params.get("run_key") or "")
-            if not run_key:
-                raise ValueError("run_key is required")
-            return await asyncio.to_thread(self.service.status, run_key)
-        if request.method == "resolve":
-            return await asyncio.to_thread(self.service.resolve, request.params)
-        if request.method == "abort-request":
-            return await asyncio.to_thread(
-                self.service.abort_request, request.params
-            )
-        if request.method == "abort-confirm":
-            return await asyncio.to_thread(
-                self.service.abort_confirm, request.params
-            )
-        if request.method == "preflight":
-            return await asyncio.to_thread(self.service.preflight)
-        if request.method == "validate-completion":
-            return await asyncio.to_thread(
-                self.service.validate_completion,
-                request.params,
-            )
-        if request.method == "health":
-            return await asyncio.to_thread(
-                self.service.health,
-                str(request.params.get("probe") or "readiness"),
-            )
-        raise ValueError(f"unsupported method {request.method}")
+        try:
+            if request.method == "start":
+                return await asyncio.to_thread(
+                    self.service.start,
+                    request.params,
+                )
+            if request.method == "status":
+                run_key = str(request.params.get("run_key") or "")
+                if not run_key:
+                    raise ValueError("run_key is required")
+                return await asyncio.to_thread(
+                    self.service.status_summary,
+                    run_key,
+                )
+            if request.method == "resolve":
+                return await asyncio.to_thread(
+                    self.service.resolve,
+                    request.params,
+                )
+            if request.method == "recover":
+                return await asyncio.to_thread(
+                    self.service.recover,
+                    request.params,
+                )
+            if request.method == "abort-request":
+                return await asyncio.to_thread(
+                    self.service.abort_request, request.params
+                )
+            if request.method == "abort-confirm":
+                return await asyncio.to_thread(
+                    self.service.abort_confirm, request.params
+                )
+            if request.method == "preflight":
+                return await asyncio.to_thread(
+                    self.service.preflight,
+                    deep=bool(request.params.get("deep", False)),
+                )
+            if request.method == "validate-completion":
+                return await asyncio.to_thread(
+                    self.service.validate_completion,
+                    request.params,
+                )
+            if request.method == "health":
+                return await asyncio.to_thread(
+                    self.service.health,
+                    str(request.params.get("probe") or "readiness"),
+                )
+            raise ValueError(f"unsupported method {request.method}")
+        except ControllerFatalError as exc:
+            self.rpc_fatal_error = exc
+            self.fatal_event.set()
+            raise
 
     async def run(self) -> None:
         await self.rpc.start()
-        try:
-            await asyncio.to_thread(self.service.reconcile_all)
-        except Exception:
-            LOG.exception(
-                "initial reconciliation degraded; background retry remains active"
-            )
-            await asyncio.to_thread(self.service.flush_outbox)
-        poll_task = asyncio.create_task(self._poll_loop(), name="kanban-event-poll")
-        reconcile_task = asyncio.create_task(
-            self._reconcile_loop(), name="full-reconcile"
-        )
         stop_task = asyncio.create_task(self.stop_event.wait(), name="shutdown")
+        fatal_task = asyncio.create_task(
+            self.fatal_event.wait(),
+            name="rpc-fatal",
+        )
+        background: list[asyncio.Task] = []
+        exit_reason = "clean_shutdown"
+        fatal = False
         try:
+            if self.config.controller_mode == "active":
+                await asyncio.to_thread(
+                    self.service.assert_activation_preflight
+                )
+                await asyncio.to_thread(self.service.reconcile_all)
+                background = [
+                    asyncio.create_task(
+                        self._poll_loop(),
+                        name="kanban-event-poll",
+                    ),
+                    asyncio.create_task(
+                        self._reconcile_loop(),
+                        name="full-reconcile",
+                    ),
+                    asyncio.create_task(
+                        self._outbox_loop(),
+                        name="durable-outbox",
+                    ),
+                ]
             done, _ = await asyncio.wait(
-                (stop_task, poll_task, reconcile_task),
+                (stop_task, fatal_task, *background),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
+                if task is fatal_task:
+                    raise self.rpc_fatal_error or ControllerFatalError(
+                        "rpc_fatal_without_error"
+                    )
                 if task is not stop_task:
                     task.result()
+        except ControllerFatalError as exc:
+            fatal = True
+            exit_reason = f"controller_fatal:{exc}"
+            raise
+        except Exception as exc:
+            fatal = True
+            exit_reason = f"unclassified_fatal:{type(exc).__name__}:{exc}"
+            raise ControllerFatalError(exit_reason) from exc
         finally:
-            for task in (stop_task, poll_task, reconcile_task):
+            for task in (stop_task, fatal_task, *background):
                 task.cancel()
             await asyncio.gather(
                 stop_task,
-                poll_task,
-                reconcile_task,
+                fatal_task,
+                *background,
                 return_exceptions=True,
             )
             await self.rpc.close()
+            await asyncio.to_thread(
+                self.service.store.finish_boot,
+                self.boot_id,
+                exit_reason=exit_reason,
+                fatal=fatal,
+            )
 
     async def _poll_loop(self) -> None:
         while True:
@@ -96,7 +157,9 @@ class ControllerDaemon:
                     self.service.store.recover_dependency,
                     "kanban-event-poll",
                 )
-            except Exception as exc:
+            except ControllerFatalError:
+                raise
+            except DependencyError as exc:
                 LOG.exception(
                     "event polling degraded; dependency retry remains active"
                 )
@@ -110,6 +173,9 @@ class ControllerDaemon:
                     maximum_backoff_seconds=(
                         self.config.dependency_backoff_max_seconds
                     ),
+                    error_class=exc.error_class,
+                    endpoint=exc.context.endpoint,
+                    retry_after_seconds=exc.context.retry_after_seconds,
                 )
                 delay = max(
                     delay,
@@ -126,7 +192,9 @@ class ControllerDaemon:
                     self.service.store.recover_dependency,
                     "full-reconcile",
                 )
-            except Exception as exc:
+            except ControllerFatalError:
+                raise
+            except DependencyError as exc:
                 LOG.exception(
                     "full reconciliation degraded; dependency retry remains active"
                 )
@@ -140,12 +208,20 @@ class ControllerDaemon:
                     maximum_backoff_seconds=(
                         self.config.dependency_backoff_max_seconds
                     ),
+                    error_class=exc.error_class,
+                    endpoint=exc.context.endpoint,
+                    retry_after_seconds=exc.context.retry_after_seconds,
                 )
                 delay = max(
                     1,
                     int(outage["next_retry_at"]) - int(outage["updated_at"]),
                 )
                 await asyncio.sleep(delay)
+
+    async def _outbox_loop(self) -> None:
+        while True:
+            await asyncio.to_thread(self.service.flush_outbox)
+            await asyncio.sleep(self.config.outbox_poll_interval_seconds)
 
 
 def _acquire_lock(path: Path):
