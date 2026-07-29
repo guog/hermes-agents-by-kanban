@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,6 +34,19 @@ CREATE TABLE IF NOT EXISTS managed_cards (
 );
 CREATE INDEX IF NOT EXISTS idx_managed_run
     ON managed_cards(run_key, created_at, card_id);
+
+CREATE TABLE IF NOT EXISTS card_runtime (
+    board TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    worker_started_at INTEGER,
+    worker_session_id TEXT,
+    last_heartbeat_at INTEGER,
+    last_progress_event_at INTEGER,
+    deadline_at INTEGER,
+    last_event_kind TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (board, card_id)
+);
 
 CREATE TABLE IF NOT EXISTS requests (
     request_key TEXT PRIMARY KEY,
@@ -67,6 +81,65 @@ CREATE TABLE IF NOT EXISTS outbox (
     last_error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_control (
+    run_key TEXT PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'active',
+    abort_requested_by TEXT,
+    abort_reason TEXT,
+    abort_requested_at INTEGER,
+    aborted_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS abort_requests (
+    request_id TEXT PRIMARY KEY,
+    run_key TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT,
+    reason TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    confirm_message_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(run_key) REFERENCES run_control(run_key)
+);
+CREATE INDEX IF NOT EXISTS idx_abort_pending
+    ON abort_requests(run_key, status, created_at);
+
+CREATE TABLE IF NOT EXISTS dependency_outages (
+    dependency TEXT PRIMARY KEY,
+    outage_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_class TEXT NOT NULL,
+    error_summary TEXT NOT NULL,
+    failures INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    next_retry_at INTEGER NOT NULL,
+    recovered_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dependency_outage_runs (
+    dependency TEXT NOT NULL,
+    outage_id TEXT NOT NULL,
+    run_key TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (dependency, outage_id, run_key)
+);
+
+CREATE TABLE IF NOT EXISTS merge_wait (
+    run_key TEXT PRIMARY KEY,
+    mr_iid INTEGER,
+    head_sha TEXT,
+    blocker_kind TEXT NOT NULL,
+    blocker TEXT NOT NULL,
+    first_seen_at INTEGER NOT NULL,
+    last_checked_at INTEGER NOT NULL,
+    next_retry_at INTEGER NOT NULL
 );
 """
 
@@ -195,12 +268,477 @@ class ControllerStore:
             ).fetchall()
             return [ManagedCard(**dict(row)) for row in rows]
 
+    def record_card_runtime_event(
+        self,
+        *,
+        board: str,
+        card_id: str,
+        kind: str,
+        created_at: int,
+        worker_session_id: str | None,
+        lease_seconds: int,
+    ) -> None:
+        started = kind in {"claimed", "started", "worker_started"}
+        heartbeat = kind in {"heartbeat", "worker_heartbeat"}
+        progress = started or heartbeat or kind in {
+            "progress",
+            "completed",
+            "blocked",
+            "crashed",
+            "timed_out",
+            "gave_up",
+            "spawn_auto_blocked",
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO card_runtime(
+                    board, card_id, worker_started_at, worker_session_id,
+                    last_heartbeat_at, last_progress_event_at, deadline_at,
+                    last_event_kind, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(board, card_id) DO UPDATE SET
+                    worker_started_at=COALESCE(
+                        card_runtime.worker_started_at,
+                        excluded.worker_started_at
+                    ),
+                    worker_session_id=COALESCE(
+                        excluded.worker_session_id,
+                        card_runtime.worker_session_id
+                    ),
+                    last_heartbeat_at=COALESCE(
+                        excluded.last_heartbeat_at,
+                        card_runtime.last_heartbeat_at
+                    ),
+                    last_progress_event_at=COALESCE(
+                        excluded.last_progress_event_at,
+                        card_runtime.last_progress_event_at
+                    ),
+                    deadline_at=COALESCE(
+                        excluded.deadline_at,
+                        card_runtime.deadline_at
+                    ),
+                    last_event_kind=excluded.last_event_kind,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    board,
+                    card_id,
+                    created_at if started else None,
+                    worker_session_id,
+                    created_at if heartbeat else None,
+                    created_at if progress else None,
+                    created_at + lease_seconds if progress else None,
+                    kind,
+                    int(time.time()),
+                ),
+            )
+
+    def card_runtime(self, board: str, card_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM card_runtime WHERE board=? AND card_id=?",
+                (board, card_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def runtime_for_run(self, run_key: str) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT runtime.*, cards.stage, cards.iteration
+                FROM card_runtime AS runtime
+                JOIN managed_cards AS cards
+                  ON cards.board=runtime.board
+                 AND cards.card_id=runtime.card_id
+                WHERE cards.run_key=?
+                ORDER BY runtime.updated_at, runtime.card_id
+                """,
+                (run_key,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def run_keys(self) -> list[str]:
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT run_key FROM managed_cards ORDER BY run_key"
             ).fetchall()
             return [str(row[0]) for row in rows]
+
+    def ensure_run_control(self, run_key: str) -> None:
+        now = int(time.time())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO run_control(run_key, state, updated_at)
+                VALUES (?, 'active', ?)
+                """,
+                (run_key, now),
+            )
+
+    def run_control(self, run_key: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_control WHERE run_key=?", (run_key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_abort_request(
+        self,
+        *,
+        request_id: str,
+        run_key: str,
+        token_hash: str,
+        sender: str,
+        chat_id: str,
+        thread_id: str | None,
+        reason: str,
+        expires_at: int,
+    ) -> dict:
+        now = int(time.time())
+        self.ensure_run_control(run_key)
+        with self.connect() as conn:
+            control = conn.execute(
+                "SELECT state FROM run_control WHERE run_key=?", (run_key,)
+            ).fetchone()
+            if control is None:
+                raise ValueError(f"unknown run {run_key}")
+            if control["state"] != "active":
+                raise ValueError(
+                    f"run {run_key} cannot request abort from {control['state']}"
+                )
+            conn.execute(
+                """
+                UPDATE abort_requests SET status='expired', updated_at=?
+                WHERE run_key=? AND status='pending'
+                """,
+                (now, run_key),
+            )
+            conn.execute(
+                """
+                INSERT INTO abort_requests(
+                    request_id, run_key, token_hash, sender, chat_id, thread_id,
+                    reason, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    run_key,
+                    token_hash,
+                    sender,
+                    chat_id,
+                    thread_id,
+                    reason,
+                    expires_at,
+                    now,
+                    now,
+                ),
+            )
+        return {
+            "request_id": request_id,
+            "run_key": run_key,
+            "expires_at": expires_at,
+            "reason": reason,
+        }
+
+    def confirm_abort_request(
+        self,
+        *,
+        run_key: str,
+        token_hash: str,
+        sender: str,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+    ) -> dict:
+        now = int(time.time())
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM abort_requests
+                WHERE run_key=? AND status='pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (run_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("no pending abort request")
+            if int(row["expires_at"]) < now:
+                conn.execute(
+                    """
+                    UPDATE abort_requests SET status='expired', updated_at=?
+                    WHERE request_id=?
+                    """,
+                    (now, row["request_id"]),
+                )
+                raise ValueError("abort confirmation token expired")
+            if (
+                row["token_hash"] != token_hash
+                or row["sender"] != sender
+                or row["chat_id"] != chat_id
+                or (row["thread_id"] or None) != (thread_id or None)
+            ):
+                raise PermissionError(
+                    "abort confirmation must match token, requester, and channel"
+                )
+            conn.execute(
+                """
+                UPDATE abort_requests
+                SET status='confirmed', confirm_message_id=?, updated_at=?
+                WHERE request_id=?
+                """,
+                (message_id, now, row["request_id"]),
+            )
+            conn.execute(
+                """
+                UPDATE run_control
+                SET state='abort_requested', abort_requested_by=?,
+                    abort_reason=?, abort_requested_at=?, updated_at=?
+                WHERE run_key=? AND state='active'
+                """,
+                (sender, row["reason"], now, now, run_key),
+            )
+            control = conn.execute(
+                "SELECT * FROM run_control WHERE run_key=?", (run_key,)
+            ).fetchone()
+        if control is None or control["state"] != "abort_requested":
+            raise ValueError("run is no longer active")
+        return dict(control)
+
+    def mark_aborting(self, run_key: str) -> None:
+        now = int(time.time())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE run_control SET state='aborting', updated_at=?
+                WHERE run_key=? AND state IN ('abort_requested', 'aborting')
+                """,
+                (now, run_key),
+            )
+
+    def finish_abort(self, run_key: str, state: str = "aborted") -> None:
+        if state not in {"aborted", "completed_before_abort"}:
+            raise ValueError(f"invalid abort terminal state {state}")
+        now = int(time.time())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE run_control SET state=?, aborted_at=?, updated_at=?
+                WHERE run_key=? AND state IN ('abort_requested', 'aborting')
+                """,
+                (state, now, now, run_key),
+            )
+
+    def active_abort_run_keys(self) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_key FROM run_control
+                WHERE state IN ('abort_requested', 'aborting')
+                ORDER BY updated_at
+                """
+            ).fetchall()
+        return [str(row["run_key"]) for row in rows]
+
+    def record_dependency_failure(
+        self,
+        dependency: str,
+        error: str,
+        *,
+        initial_backoff_seconds: float,
+        maximum_backoff_seconds: float,
+        error_class: str = "dependency_transient",
+    ) -> dict:
+        now = int(time.time())
+        with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT * FROM dependency_outages WHERE dependency=?",
+                (dependency,),
+            ).fetchone()
+            continuing = previous is not None and previous["status"] == "open"
+            failures = int(previous["failures"]) + 1 if continuing else 1
+            outage_id = (
+                str(previous["outage_id"])
+                if continuing
+                else uuid.uuid4().hex
+            )
+            delay = min(
+                maximum_backoff_seconds,
+                initial_backoff_seconds * (2 ** (failures - 1)),
+            )
+            next_retry_at = now + max(1, int(delay))
+            started_at = (
+                int(previous["started_at"]) if continuing else now
+            )
+            conn.execute(
+                """
+                INSERT INTO dependency_outages(
+                    dependency, outage_id, status, error_class, error_summary,
+                    failures, started_at, next_retry_at, recovered_at, updated_at
+                ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(dependency) DO UPDATE SET
+                    outage_id=excluded.outage_id,
+                    status='open',
+                    error_class=excluded.error_class,
+                    error_summary=excluded.error_summary,
+                    failures=excluded.failures,
+                    started_at=excluded.started_at,
+                    next_retry_at=excluded.next_retry_at,
+                    recovered_at=NULL,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    dependency,
+                    outage_id,
+                    error_class,
+                    error[:1000],
+                    failures,
+                    started_at,
+                    next_retry_at,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM dependency_outages WHERE dependency=?",
+                (dependency,),
+            ).fetchone()
+        return dict(row)
+
+    def associate_outage_run(
+        self,
+        dependency: str,
+        outage_id: str,
+        run_key: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO dependency_outage_runs(
+                    dependency, outage_id, run_key, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (dependency, outage_id, run_key, int(time.time())),
+            )
+
+    def outage_run_keys(
+        self,
+        dependency: str,
+        outage_id: str,
+    ) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_key FROM dependency_outage_runs
+                WHERE dependency=? AND outage_id=?
+                ORDER BY run_key
+                """,
+                (dependency, outage_id),
+            ).fetchall()
+        return [str(row["run_key"]) for row in rows]
+
+    def recover_dependency(self, dependency: str) -> dict | None:
+        now = int(time.time())
+        with self.connect() as conn:
+            previous = conn.execute(
+                """
+                SELECT * FROM dependency_outages
+                WHERE dependency=? AND status='open'
+                """,
+                (dependency,),
+            ).fetchone()
+            if previous is None:
+                return None
+            conn.execute(
+                """
+                UPDATE dependency_outages
+                SET status='recovered', recovered_at=?, updated_at=?
+                WHERE dependency=?
+                """,
+                (now, now, dependency),
+            )
+        return dict(previous)
+
+    def open_dependency_outages(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dependency_outages
+                WHERE status='open'
+                ORDER BY started_at, dependency
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_merge_wait(
+        self,
+        run_key: str,
+        *,
+        mr_iid: int,
+        head_sha: str | None,
+        blocker_kind: str,
+        blocker: str,
+        retry_seconds: int,
+    ) -> dict:
+        now = int(time.time())
+        with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT * FROM merge_wait WHERE run_key=?",
+                (run_key,),
+            ).fetchone()
+            same_blocker = (
+                previous is not None
+                and previous["head_sha"] == head_sha
+                and previous["blocker_kind"] == blocker_kind
+                and previous["blocker"] == blocker[:1000]
+            )
+            first_seen_at = (
+                int(previous["first_seen_at"]) if same_blocker else now
+            )
+            conn.execute(
+                """
+                INSERT INTO merge_wait(
+                    run_key, mr_iid, head_sha, blocker_kind, blocker,
+                    first_seen_at, last_checked_at, next_retry_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_key) DO UPDATE SET
+                    mr_iid=excluded.mr_iid,
+                    head_sha=excluded.head_sha,
+                    blocker_kind=excluded.blocker_kind,
+                    blocker=excluded.blocker,
+                    first_seen_at=excluded.first_seen_at,
+                    last_checked_at=excluded.last_checked_at,
+                    next_retry_at=excluded.next_retry_at
+                """,
+                (
+                    run_key,
+                    mr_iid,
+                    head_sha,
+                    blocker_kind,
+                    blocker[:1000],
+                    first_seen_at,
+                    now,
+                    now + retry_seconds,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM merge_wait WHERE run_key=?",
+                (run_key,),
+            ).fetchone()
+        result = dict(row)
+        result["changed"] = not same_blocker
+        return result
+
+    def clear_merge_wait(self, run_key: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM merge_wait WHERE run_key=?", (run_key,))
+
+    def merge_wait(self, run_key: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM merge_wait WHERE run_key=?",
+                (run_key,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def begin_request(self, key: str, kind: str, payload: dict) -> dict | None:
         now = int(time.time())
@@ -382,8 +920,16 @@ class ControllerStore:
             failed_ops = conn.execute(
                 "SELECT COUNT(*) FROM operations WHERE status='failed'"
             ).fetchone()[0]
+            aborting = conn.execute(
+                """
+                SELECT COUNT(*) FROM run_control
+                WHERE state IN ('abort_requested', 'aborting')
+                """
+            ).fetchone()[0]
         return {
             "event_cursors": cursors,
             "outbox_pending": pending,
             "failed_operations": failed_ops,
+            "aborting_runs": aborting,
+            "dependency_outages": self.open_dependency_outages(),
         }

@@ -1,0 +1,7 @@
+#!/command/with-contenv sh
+set -eu
+
+export HOME=/opt/data
+cd /opt/data
+exec s6-setuidgid hermes \
+  /opt/hermes/.venv/bin/python -m hollysys_controller.daemon

@@ -5,10 +5,10 @@
 
 ```json
 {
-  "protocol_version": "hollysys-controller/v2",
+  "protocol_version": "hollysys-controller/v3",
   "kind": "work",
   "run": {
-    "protocol_version": "hollysys-controller/v2",
+    "protocol_version": "hollysys-controller/v3",
     "kind": "run-init",
     "run_key": "<hollysys-alphanumeric-key>",
     "project": {
@@ -80,12 +80,21 @@
 }
 ```
 
-## 完成 metadata v6
+## 完成 metadata v7
+
+调用 `kanban_complete` 前，先把业务 metadata 保存为 JSON 并执行：
+
+```bash
+hollysysctl validate-completion --card-id '<当前卡 ID>' --metadata '<json-file>'
+```
+
+只有返回 `ok=true` 才完成卡片。该预检由 Controller 重新加固 card/run/stage/iteration/
+worktree/branch/MR 与冻结合同上下文，避免完成后才发现字段越权或漂移。
 
 `kanban_complete(metadata=...)` 必须提交与
 `schemas/card-completion.schema.json` 一致的扁平对象：
 
-- 必填 `protocol_version=hollysys-controller/v2`、`run_key`、`stage`、
+- 必填 `protocol_version=hollysys-controller/v3`、`run_key`、`stage`、
   `iteration`、`mode`、`outcome`、`prd_blob_sha` 和卡片中的全部
   project/workspace/PRD 身份。
 - `outcome` 只允许 `pass|fail|cancelled`；`fail` 必须给非空 `issues`。
@@ -148,6 +157,9 @@ question: <只需回答的一个问题>
 options: [<A>, <B>]
 required_action: <具体动作>
 resume_check: <可验证条件>
+gate_phase: <migration|deployment|release；environment/destructive_approval 必填>
+requirement_ids: <冻结 TASKS/需求 ID，逗号分隔；上述门禁必填>
+contract_refs: <冻结 PLAN/TASKS 合同引用，逗号分隔；上述门禁必填>
 ```
 
 reason 不超过 160 字符，群聊/话题以原发起人的 `<at>` 开头，并明确：

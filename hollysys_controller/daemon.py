@@ -32,8 +32,26 @@ class ControllerDaemon:
             return await asyncio.to_thread(self.service.status, run_key)
         if request.method == "resolve":
             return await asyncio.to_thread(self.service.resolve, request.params)
+        if request.method == "abort-request":
+            return await asyncio.to_thread(
+                self.service.abort_request, request.params
+            )
+        if request.method == "abort-confirm":
+            return await asyncio.to_thread(
+                self.service.abort_confirm, request.params
+            )
+        if request.method == "preflight":
+            return await asyncio.to_thread(self.service.preflight)
+        if request.method == "validate-completion":
+            return await asyncio.to_thread(
+                self.service.validate_completion,
+                request.params,
+            )
         if request.method == "health":
-            return await asyncio.to_thread(self.service.health)
+            return await asyncio.to_thread(
+                self.service.health,
+                str(request.params.get("probe") or "readiness"),
+            )
         raise ValueError(f"unsupported method {request.method}")
 
     async def run(self) -> None:
@@ -41,8 +59,10 @@ class ControllerDaemon:
         try:
             await asyncio.to_thread(self.service.reconcile_all)
         except Exception:
+            LOG.exception(
+                "initial reconciliation degraded; background retry remains active"
+            )
             await asyncio.to_thread(self.service.flush_outbox)
-            raise
         poll_task = asyncio.create_task(self._poll_loop(), name="kanban-event-poll")
         reconcile_task = asyncio.create_task(
             self._reconcile_loop(), name="full-reconcile"
@@ -68,30 +88,64 @@ class ControllerDaemon:
             await self.rpc.close()
 
     async def _poll_loop(self) -> None:
-        failures = 0
         while True:
+            delay = self.config.poll_interval_seconds
             try:
                 await asyncio.to_thread(self.service.poll_once)
-                failures = 0
-            except Exception:
-                failures += 1
-                LOG.exception("event polling failed")
-                if failures >= self.config.fatal_loop_error_limit:
-                    raise
-            await asyncio.sleep(self.config.poll_interval_seconds)
+                await asyncio.to_thread(
+                    self.service.store.recover_dependency,
+                    "kanban-event-poll",
+                )
+            except Exception as exc:
+                LOG.exception(
+                    "event polling degraded; dependency retry remains active"
+                )
+                outage = await asyncio.to_thread(
+                    self.service.store.record_dependency_failure,
+                    "kanban-event-poll",
+                    str(exc),
+                    initial_backoff_seconds=(
+                        self.config.dependency_backoff_initial_seconds
+                    ),
+                    maximum_backoff_seconds=(
+                        self.config.dependency_backoff_max_seconds
+                    ),
+                )
+                delay = max(
+                    delay,
+                    int(outage["next_retry_at"]) - int(outage["updated_at"]),
+                )
+            await asyncio.sleep(delay)
 
     async def _reconcile_loop(self) -> None:
-        failures = 0
         while True:
             await asyncio.sleep(self.config.reconcile_interval_seconds)
             try:
                 await asyncio.to_thread(self.service.reconcile_all)
-                failures = 0
-            except Exception:
-                failures += 1
-                LOG.exception("full reconciliation failed")
-                if failures >= self.config.fatal_loop_error_limit:
-                    raise
+                await asyncio.to_thread(
+                    self.service.store.recover_dependency,
+                    "full-reconcile",
+                )
+            except Exception as exc:
+                LOG.exception(
+                    "full reconciliation degraded; dependency retry remains active"
+                )
+                outage = await asyncio.to_thread(
+                    self.service.store.record_dependency_failure,
+                    "full-reconcile",
+                    str(exc),
+                    initial_backoff_seconds=(
+                        self.config.dependency_backoff_initial_seconds
+                    ),
+                    maximum_backoff_seconds=(
+                        self.config.dependency_backoff_max_seconds
+                    ),
+                )
+                delay = max(
+                    1,
+                    int(outage["next_retry_at"]) - int(outage["updated_at"]),
+                )
+                await asyncio.sleep(delay)
 
 
 def _acquire_lock(path: Path):

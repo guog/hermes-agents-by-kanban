@@ -1,7 +1,7 @@
 ---
 name: hollysys-dispatch-kanban
-description: 作为人类唯一入口，通过 hollysysctl 启动、查询和恢复正式交付，并解释 Controller 的飞书进度、重试、冻结及异常通知。
-version: 2.0.0
+description: 作为人类唯一入口，通过 hollysysctl 启动、查询、恢复和废止正式交付，并解释 Controller 的飞书进度、重试、冻结及异常通知。
+version: 3.0.0
 ---
 
 # Hollysys Controller 命令入口
@@ -59,9 +59,7 @@ CODE `code_modifications.used/remaining/limit`、
 run 的 `repository_base_sha`、blocked 摘要，以及
 `snapshot.controller_event_cursor/kanban_max_event_id/event_lag`。明确说明这是
 Controller store + Kanban 的权威流程快照，`gitlab_audit=not_requested` 表示本次
-没有复查 MR/head/gates，并不表示门禁失败。若
-`state=historical_read_only`，说明这是未迁移的 v1 历史；active v1 必须先结束，
-不得尝试续跑。
+没有复查 MR/head/gates，并不表示门禁失败。
 Controller 返回 `reconciling` 时明确说正在基于 Kanban+GitLab复算，不猜下一阶段。
 
 只有人类明确要求“复查 GitLab MR/head/gates”“完整门禁审计”或工件冻结有效性时，
@@ -84,9 +82,10 @@ hollysysctl status --run-key '<run_key>'
 
 ## 自动进度通知
 
-Controller 使用 Dispatcher 飞书身份和持久 outbox，在原消息/话题幂等汇报：
+Controller 使用 Dispatcher 飞书身份和持久 outbox，在原消息/话题幂等汇报。
+试运行默认 `HOLLYSYS_NOTIFICATION_LEVEL=verbose`：
 
-- run 受理和每个阶段开始；
+- run 受理、每个阶段开始、每个 Agent 开始工作和 Controller 接受其完成协议；
 - 文档 review 第 `n/3` 次失败、主要 findings、下一位 writer；
 - 第三次失败进入 finalization，以及阶段最终按 review 通过或强制收敛冻结；
 - tester 与 code-reviewer 对同一 head 的汇总结论、第 `n/5` 次 coder 修改、
@@ -94,7 +93,46 @@ Controller 使用 Dispatcher 飞书身份和持久 outbox，在原消息/话题�
 - 第 5 次修改后的双门禁仍未同时通过时结束自动流程，立即 @ 发起人并要求人类决定。
 
 Dispatcher 只解释通知中的 Controller 事实和链接，不自行补充门禁结论，不发送普通
-heartbeat。阻塞通知必须真实 @ 原发起人并给一个明确动作；业务歧义不是阻塞理由。
+heartbeat。`standard` 保留阶段、门禁、阻塞和异常通知，`minimal` 只保留终态及必须
+由人类处理的通知。阻塞通知必须真实 @ 原发起人并给一个明确动作；业务歧义不是阻塞理由。
+
+## 人类废止流程
+
+收到 `废止流程 <run_key> <reason>` 或含义明确的同义命令时，从当前飞书事件取得真实
+sender/chat/thread/message，然后执行：
+
+```bash
+hollysysctl abort-request \
+  --run-key '<run_key>' \
+  --message-id '<human-request-om_xxx>' \
+  --sender '<actual-ou_xxx>' \
+  --chat-id '<actual-oc_xxx>' \
+  --thread-id '<actual-omt_xxx>' \
+  --reason '<reason>'
+```
+
+没有 thread 时省略 `--thread-id`。只有原发起人或
+`HOLLYSYS_ABORT_ADMIN_OPEN_IDS` 中的管理员可发起。向人类展示 Controller 返回的影响：
+活动卡将停止并归档、未合并交付 MR 将留言后关闭、branch/worktree 保留；同时原样展示
+一次性确认命令。此时不得声称流程已经废止。
+
+收到 `确认废止 <run_key> <token>` 后，必须从这条新消息再次提取真实身份和会话：
+
+```bash
+hollysysctl abort-confirm \
+  --run-key '<run_key>' \
+  --token '<token>' \
+  --message-id '<human-confirm-om_xxx>' \
+  --sender '<actual-ou_xxx>' \
+  --chat-id '<actual-oc_xxx>' \
+  --thread-id '<actual-omt_xxx>'
+```
+
+确认 token 有效期默认 10 分钟，且必须由同一发送人在同一 chat/thread 使用。Controller
+先持久化 `abort_requested`，再通过 Hermes `reclaim` 停止运行中 Agent、归档受管卡并
+关闭未合并 MR；外部依赖暂时不可用时返回 `pending-retry`，Controller 后台继续收敛，
+不得直接修改 Kanban 或 GitLab 代替重试。已合并 MR 不会回滚，终态为
+`completed_before_abort`。
 
 ## 人类阻塞恢复
 
@@ -124,11 +162,13 @@ hollysysctl resolve \
 Controller 不可用或出现 Controller exception 时先执行：
 
 ```bash
-hollysysctl health
+hollysysctl health --probe readiness
 hollysysctl status-summary --run-key '<run_key>'
 ```
 
-只报告返回的事件游标、最近对账、outbox、GitLab/Kanban 连通性和异常卡。只有
+容器使用 `health --probe liveness`，因此 GitLab/Kanban 短时故障只会使 readiness
+降级，不会触发整容器重启。只报告返回的事件游标、最近对账、outbox、持久 dependency
+outages、GitLab/Kanban 连通性和异常卡。只有
 Controller socket 缺失、`health` 失败、事件 lag 持续增加且 active card 长时间不变，
 或失败操作累积时，才建议管理员重启。若需要管理员动作，给出一个最小、可验证的动作；
 修复后重新查询状态。不得用人工创建下一卡代替恢复 Controller。

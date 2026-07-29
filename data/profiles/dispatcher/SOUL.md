@@ -12,9 +12,10 @@
   gates 或完整门禁审计时才调用一次 `hollysysctl status`，不能从聊天记忆猜测。
 - 对人类说明 SPEC/PLAN/TASKS/CODE 均以 run 固定的 repository base 为基础，对现有
   MES 复用、扩展或修改，而不是从零构建。
-- 及时向原飞书会话汇报 run 受理、阶段开始、每次 review 失败及剩余次数、finalization、阶段冻结、测试结构化跳过、双门禁汇总结论、第 n/5 次代码修改、阻塞和 checked-head merge；不转发普通 heartbeat。
+- 及时向原飞书会话汇报 run 受理、阶段开始、每个 Agent 开始与完成、每次 review 失败及剩余次数、finalization、阶段冻结、测试结构化跳过、双门禁汇总结论、第 n/5 次代码修改、阻塞和 checked-head merge；频次由 `HOLLYSYS_NOTIFICATION_LEVEL` 控制，不转发普通 heartbeat。
 - 第 5 次代码修改后的 tester/code-reviewer 仍未对同一 head 双通过时，说明自动流程已结束并立即 @ 发起人给出明确处理动作。
 - 人类阻塞答复必须携带原 sender/chat/thread/message，且只能通过
   `hollysysctl resolve` 提交；不得直接 unblock、改卡或伪造恢复结果。
+- 人类废止必须走 `hollysysctl abort-request` 与新的 `abort-confirm` 消息；只接受原发起人或配置管理员，确认身份和 chat/thread 必须与申请一致。不得自行停止进程、归档卡或关闭 MR。
 - Controller 不可用、协议重试耗尽、凭据/环境故障或不安全操作待授权时，说明已验证事实和一个明确的人类动作。
 - 不编写或评判 SPEC、PLAN、TASKS 和代码，不代替 reviewer/tester。

@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .models import Stage
+from .models import NotificationLevel, Stage
 
 
 class ControllerConfig(BaseModel):
@@ -28,7 +28,6 @@ class ControllerConfig(BaseModel):
     poll_interval_seconds: float = Field(default=2.0, gt=0)
     reconcile_interval_seconds: float = Field(default=30.0, gt=0)
     command_timeout_seconds: int = Field(default=120, gt=0)
-    fatal_loop_error_limit: int = Field(default=5, gt=0)
     gitlab_host: str = ""
     allowed_groups: list[str] = Field(default_factory=list)
     required_pipeline: bool = True
@@ -39,6 +38,18 @@ class ControllerConfig(BaseModel):
     document_review_limit: int = Field(default=3, ge=1)
     code_modification_limit: int = Field(default=5, ge=1)
     protocol_retry_limit: int = 2
+    notification_level: NotificationLevel = NotificationLevel.VERBOSE
+    abort_admin_open_ids: list[str] = Field(default_factory=list)
+    abort_confirmation_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    dependency_backoff_initial_seconds: float = Field(default=5.0, gt=0)
+    dependency_backoff_max_seconds: float = Field(default=300.0, gt=0)
+    dependency_circuit_failure_threshold: int = Field(default=5, ge=1)
+    health_stale_seconds: int = Field(default=120, ge=10)
+    event_lag_warning_threshold: int = Field(default=100, ge=1)
+    outbox_warning_threshold: int = Field(default=20, ge=1)
+    worker_progress_lease_seconds: int = Field(default=14400, ge=300)
+    merge_wait_retry_seconds: int = Field(default=30, ge=5)
+    merge_wait_timeout_seconds: int = Field(default=3600, ge=60)
 
     @model_validator(mode="after")
     def validate_controller_contract(self) -> ControllerConfig:
@@ -82,6 +93,10 @@ class ControllerConfig(BaseModel):
         if missing_identities:
             raise ValueError(
                 "reviewer_identities missing: " + ", ".join(sorted(missing_identities))
+            )
+        if self.dependency_backoff_initial_seconds > self.dependency_backoff_max_seconds:
+            raise ValueError(
+                "dependency_backoff_initial_seconds cannot exceed maximum"
             )
         return self
 
@@ -144,6 +159,7 @@ class ControllerConfig(BaseModel):
                 "reviewer_identities",
                 "code-review",
             ),
+            "HOLLYSYS_ABORT_ADMIN_OPEN_IDS": "abort_admin_open_ids",
         }
         for env_name, target in env_map.items():
             raw = os.environ.get(env_name)
@@ -153,7 +169,60 @@ class ControllerConfig(BaseModel):
             if isinstance(target, tuple):
                 data.setdefault(target[0], {})[target[1]] = values
             else:
-                data[target] = values if target == "allowed_groups" else raw.strip()
+                data[target] = (
+                    values
+                    if target in {"allowed_groups", "abort_admin_open_ids"}
+                    else raw.strip()
+                )
+        scalar_env = {
+            "HOLLYSYS_NOTIFICATION_LEVEL": "notification_level",
+            "HOLLYSYS_ABORT_CONFIRMATION_TTL_SECONDS": (
+                "abort_confirmation_ttl_seconds",
+                int,
+            ),
+            "HOLLYSYS_DEPENDENCY_BACKOFF_INITIAL_SECONDS": (
+                "dependency_backoff_initial_seconds",
+                float,
+            ),
+            "HOLLYSYS_DEPENDENCY_BACKOFF_MAX_SECONDS": (
+                "dependency_backoff_max_seconds",
+                float,
+            ),
+            "HOLLYSYS_DEPENDENCY_CIRCUIT_FAILURE_THRESHOLD": (
+                "dependency_circuit_failure_threshold",
+                int,
+            ),
+            "HOLLYSYS_HEALTH_STALE_SECONDS": ("health_stale_seconds", int),
+            "HOLLYSYS_EVENT_LAG_WARNING_THRESHOLD": (
+                "event_lag_warning_threshold",
+                int,
+            ),
+            "HOLLYSYS_OUTBOX_WARNING_THRESHOLD": (
+                "outbox_warning_threshold",
+                int,
+            ),
+            "HOLLYSYS_WORKER_PROGRESS_LEASE_SECONDS": (
+                "worker_progress_lease_seconds",
+                int,
+            ),
+            "HOLLYSYS_MERGE_WAIT_RETRY_SECONDS": (
+                "merge_wait_retry_seconds",
+                int,
+            ),
+            "HOLLYSYS_MERGE_WAIT_TIMEOUT_SECONDS": (
+                "merge_wait_timeout_seconds",
+                int,
+            ),
+        }
+        for env_name, target in scalar_env.items():
+            raw = os.environ.get(env_name)
+            if raw is None:
+                continue
+            if isinstance(target, tuple):
+                field_name, converter = target
+                data[field_name] = converter(raw)
+            else:
+                data[target] = raw.strip()
         return cls.model_validate(data)
 
     def read_token(self) -> str:

@@ -59,6 +59,19 @@ class TestDisposition(StrEnum):
     SKIPPED_UNAVAILABLE = "skipped_unavailable"
 
 
+class GatePhase(StrEnum):
+    CODE = "code"
+    MIGRATION = "migration"
+    DEPLOYMENT = "deployment"
+    RELEASE = "release"
+
+
+class NotificationLevel(StrEnum):
+    VERBOSE = "verbose"
+    STANDARD = "standard"
+    MINIMAL = "minimal"
+
+
 class ChangeStrategy(StrEnum):
     EXTEND_EXISTING = "extend_existing"
     MODIFY_EXISTING = "modify_existing"
@@ -106,7 +119,7 @@ class WorkspaceFacts(StrictModel):
 
 
 class RunRecord(StrictModel):
-    protocol_version: Literal["hollysys-controller/v2"] = "hollysys-controller/v2"
+    protocol_version: Literal["hollysys-controller/v3"] = "hollysys-controller/v3"
     kind: Literal["run-init"] = "run-init"
     run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
     project: ProjectFacts
@@ -182,14 +195,17 @@ class RepairContext(StrictModel):
             raise ValueError(
                 "code gate fields are only valid for code_gate_failure"
             )
-        if self.review_attempt is not None and self.review_limit is not None:
-            if self.review_attempt > self.review_limit:
-                raise ValueError("review_attempt cannot exceed review_limit")
+        if (
+            self.review_attempt is not None
+            and self.review_limit is not None
+            and self.review_attempt > self.review_limit
+        ):
+            raise ValueError("review_attempt cannot exceed review_limit")
         return self
 
 
 class CardRecord(StrictModel):
-    protocol_version: Literal["hollysys-controller/v2"] = "hollysys-controller/v2"
+    protocol_version: Literal["hollysys-controller/v3"] = "hollysys-controller/v3"
     kind: Literal["work"] = "work"
     run: RunRecord
     stage: Stage
@@ -250,7 +266,7 @@ class RepositoryEvidence(StrictModel):
 
 
 class CompletionMetadata(StrictModel):
-    protocol_version: Literal["hollysys-controller/v2"]
+    protocol_version: Literal["hollysys-controller/v3"]
     run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
     stage: Stage
     iteration: Annotated[int, Field(ge=1)]
@@ -285,9 +301,28 @@ class CompletionMetadata(StrictModel):
     key_decisions: list[str] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
     residual_risk: list[str] = Field(default_factory=list)
+    gate_phase: GatePhase | None = None
+    contract_refs: list[Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=list
+    )
+    requirement_ids: list[Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=list
+    )
 
     @model_validator(mode="after")
     def validate_stage_contract(self) -> CompletionMetadata:
+        if self.gate_phase is not None and (
+            not self.contract_refs or not self.requirement_ids
+        ):
+            raise ValueError(
+                "gate_phase requires contract_refs and requirement_ids"
+            )
+        if self.gate_phase is None and (
+            self.contract_refs or self.requirement_ids
+        ):
+            raise ValueError(
+                "contract_refs and requirement_ids require gate_phase"
+            )
         document_reviews = {
             Stage.SPEC_REVIEW,
             Stage.PLAN_REVIEW,
@@ -429,18 +464,11 @@ class CompletionMetadata(StrictModel):
 
 
 def validate_persisted_completion_metadata(raw: object) -> CompletionMetadata:
-    """Validate metadata after removing known non-authoritative extras.
+    """Validate the worker payload after separating the trusted runtime envelope.
 
     Hermes v2026.7.20 appends ``worker_session_id`` after a scoped worker calls
     ``kanban_complete``.  It is runtime provenance, not part of the worker's
     strict business completion contract.
-
-    Review/test agents have also been observed copying ``repository_evidence``
-    into their persisted result after inspecting the repository.  That field
-    can authorize nothing for those stages and the Controller independently
-    validates their gate evidence, so this temporary compatibility boundary
-    discards it.  The public worker schema remains strict and rejects both
-    fields; every other extra still reaches ``CompletionMetadata``.
     """
     if not isinstance(raw, dict):
         return CompletionMetadata.model_validate(raw)
@@ -449,14 +477,6 @@ def validate_persisted_completion_metadata(raw: object) -> CompletionMetadata:
         worker_session_id = payload.pop("worker_session_id")
         if not isinstance(worker_session_id, str) or not worker_session_id.strip():
             raise ValueError("worker_session_id must be a non-empty string")
-    if payload.get("stage") in {
-        Stage.SPEC_REVIEW,
-        Stage.PLAN_REVIEW,
-        Stage.TASKS_REVIEW,
-        Stage.TEST,
-        Stage.CODE_REVIEW,
-    }:
-        payload.pop("repository_evidence", None)
     return CompletionMetadata.model_validate(payload)
 
 
@@ -481,9 +501,41 @@ class ResolveRequest(StrictModel):
     answer: Annotated[str, Field(min_length=1, max_length=4000)]
 
 
+class AbortRequest(StrictModel):
+    run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
+    message_id: Annotated[str, Field(pattern=r"^om_[A-Za-z0-9_-]+$")]
+    sender: Annotated[str, Field(pattern=r"^ou_[A-Za-z0-9_-]+$")]
+    chat_id: Annotated[str, Field(pattern=r"^oc_[A-Za-z0-9_-]+$")]
+    thread_id: str | None = None
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+
+
+class AbortConfirmRequest(StrictModel):
+    run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
+    token: Annotated[str, Field(pattern=r"^[A-Z2-9]{8}$")]
+    message_id: Annotated[str, Field(pattern=r"^om_[A-Za-z0-9_-]+$")]
+    sender: Annotated[str, Field(pattern=r"^ou_[A-Za-z0-9_-]+$")]
+    chat_id: Annotated[str, Field(pattern=r"^oc_[A-Za-z0-9_-]+$")]
+    thread_id: str | None = None
+
+
+class CompletionValidationRequest(StrictModel):
+    card_id: Annotated[str, Field(min_length=1)]
+    metadata: dict
+
+
 class RpcRequest(StrictModel):
     id: str
-    method: Literal["start", "status", "resolve", "health"]
+    method: Literal[
+        "start",
+        "status",
+        "resolve",
+        "health",
+        "preflight",
+        "abort-request",
+        "abort-confirm",
+        "validate-completion",
+    ]
     params: dict = Field(default_factory=dict)
 
 

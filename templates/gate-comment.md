@@ -39,7 +39,7 @@ HOLLYSYS-GATE: v=5 run=<run_key> stage=<spec-review|plan-review|tasks-review|tes
 
 ```json
 {
-  "protocol_version": "hollysys-controller/v2",
+  "protocol_version": "hollysys-controller/v3",
   "run_key": "<run_key>",
   "stage": "<stage>",
   "iteration": 1,

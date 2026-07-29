@@ -16,7 +16,7 @@ version: 2.0.1
 - PRD/SPEC 遗漏、歧义或矛盾不得阻塞或触发上游返工。依次按安全/数据完整性、明确验收、具体规则、仓库契约与兼容性、最小可逆方案形成 PLAN 决策并记录未采用方案和回滚方式。
 - 只有权限、凭据、环境/能力缺失、自动重试不安全或破坏性动作待授权时才允许人类阻塞；Controller outbox 负责原渠道通知，不管理订阅。
 
-1. 调用 `kanban_show()`；要求 `created_by=hollysys-controller`，并验证卡片 JSON 的 v2 protocol/mode/run/stage/iteration/assignee/parent、项目、worktree/分支、PRD、交付 MR、冻结基线和可选 repair_context。
+1. 调用 `kanban_show()`；要求 `created_by=hollysys-controller`，并验证卡片 JSON 的 v3 protocol/mode/run/stage/iteration/assignee/parent、项目、worktree/分支、PRD、交付 MR、冻结基线和可选 repair_context。
 2. 在 `repository_base_sha` 上阅读仓库规则、架构、相关实现、配置、迁移和测试，形成
    精确的现有系统盘点：哪些能力直接复用、哪些局部修改、哪些扩展点承载新增能力，
    以及影响和兼容边界。对于每个 `spec-<key>.md`，基于 PLAN 模板创建且只创建对应
@@ -24,7 +24,7 @@ version: 2.0.1
 3. 保留模板中必需的技术上下文、治理检查、决策、架构、接口、数据/迁移、兼容性、可观测性、安全性、测试、回滚、真实项目结构、可追溯性和风险章节。将决策追溯到 SPEC 需求，但不得改变意图或定义最终 Task ID。
 4. review 重写只修改受影响 PLAN 并保留键；冻结违规修复时按 `frozen_baselines` 恢复 PRD/SPEC。不得修改冻结上游。`mode=finalization` 时完成最后取舍并记录残余风险。
 5. commit 最小且连贯的 PLAN 变更，并 push 到同一分支/MR。绝不得创建 PLAN MR。
-6. 普通/重写卡以 v2 `mode=normal,outcome=pass` 完成，并提交严格 v6
+6. 普通/重写卡以 v3 `mode=normal,outcome=pass` 完成，并提交严格 v7
    `repository_evidence`。不得因业务缺口 fail。finalization 按 forced-advance
    模板发布决策评论并提交完整最终基线、决策和风险证据后 pass。不得创建下一卡、
    审查或合并。
@@ -34,3 +34,6 @@ version: 2.0.1
    metadata。`repository_evidence.inspected_paths` 只允许
    `repository_base_sha` 上已存在的精确路径；逐项执行
    `git cat-file -e "$repository_base_sha:$path"`，不得把本轮新增工件路径列入其中。
+- 调用完成工具前，必须将业务 metadata 保存为 JSON，并执行
+  `hollysysctl validate-completion --card-id '<当前卡 ID>' --metadata '<json-file>'`；
+  只有 Controller 返回 `ok=true` 才能完成卡片。

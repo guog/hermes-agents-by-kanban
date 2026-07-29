@@ -17,7 +17,7 @@ version: 2.0.1
 - PRD 存在遗漏、歧义或矛盾，本身不等于阻塞。不得修改任何冻结工件；应依次根据安全、明确的验收条件、具体规则、仓库契约、兼容性和最小可逆范围作出判断。若决策影响用户可见范围/验收、公共接口、数据/迁移、安全/权限、兼容性、恢复/回滚或必需门禁，则属于关键决策。完成前，使用 `/opt/fleet/templates/decision-comment.md` 对账一条幂等的交付 MR 评论，记录本卡关键决策并将 URL 写入 `gitlab_urls`；若没有关键决策，不发布空评论。
 - 真正需要人类时，严格执行卡片中的“人类阻塞协议”：写入幂等 `[human-block:v1]` 评论，再 `kanban_block`；Controller outbox 负责原渠道通知，不得自行发飞书、管理订阅、unblock 或创建恢复卡。
 
-1. 调用 `kanban_show()`；要求 `created_by=hollysys-controller`，并验证卡片 JSON 的 v2 protocol、mode、run/stage/iteration/assignee/parent、项目、worktree/分支、PRD、交付 MR、冻结基线和可选 `repair_context`。绝不得创建另一个 checkout、分支或 MR。
+1. 调用 `kanban_show()`；要求 `created_by=hollysys-controller`，并验证卡片 JSON 的 v3 protocol、mode、run/stage/iteration/assignee/parent、项目、worktree/分支、PRD、交付 MR、冻结基线和可选 `repair_context`。绝不得创建另一个 checkout、分支或 MR。
 2. 写入前，对账当前分支、commit、MR、流水线和已有部分实现；按 TASKS 引用路径
    读取相关现有代码、调用链、数据契约、配置、文档与回归测试，确认每项工作是
    `reuse|modify|extend|create`。若 TASKS 的路径或现状判断有误，在 CODE 阶段按真实
@@ -27,7 +27,7 @@ version: 2.0.1
 4. 运行与改动相称的格式化、静态检查、单元测试、集成/契约检查，并在同一个 MR 描述中记录准确的命令和结果。
 5. 按上述决策层级解决上游遗漏、歧义或矛盾，不得回改冻结工件。`repair_context.kind=code_gate_failure` 时核对其中同一 `head_sha` 的 tester 与 code-reviewer 卡片和全部 findings，并按 `code_modification=n/code_modification_limit` 在一次连贯修改中逐项处理两者意见；不得只修其中一方。Controller 最多派发 5 次修改。`frozen_artifact_violation` 时先精确恢复冻结 blob，并保留上下文中已有代码 findings，再继续实现。
 6. 覆盖所有 TASK 且自测通过后，更新 `/opt/fleet/templates/mr-description.md` 所定义的元数据，并将现有 Draft MR 标记为 ready。代码修复时保持 ready，除非 GitLab 策略要求变更期间设为 draft。
-7. 完成时提交严格 v6 metadata，必含完整上下文、MR/head、验证，以及绑定
+7. 完成时提交严格 v7 metadata，必含完整上下文、MR/head、验证，以及绑定
    `repository_base_sha` 的 `repository_evidence`（实际检查路径、现有能力、变更类型
    和复用决策）。不得包含 continuation/下一卡/merge 字段，不得自审、创建卡片或合并。
 8. 调用完成工具前，必须重新读取当前卡片并逐项原样复制 Controller 上下文：
@@ -36,3 +36,6 @@ version: 2.0.1
    metadata。`repository_evidence.inspected_paths` 只允许
    `repository_base_sha` 上已存在的精确路径；逐项执行
    `git cat-file -e "$repository_base_sha:$path"`，不得把本轮新增工件路径列入其中。
+- 调用完成工具前，必须将业务 metadata 保存为 JSON，并执行
+  `hollysysctl validate-completion --card-id '<当前卡 ID>' --metadata '<json-file>'`；
+  只有 Controller 返回 `ok=true` 才能完成卡片。

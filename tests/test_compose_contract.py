@@ -15,13 +15,29 @@ class ComposeContractTests(unittest.TestCase):
             (root / "docker-compose.yaml").read_text(encoding="utf-8")
         )
 
-    def test_controller_is_container_main_process(self) -> None:
+    def test_controller_is_independently_supervised_by_s6(self) -> None:
         service = self.compose["services"]["hermes"]
         self.assertEqual(
             service["command"],
-            ["python", "-m", "hollysys_controller.daemon"],
+            ["sleep", "infinity"],
         )
         self.assertEqual(service["restart"], "unless-stopped")
+        self.assertIn(
+            "./container/services.d/hollysys-controller:/run/service/hollysys-controller:ro",
+            service["volumes"],
+        )
+        run_script = (
+            self.root / "container/services.d/hollysys-controller/run"
+        ).read_text(encoding="utf-8")
+        self.assertIn("s6-setuidgid hermes", run_script)
+        self.assertIn(
+            "/opt/hermes/.venv/bin/python -m hollysys_controller.daemon",
+            run_script,
+        )
+
+    def test_container_health_uses_local_liveness_probe(self) -> None:
+        healthcheck = self.compose["services"]["hermes"]["healthcheck"]
+        self.assertEqual(healthcheck["test"][-2:], ["--probe", "liveness"])
 
     def test_dashboard_is_published_on_configured_port(self) -> None:
         service = self.compose["services"]["hermes"]

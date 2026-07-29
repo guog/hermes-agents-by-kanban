@@ -13,9 +13,8 @@ from typing import Any
 from .config import ControllerConfig
 from .models import CardRecord, RunRecord
 
-CARD_MARKER = "[hollysys-controller-card:v2]"
-RUN_MARKER = "[hollysys-controller-run:v2]"
-LEGACY_RUN_MARKER = "[hollysys-controller-run:v1]"
+CARD_MARKER = "[hollysys-controller-card:v3]"
+RUN_MARKER = "[hollysys-controller-run:v3]"
 
 
 class CommandError(RuntimeError):
@@ -81,10 +80,12 @@ def render_card_body(card: CardRecord) -> str:
         f"迭代：`{card.iteration}`。\n\n"
         "开始前必须读取完整 JSON 输入和角色 Skill。所有工作写入指定共享 "
         "worktree/branch/MR；完成时提交符合 "
-        "`/opt/fleet/schemas/card-completion.schema.json` 的严格 metadata。\n\n"
+        "`/opt/fleet/schemas/card-completion.schema.json` 的严格 metadata，并先运行 "
+        "`hollysysctl validate-completion --card-id <当前卡> --metadata <json>`。\n\n"
         "真正需要人类时先写 `[human-block:v1]` 评论再使用 "
         "`kanban_block`；Controller outbox 负责原渠道通知。不得创建、链接或推进 "
-        "其他正式卡片。\n\n"
+        "其他正式卡片。environment/destructive_approval 阻塞还必须写明 "
+        "`gate_phase`、冻结 `requirement_ids` 和 `contract_refs`。\n\n"
         f"```json\n{payload}\n```\n"
     )
 
@@ -106,8 +107,7 @@ def parse_run_body(body: str | None) -> RunRecord:
 
 
 def parse_run_protocol_version(body: str | None) -> str:
-    marker = RUN_MARKER if body and RUN_MARKER in body else LEGACY_RUN_MARKER
-    return str(_extract_json(body, marker).get("protocol_version") or "")
+    return str(_extract_json(body, RUN_MARKER).get("protocol_version") or "")
 
 
 def parse_card_body(body: str | None) -> CardRecord:
@@ -360,7 +360,7 @@ class KanbanCLI:
             return
         metadata = json.dumps(
             {
-                "protocol_version": "hollysys-controller/v2",
+                "protocol_version": "hollysys-controller/v3",
                 "kind": "run-init",
                 "run_key": run.run_key,
             },
@@ -424,6 +424,25 @@ class KanbanCLI:
         released = self.reader.task(board, task_id)
         if released is None or released.status not in {"ready", "running", "todo"}:
             raise RuntimeError(f"card {task_id} did not leave controller hold")
+
+    def abort_task(self, board: str, task_id: str, reason: str) -> None:
+        """Stop an active worker through Hermes, then archive its task.
+
+        ``reclaim`` performs the host-local claim/PID validation and sends
+        SIGTERM followed by SIGKILL when needed.  Archiving preserves the task,
+        run, comments, log pointers, and worktree while preventing redispatch.
+        """
+        task = self.reader.task(board, task_id)
+        if task is None or task.status == "archived":
+            return
+        if task.status == "running":
+            self._run(
+                ["reclaim", task_id, "--reason", reason[:500]],
+                board=board,
+            )
+        task = self.reader.task(board, task_id)
+        if task is not None and task.status != "archived":
+            self._run(["archive", task_id], board=board)
 
     def prepare_human_block_for_completion(
         self, board: str, task_id: str
@@ -527,7 +546,7 @@ class KanbanCLI:
         if existing:
             return existing
         body = (
-            "[hollysys-controller-exception:v2]\n\n"
+            "[hollysys-controller-exception:v3]\n\n"
             f"run_key: {run.run_key}\n\n"
             f"reason: {reason[:1000]}\n\n"
             "该卡由 Dispatcher 作为异常入口处理；不得直接推进门禁或合并。"

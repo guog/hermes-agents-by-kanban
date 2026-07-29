@@ -31,6 +31,22 @@ class CompletionMetadataTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionMetadata.model_validate(payload)
 
+    def test_gate_phase_requires_contract_and_requirement_refs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires contract_refs"):
+            completion(
+                self.root,
+                Stage.IMPLEMENT,
+                gate_phase="deployment",
+            )
+        metadata = completion(
+            self.root,
+            Stage.IMPLEMENT,
+            gate_phase="deployment",
+            contract_refs=["PLAN-BLK-001"],
+            requirement_ids=["OP-001"],
+        )
+        self.assertEqual(metadata.gate_phase.value, "deployment")
+
     def test_runtime_worker_session_stamp_is_not_a_worker_schema_field(self) -> None:
         payload = completion(self.root).model_dump(mode="json")
         payload["worker_session_id"] = "20260728_122745_220289"
@@ -53,7 +69,7 @@ class CompletionMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-empty string"):
             validate_persisted_completion_metadata(payload)
 
-    def test_persisted_review_discards_non_authoritative_repository_evidence(
+    def test_persisted_review_rejects_non_authoritative_repository_evidence(
         self,
     ) -> None:
         payload = completion(
@@ -72,8 +88,8 @@ class CompletionMetadataTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionMetadata.model_validate(payload)
 
-        parsed = validate_persisted_completion_metadata(payload)
-        self.assertIsNone(parsed.repository_evidence)
+        with self.assertRaises(ValidationError):
+            validate_persisted_completion_metadata(payload)
 
     def test_run_key_accepts_all_lowercase_alphanumeric_characters(self) -> None:
         run_key = "hollysys-a0b1c2d3e4f5g6h7i8j9"
