@@ -502,7 +502,9 @@ npm run assets:cli
 `npm run assets:cli`。升级 skills CLI 本身时使用
 `npm install --save-dev --save-exact skills@<version>`，同时审查并提交 `package-lock.json`。
 
-Compose 将生成的 `cli/`、`skills/` 分别只读挂载到 `/opt/cli`、`/opt/skills`。Profile 中自有的
+Compose 将生成的 `cli/`、`skills/` 分别只读挂载到 `/opt/cli`、`/opt/skills`。由于 Worker
+命令使用的登录 shell 可能重置 `PATH`，锁定版本的 `glab`、`lark-cli` 还会只读挂载到
+`/usr/local/bin`；运行中的 Agent 不应尝试通过系统包管理器或临时下载替换它们。Profile 中自有的
 `data/profiles/<profile>/skills/hollysys-*` 是本部署的角色流程合同，仍属于代码仓库；第三方依赖不会覆盖
 Agent 已审批的运行态 Skill。运行中的 Agent 也不下载或更新这些资产。
 

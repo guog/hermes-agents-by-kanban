@@ -29,6 +29,8 @@ services:
       - ${HERMES_DATA_DIR:-./data}:/opt/data
       - ${PROJECTS_DIR:-./projects}:/workspace/projects
       - ./cli:/opt/cli:ro
+      - ./cli/bin/glab:/usr/local/bin/glab:ro
+      - ./cli/bin/lark-cli:/usr/local/bin/lark-cli:ro
       - ./skills:/opt/skills:ro
       - ./hollysys_controller:/opt/hollysys-controller-src/hollysys_controller:ro
       - ./controller/config.yaml:/opt/hollysys-controller/config.yaml:ro

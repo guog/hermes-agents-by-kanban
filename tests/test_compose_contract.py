@@ -54,5 +54,10 @@ class ComposeContractTests(unittest.TestCase):
             "/opt/data:/workspace/projects",
         )
 
+    def test_locked_clis_are_available_to_login_shells(self) -> None:
+        volumes = self.compose["services"]["hermes"]["volumes"]
+        self.assertIn("./cli/bin/glab:/usr/local/bin/glab:ro", volumes)
+        self.assertIn("./cli/bin/lark-cli:/usr/local/bin/lark-cli:ro", volumes)
+
 if __name__ == "__main__":
     unittest.main()
