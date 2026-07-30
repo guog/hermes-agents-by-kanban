@@ -6,9 +6,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlparse
 
@@ -26,6 +28,7 @@ from .errors import (
 from .models import (
     ArtifactBaseline,
     CompletionMetadata,
+    DeliveryBinding,
     FeishuOrigin,
     GatePhase,
     Outcome,
@@ -36,6 +39,7 @@ from .models import (
     WorkMode,
     WorkspaceFacts,
 )
+from .validators import validate_task_documents
 
 PRD_URL_RE = re.compile(
     r"^/(?P<project>.+?)/-/(?:blob|raw)/(?P<sha>[0-9a-f]{40})/(?P<path>.+)$"
@@ -71,7 +75,7 @@ PROJECT_PATH_RE = re.compile(
     r"^[A-Za-z0-9_][A-Za-z0-9_.-]*"
     r"(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)+$"
 )
-CONTROLLER_MERGE_SUBMITTED_FIELD = "_hollysys_controller_merge_submitted_v3"
+CONTROLLER_MERGE_SUBMITTED_FIELD = "_hollysys_controller_merge_submitted_v4"
 
 
 @dataclass(frozen=True)
@@ -479,10 +483,14 @@ class GitLabClient:
             raise ValueError(
                 "the PRD on the default branch no longer equals the requested version"
             )
-        identity = f"{blob.hostname}|{project_id}|{prd_path}|{prd_sha}".encode()
+        identity = (
+            f"{blob.hostname}|{project_id}|{prd_path}|{requested_blob}".encode()
+        )
         digest = hashlib.sha256(identity).digest()
         encoded = base64.b32encode(digest).decode("ascii").lower().rstrip("=")
-        run_key = f"hollysys-{encoded[:20]}"
+        source_key = f"source-{encoded[:20]}"
+        run_generation = secrets.token_hex(10)
+        run_key = f"hollysys-{secrets.token_hex(10)}"
         repo_slug = project_path.rsplit("/", 1)[1].lower()
         prd_name = Path(prd_path).stem.lower()
         safe_name = re.sub(r"[^a-z0-9]+", "-", prd_name).strip("-") or "prd"
@@ -496,6 +504,9 @@ class GitLabClient:
         )
         run = RunRecord(
             run_key=run_key,
+            source_key=source_key,
+            run_generation=run_generation,
+            started_at=datetime.now(timezone.utc),
             project=ProjectFacts(
                 host=str(blob.hostname),
                 project_id=project_id,
@@ -623,6 +634,296 @@ class GitLabClient:
                     base_sha,
                 ],
             )
+
+    def create_delivery_branch(self, run: RunRecord) -> dict:
+        project = self._project_endpoint(run.project.project_id)
+        branch_name = run.workspace.branch
+        branch_list_endpoint = (
+            f"{project}/repository/branches?search="
+            f"{quote(f'^{branch_name}$', safe='')}&per_page=100"
+        )
+        branches = self.api(branch_list_endpoint)
+        if not isinstance(branches, list):
+            raise DependencyContractError(
+                "GitLab branch collision response is not an array",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=branch_list_endpoint,
+                    error_code="invalid_list_response",
+                ),
+            )
+        if any(
+            isinstance(item, dict) and item.get("name") == branch_name
+            for item in branches
+        ):
+            raise ValueError(
+                f"delivery_branch_already_exists:{branch_name}"
+            )
+        mr_endpoint = (
+            f"{project}/merge_requests?source_branch="
+            f"{quote(branch_name, safe='')}&scope=all&per_page=100"
+        )
+        merge_requests = self.api(mr_endpoint)
+        if not isinstance(merge_requests, list):
+            raise DependencyContractError(
+                "GitLab MR collision response is not an array",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=mr_endpoint,
+                    error_code="invalid_list_response",
+                ),
+            )
+        if any(
+            isinstance(item, dict)
+            and item.get("source_branch") == branch_name
+            for item in merge_requests
+        ):
+            raise ValueError(
+                f"historical_delivery_mr_exists:{branch_name}"
+            )
+        endpoint = f"{project}/repository/branches"
+        created = self._require_object(
+            self.api(
+                endpoint,
+                method="POST",
+                fields={
+                    "branch": branch_name,
+                    "ref": run.workspace.repository_base_sha,
+                },
+            ),
+            endpoint,
+        )
+        try:
+            created_head = str(created["commit"]["id"])
+        except (KeyError, TypeError) as exc:
+            raise DependencyContractError(
+                "GitLab created branch response lacks commit id",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=endpoint,
+                    error_code="invalid_branch_response",
+                ),
+            ) from exc
+        if (
+            created.get("name") != branch_name
+            or created_head != run.workspace.repository_base_sha
+        ):
+            raise DependencyContractError(
+                "GitLab created branch does not match run identity",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=endpoint,
+                    error_code="created_branch_mismatch",
+                ),
+            )
+        return {"branch": branch_name, "head_sha": created_head}
+
+    def publish_delivery(
+        self,
+        run: RunRecord,
+        *,
+        head_sha: str,
+        description: str,
+    ) -> DeliveryBinding:
+        if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise ValueError("publish_delivery requires a full head SHA")
+        state = self.local_workspace_state(run)
+        if (
+            not state.get("ok")
+            or state.get("head_sha") != head_sha
+            or state.get("branch") != run.workspace.branch
+        ):
+            raise ValueError("publish_delivery local head/branch mismatch")
+        project = self._project_endpoint(run.project.project_id)
+        branch_endpoint = (
+            f"{project}/repository/branches/"
+            f"{quote(run.workspace.branch, safe='')}"
+        )
+        branch = self._require_object(
+            self.api(branch_endpoint),
+            branch_endpoint,
+        )
+        remote_head = str(
+            branch.get("commit", {}).get("id")
+            if isinstance(branch.get("commit"), dict)
+            else ""
+        )
+        if remote_head != head_sha:
+            raise ValueError(
+                f"publish_delivery remote head mismatch:{remote_head}"
+            )
+        collision_endpoint = (
+            f"{project}/merge_requests?source_branch="
+            f"{quote(run.workspace.branch, safe='')}&scope=all&per_page=100"
+        )
+        collisions = self.api(collision_endpoint)
+        if not isinstance(collisions, list):
+            raise DependencyContractError(
+                "GitLab MR collision response is not an array",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=collision_endpoint,
+                    error_code="invalid_list_response",
+                ),
+            )
+        if any(
+            isinstance(item, dict)
+            and item.get("source_branch") == run.workspace.branch
+            for item in collisions
+        ):
+            raise ValueError(
+                f"unbound_delivery_mr_exists:{run.workspace.branch}"
+            )
+        current_user_endpoint = "user"
+        current_user = self._require_object(
+            self.api(current_user_endpoint),
+            current_user_endpoint,
+        )
+        creator = str(
+            current_user.get("username")
+            or current_user.get("id")
+            or ""
+        ).strip()
+        if not creator:
+            raise DependencyContractError(
+                "GitLab current user response lacks identity",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=current_user_endpoint,
+                    error_code="invalid_user_response",
+                ),
+            )
+        mr_endpoint = f"{project}/merge_requests"
+        title = f"Draft: Hollysys {Path(run.source.prd_path).stem} [{run.run_key}]"
+        mr = self._require_object(
+            self.api(
+                mr_endpoint,
+                method="POST",
+                fields={
+                    "source_branch": run.workspace.branch,
+                    "target_branch": run.workspace.target_branch,
+                    "title": title,
+                    "description": description,
+                    "remove_source_branch": False,
+                },
+            ),
+            mr_endpoint,
+        )
+        author = mr.get("author") if isinstance(mr.get("author"), dict) else {}
+        actual_creator = str(
+            author.get("username") or author.get("id") or ""
+        ).strip()
+        if actual_creator != creator:
+            raise DependencyContractError(
+                "created MR author is not the Controller identity",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=mr_endpoint,
+                    error_code="mr_creator_mismatch",
+                ),
+            )
+        if (
+            mr.get("source_branch") != run.workspace.branch
+            or mr.get("target_branch") != run.workspace.target_branch
+            or str(mr.get("sha") or "") != head_sha
+        ):
+            raise DependencyContractError(
+                "created MR does not match run branch/head",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint=mr_endpoint,
+                    error_code="created_mr_mismatch",
+                ),
+            )
+        iid = int(mr.get("iid") or 0)
+        claim = (
+            "[hollysys-run-claim:v4] "
+            f"run={run.run_key} source={run.source_key} "
+            f"generation={run.run_generation} initial_head={head_sha} "
+            f"started_at={run.started_at.isoformat()}"
+        )
+        note_endpoint = f"{project}/merge_requests/{iid}/notes"
+        note = self._require_object(
+            self.api(
+                note_endpoint,
+                method="POST",
+                fields={"body": claim},
+            ),
+            note_endpoint,
+        )
+        created_at = datetime.fromisoformat(
+            str(mr.get("created_at") or "").replace("Z", "+00:00")
+        )
+        return DeliveryBinding(
+            mr_iid=iid,
+            mr_url=str(mr.get("web_url") or ""),
+            creator=creator,
+            created_at=created_at,
+            initial_head_sha=head_sha,
+            claim_note_id=int(note.get("id") or 0),
+        )
+
+    def mark_delivery_ready(
+        self,
+        run: RunRecord,
+        binding: DeliveryBinding,
+    ) -> dict:
+        mr = self.delivery_mr(run, binding.mr_iid)
+        title = str(mr.get("title") or "")
+        ready_title = re.sub(r"^(?:Draft:|WIP:)\s*", "", title).strip()
+        endpoint = (
+            f"{self._project_endpoint(run.project.project_id)}"
+            f"/merge_requests/{binding.mr_iid}"
+        )
+        return self._require_object(
+            self.api(
+                endpoint,
+                method="PUT",
+                fields={"title": ready_title or title},
+            ),
+            endpoint,
+        )
+
+    def validate_delivery_binding(
+        self,
+        run: RunRecord,
+        binding: DeliveryBinding,
+    ) -> dict:
+        mr = self.delivery_mr(run, binding.mr_iid)
+        author = mr.get("author") if isinstance(mr.get("author"), dict) else {}
+        creator = str(
+            author.get("username") or author.get("id") or ""
+        ).strip()
+        created_at = datetime.fromisoformat(
+            str(mr.get("created_at") or "").replace("Z", "+00:00")
+        )
+        if (
+            creator != binding.creator
+            or created_at != binding.created_at
+            or created_at < run.started_at
+        ):
+            raise ValueError("delivery binding creator/time mismatch")
+        note_endpoint = (
+            f"{self._project_endpoint(run.project.project_id)}"
+            f"/merge_requests/{binding.mr_iid}/notes/{binding.claim_note_id}"
+        )
+        note = self._require_object(self.api(note_endpoint), note_endpoint)
+        marker = (
+            f"[hollysys-run-claim:v4] run={run.run_key} "
+            f"source={run.source_key} generation={run.run_generation} "
+            f"initial_head={binding.initial_head_sha}"
+        )
+        note_author = (
+            note.get("author")
+            if isinstance(note.get("author"), dict)
+            else {}
+        )
+        note_creator = str(
+            note_author.get("username") or note_author.get("id") or ""
+        ).strip()
+        if marker not in str(note.get("body") or "") or note_creator != creator:
+            raise ValueError("delivery binding claim note mismatch")
+        return mr
 
     def local_workspace_state(self, run: RunRecord) -> dict:
         worktree = Path(run.workspace.worktree)
@@ -870,78 +1171,12 @@ class GitLabClient:
 
     @staticmethod
     def _validate_task_graph(documents: list[str]) -> None:
-        tasks: dict[str, set[str]] = {}
-        for document in documents:
-            headers = list(TASK_HEADER_RE.finditer(document))
-            for index, header in enumerate(headers):
-                task_id = header.group("task_id")
-                if task_id in tasks:
-                    raise ValueError(
-                        f"TASKS contains duplicate task id: {task_id}"
-                    )
-                end = (
-                    headers[index + 1].start()
-                    if index + 1 < len(headers)
-                    else len(document)
-                )
-                block = document[header.start() : end]
-                dependencies = list(TASK_DEPENDENCY_RE.finditer(block))
-                if len(dependencies) != 1:
-                    raise ValueError(
-                        f"TASKS task {task_id} must define exactly one depends_on"
-                    )
-                dependency_text = dependencies[0].group("dependencies").strip()
-                dependency_ids = set(re.findall(r"\bT[0-9]{3,}\b", dependency_text))
-                residue = re.sub(r"\bT[0-9]{3,}\b", "", dependency_text)
-                residue = re.sub(r"[\s,，、]+", "", residue)
-                if residue:
-                    raise ValueError(
-                        f"TASKS task {task_id} has malformed depends_on"
-                    )
-                actions = list(TASK_ACTION_RE.finditer(block))
-                if len(actions) != 1:
-                    raise ValueError(
-                        f"TASKS task {task_id} must define exactly one action"
-                    )
-                action = actions[0].group("action")
-                target_paths = re.findall(r"`([^`\n]+)`", block)
-                if action != "reuse" and any(
-                    GitLabClient._looks_like_frozen_upstream(path)
-                    for path in target_paths
-                ):
-                    raise ValueError(
-                        f"TASKS task {task_id} attempts to modify a frozen "
-                        "PRD/SPEC/PLAN artifact"
-                    )
-                tasks[task_id] = dependency_ids
-        if not tasks:
-            raise ValueError("implementation_entry TASKS contains no executable tasks")
-        for task_id, dependencies in tasks.items():
-            missing = sorted(dependencies - tasks.keys())
-            if missing:
-                raise ValueError(
-                    f"TASKS task {task_id} depends on missing tasks: "
-                    + ", ".join(missing)
-                )
-            if task_id in dependencies:
-                raise ValueError(f"TASKS task {task_id} depends on itself")
-
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(task_id: str) -> None:
-            if task_id in visiting:
-                raise ValueError(f"TASKS dependency cycle includes {task_id}")
-            if task_id in visited:
-                return
-            visiting.add(task_id)
-            for dependency in tasks[task_id]:
-                visit(dependency)
-            visiting.remove(task_id)
-            visited.add(task_id)
-
-        for task_id in sorted(tasks):
-            visit(task_id)
+        result = validate_task_documents(documents)
+        if not result.passed:
+            raise ValueError(
+                "TASKS_VALIDATION_FAILED:"
+                + ",".join(result.error_codes)
+            )
 
     @staticmethod
     def _looks_like_frozen_upstream(path: str) -> bool:
@@ -1063,62 +1298,31 @@ class GitLabClient:
             raise ControllerFatalError(f"local_git_operation_failed:{operation}")
         return result
 
-    def delivery_mr(self, run: RunRecord, mr_iid: int | None = None) -> dict | None:
+    def delivery_mr(self, run: RunRecord, mr_iid: int) -> dict:
         project = self._project_endpoint(run.project.project_id)
-        if mr_iid is not None:
-            endpoint = f"{project}/merge_requests/{mr_iid}"
-            mr = self._require_object(self.api(endpoint), endpoint)
-            if (
-                mr.get("source_branch") != run.workspace.branch
-                or mr.get("target_branch") != run.workspace.target_branch
-            ):
-                raise ValueError(
-                    "delivery MR does not belong to the run branch/target"
-                )
-            return mr
-        endpoint = (
-            f"{project}/merge_requests?source_branch="
-            f"{quote(run.workspace.branch, safe='')}&scope=all&per_page=20"
-        )
-        results = self.api(endpoint)
-        if not isinstance(results, list):
-            raise DependencyContractError(
-                "GitLab delivery MR list is not an array",
-                context=ErrorContext(
-                    dependency="gitlab",
-                    endpoint=endpoint,
-                    error_code="invalid_list_response",
-                ),
+        endpoint = f"{project}/merge_requests/{mr_iid}"
+        mr = self._require_object(self.api(endpoint), endpoint)
+        if (
+            mr.get("source_branch") != run.workspace.branch
+            or mr.get("target_branch") != run.workspace.target_branch
+        ):
+            raise ValueError(
+                "delivery MR does not belong to the run branch/target"
             )
-        matches = [
-            item
-            for item in results
-            if isinstance(item, dict)
-            and item.get("source_branch") == run.workspace.branch
-            and item.get("target_branch") == run.workspace.target_branch
-        ]
-        if len(matches) > 1:
-            raise DependencyContractError(
-                "more than one delivery MR exists for the run branch",
-                context=ErrorContext(
-                    dependency="gitlab",
-                    endpoint="merge_requests",
-                    error_code="multiple_delivery_mrs",
-                ),
-            )
-        return matches[0] if matches else None
+        return mr
 
     def abort_delivery(
         self,
         run: RunRecord,
         *,
+        mr_iid: int | None,
         requested_by: str,
         reason: str,
     ) -> dict:
         """Write one abort audit note and close an unmerged delivery MR."""
-        mr = self.delivery_mr(run)
-        if mr is None:
+        if mr_iid is None:
             return {"state": "absent", "iid": None, "web_url": None}
+        mr = self.delivery_mr(run, mr_iid)
         if mr.get("state") == "merged":
             return {
                 "state": "merged",
@@ -1129,7 +1333,7 @@ class GitLabClient:
             }
         iid = int(mr["iid"])
         project = self._project_endpoint(run.project.project_id)
-        marker = f"[hollysys-aborted:v3] run={run.run_key}"
+        marker = f"[hollysys-aborted:v4] run={run.run_key}"
         notes = self.paginated_list(
             f"{project}/merge_requests/{iid}/notes"
         )

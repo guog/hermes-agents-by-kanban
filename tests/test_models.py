@@ -164,7 +164,13 @@ class CompletionMetadataTests(unittest.TestCase):
 
     def test_code_gate_pass_requires_current_head_fields(self) -> None:
         with self.assertRaises(ValidationError):
-            completion(self.root, Stage.TEST)
+            completion(
+                self.root,
+                Stage.TEST,
+                mr_iid=None,
+                mr_url=None,
+                head_sha=None,
+            )
         valid = completion(
             self.root,
             Stage.TEST,

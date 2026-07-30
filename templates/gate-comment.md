@@ -36,39 +36,14 @@ HOLLYSYS-SEMANTIC-GATE: v=1 run=<run_key> phase=<implementation_entry|implementa
 | --- | --- | --- | --- | --- |
 | `<stable-decision-id-or-none>` | <ambiguity-or-none> | <decision-or-none> | <evidence> | <impact/rollback> |
 
-## 结构化摘要
+## Controller v8 证据
 
-```json
-{
-  "protocol_version": "hollysys-controller/v3",
-  "run_key": "<run_key>",
-  "stage": "<stage>",
-  "iteration": 1,
-  "mode": "normal",
-  "outcome": "<pass|fail|cancelled>",
-  "prd_blob_sha": "<40-char-git-blob-sha>",
-  "artifact_paths": ["<sorted-path>"],
-  "artifact_digest": "<sha256-or-null>",
-  "artifact_commit_sha": "<40-char-sha-or-null>",
-  "head_sha": "<40-char-sha-or-null>",
-  "test_disposition": "<executed|skipped_unavailable|null>",
-  "skip_reason": "<unavailable-condition-or-null>",
-  "gate_phase": "<implementation_entry|implementation_completion|migration_execution|deployment_entry|release_acceptance|null>",
-  "gate_decision": "<approved|rejected|null>",
-  "gate_reviewer": "<id:numeric-id-or-null>",
-  "gate_reviewed_at": "<RFC3339-with-timezone-or-null>",
-  "gate_reason": "<reason-or-null>",
-  "gate_evidence_refs": [],
-  "gate_artifact_paths": [],
-  "gate_artifact_commit_sha": "<40-char-sha-or-null>",
-  "gate_artifact_digest": "<sha256-or-null>",
-  "contract_refs": [],
-  "requirement_ids": [],
-  "verification": [],
-  "kanban_card_id": "<card-id>",
-  "key_decisions": [],
-  "issues": [],
-  "baseline_disposition": "<reviewed-or-null>",
-  "residual_risk": []
-}
-```
+- source_key：`<source_key>`
+- run_generation：`<run_generation>`
+- context_digest：`<context_digest>`
+- validator/version：`<validator>` / `<validator_version>`
+- validator input/result digest：`<input_digest>` / `<result_digest>`
+- completion v8 digest：`<sha256>`
+
+完整 completion 必须由 `hollysysctl completion-template` 生成并经
+`validate-completion` 验证，不在评论中手写或复制全量对象。

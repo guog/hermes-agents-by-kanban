@@ -1,188 +1,57 @@
 # [<run_key>] <STAGE> iteration <n>
 
-正式工作卡由确定性 Controller 生成；本模板说明卡片 JSON 与执行合同。Worker
-不得创建/link/promote/unblock 其他正式卡，也不得猜测下一阶段。
+正式工作卡由 Hollysys Controller v4 生成。Worker 不得创建、link、promote、resolve、
+unblock 或猜测其他正式卡。
 
-```json
-{
-  "protocol_version": "hollysys-controller/v3",
-  "kind": "work",
-  "run": {
-    "protocol_version": "hollysys-controller/v3",
-    "kind": "run-init",
-    "run_key": "<hollysys-alphanumeric-key>",
-    "project": {
-      "host": "<gitlab-host>",
-      "project_id": 1,
-      "project_path": "<group/project>",
-      "project_display_name": "<display-name>",
-      "default_branch": "<branch>"
-    },
-    "source": {
-      "prd_path": "docs/prds/<prd>.md",
-      "prd_commit_sha": "<40-char-sha>",
-      "prd_blob_sha": "<40-char-git-blob-sha>",
-      "prd_blob_url": "<commit-pinned-url>",
-      "prd_mr_url": "<merged-prd-mr-url>"
-    },
-    "workspace": {
-      "board": "gitlab-p<id>",
-      "checkout": "/workspace/projects/p<id>-<slug>",
-      "worktree": "/workspace/projects/worktrees/p<id>/<run_key>",
-      "branch": "<one-shared-branch>",
-      "target_branch": "<default-branch>",
-      "repository_base_sha": "<40-char-run-start-default-branch-sha>"
-    },
-    "origin": {
-      "platform": "feishu",
-      "message_id": "<om_xxx>",
-      "chat_id": "<oc_xxx>",
-      "thread_id": "<omt_xxx-or-null>",
-      "chat_type": "<group-or-p2p>",
-      "initiator_open_id": "<ou_xxx>"
-    }
-  },
-  "stage": "<controlled-stage>",
-  "iteration": 1,
-  "mode": "<normal|finalization>",
-  "idempotency_key": "<run_key>:<stage>:<iteration>:<mode>:work",
-  "parent_card_id": "<previous-completed-card>",
-  "assignee": "<role-profile>",
-  "skills": ["<role-skill>", "glab"],
-  "frozen_baselines": [
-    {
-      "phase": "<prd|spec|plan|tasks>",
-      "disposition": "<source|reviewed|forced_after_review_limit>",
-      "artifact_paths": ["<sorted-path>"],
-      "artifact_digest": "<sha256>",
-      "artifact_commit_sha": "<40-char-sha>",
-      "source_card_id": "<card-id>",
-      "decision_urls": [],
-      "key_decisions": [],
-      "unresolved_findings": [],
-      "residual_risk": []
-    }
-  ],
-  "repair_context": {
-    "kind": "<review_failure|code_gate_failure|frozen_artifact_violation>",
-    "trigger_card_id": "<card-id>",
-    "issues": ["<exact-finding>"],
-    "review_attempt": null,
-    "review_limit": null,
-    "related_card_ids": [],
-    "head_sha": null,
-    "code_modification": null,
-    "code_modification_limit": null,
-    "frozen_baselines": []
-  },
-  "resume_answer": null,
-  "resumed_from_card_id": null
-}
+## 受信上下文
+
+先执行：
+
+```sh
+hollysysctl card-context --card-id "$HERMES_KANBAN_TASK"
 ```
 
-## 完成 metadata v7
+该短响应是唯一可交给业务 Agent 的卡片上下文，包含稳定 `source_key`、随机
+`run_key/run_generation`、`provenance=fresh_v4`、项目与 PRD 身份、唯一 worktree/
+branch、`expected_head_sha`、`context_digest`、安全 `scratch_dir`、冻结基线和可选
+Delivery binding。不得读取完整 Kanban 代替此入口，也不得复用父卡或前次 attempt
+上下文。
 
-调用 `kanban_complete` 前，先把业务 metadata 保存为 JSON 并执行：
+## 执行边界
 
-```bash
-hollysysctl validate-completion --card-id '<当前卡 ID>' --metadata '<json-file>'
-```
+1. 只在受信 worktree 和 branch 工作。Agent 不创建/发现/选择/切换 MR；首次 SPEC
+   push 后由 Spec Writer 调用 `publish-delivery`，其余阶段只使用已绑定 IID。
+2. Controller 已在派卡前按真实 Profile 的登录环境、PATH 和 wrapper 对当前项目/
+   branch 做准入。不要例行 fetch/pull；只有缺 ref 或已证实漂移时 fetch 并记录原因。
+3. `$HERMES_SCRATCH_DIR` 下每个 attempt 使用独立 `scratch_dir`。不得使用安全根外
+   临时目录。
+4. heartbeat 只保活，不表示进展。进展只由 head、artifact digest、validator、
+   Gate 或 completion 等结构化事实更新。
+5. Writer/Reviewer 对文档统一调用：
 
-只有返回 `ok=true` 才完成卡片。该预检由 Controller 重新加固 card/run/stage/iteration/
-worktree/branch/MR 与冻结合同上下文，避免完成后才发现字段越权或漂移。
+   ```sh
+   hollysysctl validate-artifact --card-id "$HERMES_KANBAN_TASK"
+   ```
 
-`kanban_complete(metadata=...)` 必须提交与
-`schemas/card-completion.schema.json` 一致的扁平对象：
+   `ok=false` 或 `tool_unavailable` 时不得声称通过。
+6. 完成时从 Controller 生成当前 stage/mode/outcome 的 completion v8：
 
-- 必填 `protocol_version=hollysys-controller/v3`、`run_key`、`stage`、
-  `iteration`、`mode`、`outcome`、`prd_blob_sha` 和卡片中的全部
-  project/workspace/PRD 身份。
-- `outcome` 只允许 `pass|fail|cancelled`；`fail` 必须给非空 `issues`。
-- 文档 review 的 pass/fail 都必须给完整排序后的 `artifact_paths`、
-  `artifact_digest`、`artifact_commit_sha`；pass 还必须给
-  `baseline_disposition=reviewed`。
-- test/code-review 的 pass/fail 都必须给当前 `mr_iid`、`mr_url`、`head_sha`。
-- spec-write、plan-write、tasks-write、implement 的 pass 必须给
-  共享交付 `mr_iid`、`mr_url`、当前 `head_sha` 和 `repository_evidence`：
-  后者绑定卡片的 `repository_base_sha`，列出实际检查过的
-  现有代码/文档路径、现有能力、`extend_existing|modify_existing|
-  extend_and_modify` 变更类型，以及明确的复用决策。不能只写“已检查仓库”。
-- test 的 pass/fail 还必须给 `test_disposition=executed|skipped_unavailable`。
-  只有测试条件经实际预检确认不具备时才允许 `skipped_unavailable`，此时使用
-  `outcome=pass`，并给出非空 `skip_reason`、已执行的可用检查 `verification`
-  以及未执行测试带来的 `residual_risk`。
-- 非 TEST 卡必须省略 `test_disposition` 和 `skip_reason`（兼容输入可为 JSON
-  `null`）。lint、build、文档检查等结果属于 `verification`，不能写成
-  `test_disposition=executed`。TEST 使用 `executed` 时也必须省略
-  `skip_reason`（或设为 `null`）。
-- finalization producer 的 pass 必须给工件证据、MR、`baseline_disposition=
-  forced_after_review_limit` 和完整 `forced_advance`，其中包含第三次 review
-  卡片/评论、最终决策评论、baseline commit/paths/digest、关键决策、未解决
-  findings、residual risks 和 review_limit；嵌套证据必须与顶层字段一致。
-- 携带五类语义 Gate 时，必须同时给出 `gate_decision`、`gate_reviewer`、
-  带时区的 `gate_reviewed_at`、`gate_reason`、`gate_evidence_refs`，以及与卡片中
-  唯一冻结 TASKS 基线完全一致的 `gate_artifact_paths`、
-  `gate_artifact_commit_sha`、`gate_artifact_digest`。`requirement_ids` 和
-  `contract_refs` 必须真实出现在冻结 TASKS 文本中；每个 Gate 至少引用一条当前共享
-  MR 的精确 `#note_<id>` URL，该 note 作者必须匹配 `gate_reviewer=id:<numeric-id>`
-  且包含绑定 run/phase/decision/TASKS commit/digest 的
-  `HOLLYSYS-SEMANTIC-GATE` marker；其他证据使用冻结 commit 中存在的精确仓库路径。
-  缺失、重复、漂移或 reviewer 身份不一致均 fail closed。
-- 不得包含 `next_card_ids`、continuation、`live_reconcile_required`、人类
-  resolution 或 merge 专属字段；Schema 对额外字段使用 `additionalProperties=false`。
+   ```sh
+   hollysysctl completion-template \
+     --card-id "$HERMES_KANBAN_TASK" \
+     --outcome pass
+   ```
 
-Hermes 官方完成入口保存 free-form metadata，不会替本部署强制 v6。Worker 必须先
-自检；Controller 会在卡片 done 后再次严格验证，非法 metadata 不推进并创建同阶段新
-attempt，最多自动重试两次。
-
-## 执行协议
-
-1. `kanban_show()` 读取完整卡片。要求 `created_by=hollysys-controller`，并验证 JSON
-   中的 run/stage/iteration/mode/assignee/parent、冻结基线和 repair_context
-   与当前卡一致。
-2. 只在卡片给出的共享 worktree、branch 和单一 MR 工作；GitLab API 操作使用锁定
-   `glab`，由当前 Profile 的 `GITLAB_HOST/GITLAB_TOKEN` 直接认证，不运行
-   `glab auth login`。所有 clone/fetch/pull/push/ls-remote 只调用 PATH 中的受控
-   `git`，remote 必须为 `https://green-git.hollysys.net/<allowed-group>/...`；禁用
-   SSH、明文 HTTP、含用户名/token 的 URL、持久 credential 和绕过 wrapper 的系统 Git
-   路径。Reviewer/Profile 即使 token 误配为高权限也不得 push。
-3. Controller 已在发卡前对账；不要例行 fetch/pull。只有 ref 缺失、已证实头不一致
-   或 push 被拒绝时才能 fetch，并记录原因。
-4. 长任务定期 `kanban_heartbeat(note=...)`。heartbeat 只保活，不触发飞书进度
-   通知。详细工件和证据写入 GitLab；
-   Kanban completion 只保存摘要、结构化事实与链接。
-5. 正常完成前先构造并自检完整 metadata，然后立即完成；Controller 的持久 outbox
-   负责业务进度和阻塞通知。
-6. 不创建下一卡、不判断整体门禁、不执行合并；Controller 监听完成事件并重读
-   Kanban+GitLab后决定下一步。
-7. CODE 阶段不会因 tester fail 提前退回 coder；code-reviewer 仍审查同一 head。
-   两道门禁都完成后，Controller 汇总 findings。任一未通过才派发下一次 coder
-   修改，最多 5 次；第 5 次修改后的双门禁仍未同时通过则结束自动流程并通知人类。
+   只补充真实业务证据；不得修改 source/run/context/head_before/deterministic checks，
+   不得手写全量示例。随后使用 `validate-completion` 校验；只有 `ok=true` 才调用
+   `kanban_complete`。成功后立即结束，不得继续调用模型或业务工具。
+7. Worker 不创建下一卡、不做 Controller 路由、不合并。Controller 只在同一
+   checked head 上汇总 TEST 与 CODE REVIEW Gate。
 
 ## 人类阻塞
 
-业务遗漏、歧义或矛盾不阻塞，也不得要求回改冻结工件。普通缺陷用 fail；依赖等待
-不得伪装成人类问题。只有权限、凭据、环境/能力缺失、自动重试不安全或破坏性操作
-待授权时使用 `kanban_block`，并在 block 前追加一条幂等评论：
-
-```yaml
-[human-block:v1]
-block_id: <run-key>:<card-id>:<run-id>
-kind: <permission|credential|environment|unsafe_retry|destructive_approval>
-summary: <发生了什么>
-evidence: [<脱敏证据>]
-question: <只需回答的一个问题>
-options: [<A>, <B>]
-required_action: <具体动作>
-resume_check: <可验证条件>
-gate_phase: <implementation_entry|implementation_completion|migration_execution|deployment_entry|release_acceptance；environment/destructive_approval 必填>
-requirement_ids: <冻结 TASKS/需求 ID，逗号分隔；上述门禁必填>
-contract_refs: <冻结 PLAN/TASKS 合同引用，逗号分隔；上述门禁必填>
-```
-
-reason 不超过 160 字符，群聊/话题以原发起人的 `<at>` 开头，并明确：
-`处理阻塞 <run-key> <card-id> <答案/已完成动作>`。不得发送 token、密码或原始
-敏感日志。Worker 不发飞书、不管理通知订阅、不自行 unblock、不创建恢复卡。
-Controller outbox 将阻塞通知投递到原会话，Dispatcher 将人类答复
-交给 `hollysysctl resolve`；Controller 验证 origin、block 评论和消息幂等后创建新的同阶段
-attempt，并以 `outcome=cancelled` 结束旧 blocked 尝试。
+业务遗漏、歧义和普通缺陷不阻塞。只有权限、凭据、能力缺失、不安全重试或破坏性
+授权才能先发布幂等 `[human-block:v1]` 评论，再调用 `kanban_block`。评论必须包含
+稳定 `block_id`、类别、脱敏证据、一个问题、required action 和可验证 resume check。
+Worker 不发飞书、不自行 unblock、不创建恢复卡；只有匹配的人类 `resolve` 能让
+Controller 创建新的 run_id/attempt。

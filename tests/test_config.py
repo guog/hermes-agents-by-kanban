@@ -24,24 +24,29 @@ class ConfigTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_controller_uses_private_dispatcher_profile_token(self) -> None:
-        env_file = write_profile_env(
+    def test_controller_uses_private_dedicated_token_file(self) -> None:
+        write_profile_env(
             self.config,
             token="secret",
-            mode=0o644,
         )
+        token_file = self.config.controller_token_file
+        token_file.chmod(0o644)
         with self.assertRaises(PermissionError):
             self.config.read_token()
 
-        env_file.chmod(0o600)
-        self.assertEqual(self.config.read_token(), "secret")
+        token_file.chmod(0o600)
+        self.assertEqual(
+            self.config.read_token(),
+            "dedicated-controller-token",
+        )
 
-    def test_controller_rejects_dispatcher_env_symlink(self) -> None:
-        env_file = write_profile_env(self.config, token="secret")
-        target = self.root / "actual-dispatcher-env"
-        env_file.replace(target)
-        env_file.symlink_to(target)
-        with self.assertRaisesRegex(PermissionError, "symlink"):
+    def test_controller_rejects_token_file_symlink(self) -> None:
+        write_profile_env(self.config, token="secret")
+        token_file = self.config.controller_token_file
+        target = self.root / "actual-controller-token"
+        token_file.replace(target)
+        token_file.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "token_file_invalid"):
             self.config.read_token()
 
     def test_compose_puid_is_a_trusted_runtime_owner(self) -> None:

@@ -5,6 +5,10 @@ model:
   base_url: https://chatgpt.com/backend-api/codex
 agent:
   reasoning_effort: high
+tool_output:
+  max_bytes: 12000
+  max_lines: 400
+  max_line_length: 1000
 toolsets: [file, terminal]
 terminal:
   backend: local
@@ -15,6 +19,11 @@ terminal:
     - GITLAB_HOST
     - GITLAB_ALLOWED_GROUPS
     - GITLAB_TOKEN
+    - HERMES_SCRATCH_DIR
+    - HOLLYSYS_CONTROLLER_SOCKET
+    - NPM_CONFIG_OFFLINE
+    - NPM_CONFIG_CACHE
+    - NUGET_PACKAGES
 approvals:
   mode: off
 memory:

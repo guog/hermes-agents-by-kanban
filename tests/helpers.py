@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from hollysys_controller.config import ControllerConfig
@@ -20,6 +21,7 @@ def config(tmp_path: Path) -> ControllerConfig:
         state_dir=tmp_path / "state",
         socket_path=tmp_path / "state" / "controller.sock",
         lock_path=tmp_path / "state" / "controller.lock",
+        controller_token_file=tmp_path / "controller-token",
         profiles_root=tmp_path / "profiles",
         projects_root=tmp_path / "projects",
         gitlab_host="green-git.hollysys.net",
@@ -59,6 +61,13 @@ def write_profile_env(
     token: str = "controller-token",
     mode: int = 0o600,
 ) -> Path:
+    if not cfg.controller_token_file.exists():
+        cfg.controller_token_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg.controller_token_file.write_text(
+            "dedicated-controller-token\n",
+            encoding="utf-8",
+        )
+        cfg.controller_token_file.chmod(0o600)
     profile_root = cfg.profiles_root / profile
     (profile_root / "home").mkdir(parents=True, exist_ok=True)
     env_file = profile_root / ".env"
@@ -91,6 +100,9 @@ def origin() -> FeishuOrigin:
 def run_record(tmp_path: Path) -> RunRecord:
     return RunRecord(
         run_key="hollysys-abcdefghijklmnopqrst",
+        source_key="source-abcdefghijklmnopqrst",
+        run_generation="0123456789abcdefghij",
+        started_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
         project=ProjectFacts(
             host="green-git.hollysys.net",
             project_id=12,
@@ -136,8 +148,11 @@ def completion(
 ) -> CompletionMetadata:
     run = run_record(tmp_path)
     data = {
-        "protocol_version": "hollysys-controller/v3",
+        "protocol_version": "hollysys-controller/v4",
         "run_key": run.run_key,
+        "source_key": run.source_key,
+        "run_generation": run.run_generation,
+        "context_digest": "e" * 64,
         "stage": stage,
         "iteration": 1,
         "mode": "normal",
@@ -153,9 +168,19 @@ def completion(
         "prd_blob_sha": run.source.prd_blob_sha,
         "prd_mr_url": str(run.source.prd_mr_url),
         "kanban_card_id": "t_abc",
+        "head_before_sha": run.workspace.repository_base_sha,
+        "deterministic_checks": [],
         "verification": ["unit tests"],
     }
     data.update(overrides)
+    if "mr_iid" not in overrides:
+        data["mr_iid"] = 2
+    if "mr_url" not in overrides:
+        data["mr_url"] = (
+            "https://gitlab.example.com/group/project/-/merge_requests/2"
+        )
+    if "head_sha" not in overrides:
+        data["head_sha"] = "d" * 40
     if (
         stage
         in {
@@ -165,26 +190,18 @@ def completion(
             Stage.IMPLEMENT,
         }
         and data["outcome"] == "pass"
+        and "repository_evidence" not in overrides
     ):
-        data.setdefault("mr_iid", 2)
-        data.setdefault(
-            "mr_url",
-            "https://gitlab.example.com/group/project/-/merge_requests/2",
-        )
-        data.setdefault("head_sha", "d" * 40)
-        if "repository_evidence" not in overrides:
-            data["repository_evidence"] = {
-                "repository_base_sha": run.workspace.repository_base_sha,
-                "inspected_paths": [
-                    "src/existing-module",
-                    "docs/architecture.md",
-                ],
-                "existing_capabilities": ["existing MES application framework"],
-                "change_strategy": "extend_existing",
-                "reuse_decisions": [
-                    "reuse the existing module and conventions"
-                ],
-            }
+        data["repository_evidence"] = {
+            "repository_base_sha": run.workspace.repository_base_sha,
+            "inspected_paths": [
+                "src/existing-module",
+                "docs/architecture.md",
+            ],
+            "existing_capabilities": ["existing MES application framework"],
+            "change_strategy": "extend_existing",
+            "reuse_decisions": ["reuse the existing module and conventions"],
+        }
     if (
         stage == Stage.TEST
         and data["outcome"] in {"pass", "fail"}

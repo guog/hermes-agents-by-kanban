@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -29,11 +31,12 @@ from .errors import (
     ReconcileSuperseded,
     RunPolicyError,
 )
-from .git_auth import summarize_profile_preflight
+from .git_auth import profile_preflight, summarize_profile_preflight
 from .gitlab import (
     CONTROLLER_MERGE_SUBMITTED_FIELD,
     CheckedHeadConflict,
     GitLabClient,
+    StartFacts,
 )
 from .kanban import (
     EventRecord,
@@ -43,6 +46,20 @@ from .kanban import (
     parse_card_body,
     parse_run_body,
 )
+from .messages import (
+    escape_markdown,
+    format_agent,
+    format_attempt,
+    format_duration,
+    format_event,
+    format_outcome,
+    format_stage,
+    inline_code,
+    markdown_link,
+    markdown_payload,
+    render_message,
+    short_sha,
+)
 from .models import (
     AbortConfirmRequest,
     AbortRequest,
@@ -51,6 +68,7 @@ from .models import (
     CardRecord,
     CompletionMetadata,
     CompletionValidationRequest,
+    DeliveryBinding,
     FeishuOrigin,
     NotificationLevel,
     Outcome,
@@ -68,6 +86,7 @@ from .models import (
 )
 from .notifier import LarkNotifier
 from .store import TERMINAL_RUN_STATES, ControllerStore, ManagedCard
+from .validators import validate_task_documents
 from .workflow import (
     DOCUMENT_REVIEW_FOR_PRODUCER,
     PHASE_FOR_STAGE,
@@ -86,6 +105,7 @@ TERMINAL_EVENT_KINDS = {
     "gave_up",
     "spawn_auto_blocked",
     "status",
+    "promoted_manual",
 }
 ALLOWED_HUMAN_BLOCK_KINDS = {
     "permission",
@@ -242,13 +262,31 @@ class ControllerService:
                 chat_type=request.chat_type,
                 initiator_open_id=request.initiator,
             )
-            facts = self.gitlab.validate_start(
-                prd_blob_url=str(request.prd_blob_url),
-                prd_mr_url=str(request.prd_mr_url),
-                origin=origin,
+            request_state = self.store.request(key)
+            persisted_run_key = (
+                str(request_state.get("run_key") or "")
+                if request_state is not None
+                else ""
             )
+            persisted_run = (
+                self.store.run_record(persisted_run_key)
+                if persisted_run_key
+                else None
+            )
+            if persisted_run is not None:
+                facts = StartFacts(
+                    run=persisted_run,
+                    base_sha=persisted_run.workspace.repository_base_sha,
+                )
+            else:
+                facts = self.gitlab.validate_start(
+                    prd_blob_url=str(request.prd_blob_url),
+                    prd_mr_url=str(request.prd_mr_url),
+                    origin=origin,
+                )
             run = facts.run
             dependency_run_key = run.run_key
+            self.store.save_run(run)
             self.store.ensure_run_control(run.run_key)
             self.store.bind_request_run(key, run.run_key)
             if not self._begin_reconcile(run.run_key):
@@ -261,6 +299,16 @@ class ControllerService:
                 return response
 
             self._operation(
+                f"{run.run_key}:remote-branch",
+                "remote-branch",
+                {
+                    "run_key": run.run_key,
+                    "branch": run.workspace.branch,
+                    "base_sha": facts.base_sha,
+                },
+                lambda: self.gitlab.create_delivery_branch(run),
+            )
+            self._operation(
                 f"{run.run_key}:workspace",
                 "workspace",
                 {"run_key": run.run_key, "base_sha": facts.base_sha},
@@ -269,6 +317,21 @@ class ControllerService:
                     or {"worktree": run.workspace.worktree}
                 ),
             )
+            accepted_preflight = self.store.deployment_preflight()
+            if (
+                accepted_preflight is not None
+                and accepted_preflight.get("ok")
+                and accepted_preflight.get("deep")
+            ):
+                self._operation(
+                    f"{run.run_key}:offline-caches",
+                    "offline-caches",
+                    {
+                        "run_key": run.run_key,
+                        "worktree": run.workspace.worktree,
+                    },
+                    lambda: self._prepare_offline_caches(run),
+                )
             self._operation(
                 f"{run.run_key}:board",
                 "board",
@@ -309,13 +372,23 @@ class ControllerService:
             self._enqueue_progress(
                 run,
                 "run-accepted",
-                self._mention(run.origin)
-                + "已受理 PRD 自动交付并进入 SPEC。\n"
-                f"run={run.run_key} agent={first.assignee} card={first.id}",
+                self._render_notification(
+                    run,
+                    icon="ℹ️",
+                    title="已受理 PRD 自动交付",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        ("阶段", format_stage(Stage.SPEC_WRITE)),
+                        ("Agent", format_agent(first.assignee)),
+                        ("Card", inline_code(first.id)),
+                    ],
+                ),
             )
             self._enqueue_phase_started(run, Phase.SPEC, first)
             response = {
                 "run_key": run.run_key,
+                "source_key": run.source_key,
+                "run_generation": run.run_generation,
                 "project": run.project.project_path,
                 "stage": Stage.SPEC_WRITE.value,
                 "active_card": first.id,
@@ -341,6 +414,59 @@ class ControllerService:
             if run_claimed and dependency_run_key is not None:
                 self._finish_reconcile(dependency_run_key)
 
+    def _prepare_offline_caches(self, run: RunRecord) -> dict:
+        command = self.config.offline_cache_command
+        if (
+            command.is_symlink()
+            or not command.is_file()
+            or not os.access(command, os.X_OK)
+        ):
+            raise RunPolicyError("tool_unavailable:offline_cache_preparer")
+        worktree = Path(run.workspace.worktree).resolve()
+        projects_root = self.config.projects_root.resolve()
+        if worktree == projects_root or projects_root not in worktree.parents:
+            raise RunPolicyError("unsafe_offline_cache_workspace")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "NPM_CONFIG_CACHE": str(
+                    self.config.hermes_home / "cache" / "npm"
+                ),
+                "NUGET_PACKAGES": str(
+                    self.config.hermes_home / "cache" / "nuget"
+                ),
+                "NPM_CONFIG_OFFLINE": "false",
+            }
+        )
+        result = subprocess.run(
+            [str(command), str(worktree)],
+            cwd=worktree,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=self.config.offline_cache_timeout_seconds,
+            check=False,
+        )
+        if result.returncode != 0:
+            summary = (
+                result.stderr.strip() or result.stdout.strip()
+            )[-1000:]
+            raise RunPolicyError(
+                f"offline_cache_prepare_failed:{result.returncode}:{summary}"
+            )
+        try:
+            payload = json.loads(result.stdout.splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            raise RunPolicyError(
+                "offline_cache_prepare_invalid_output"
+            ) from exc
+        if payload.get("ok") is not True:
+            raise RunPolicyError(
+                "offline_cache_prepare_rejected:"
+                + str(payload.get("error_code") or "unknown")
+            )
+        return payload
+
     def status(self, run_key: str) -> dict:
         # Full GitLab audit may be slow. Serialize audits separately so a
         # Dispatcher status request cannot block Kanban transitions, aborts,
@@ -351,7 +477,7 @@ class ControllerService:
             attempts = self._attempts_by_stage(history)
             document_review_attempts = self._review_attempts_by_stage(history)
             protocol_failures = self._protocol_failures_by_stage(history)
-            mr = self.gitlab.delivery_mr(run)
+            mr = self._delivery_mr(run)
             merged = bool(mr and mr.get("state") == "merged")
             gates: dict[str, dict] = {}
             gate_authors: dict[Stage, str | None] = {}
@@ -664,6 +790,16 @@ class ControllerService:
         )
         code_modifications = self._code_modification_count(history)
         store_health = self.store.health()
+        binding = (
+            self.store.delivery_binding(run_key)
+            if hasattr(self.store, "delivery_binding")
+            else None
+        )
+        reconcile_intents = (
+            self.store.reconcile_intents(run_key)
+            if hasattr(self.store, "reconcile_intents")
+            else []
+        )
         controller_cursor = int(
             store_health["event_cursors"].get(run.workspace.board, 0)
         )
@@ -671,7 +807,14 @@ class ControllerService:
 
         return {
             "run_key": run_key,
+            "source_key": run.source_key,
+            "run_generation": run.run_generation,
+            "started_at": run.started_at.isoformat(),
+            "provenance": run.provenance,
             "control": control,
+            "transition_pending": control_state == "transition_pending",
+            "human_blocked": control_state == "human_blocked",
+            "retry_wait": control_state == "retry_wait",
             "notification_level": self.config.notification_level.value,
             "phase": phase,
             "stage": exact_stage,
@@ -709,6 +852,25 @@ class ControllerService:
                 if hasattr(self.store, "runtime_for_run")
                 else []
             ),
+            "attempt_timeline": (
+                self.store.attempts_for_run(run_key)
+                if hasattr(self.store, "attempts_for_run")
+                else []
+            ),
+            "delivery_binding": (
+                binding.model_dump(mode="json")
+                if binding is not None
+                else None
+            ),
+            "reconcile": {
+                "pending": bool(reconcile_intents),
+                "queue": reconcile_intents,
+                "current_step": (
+                    reconcile_intents[0].get("current_step")
+                    if reconcile_intents
+                    else None
+                ),
+            },
             "board": run.workspace.board,
             "worktree": run.workspace.worktree,
             "repository_base_sha": run.workspace.repository_base_sha,
@@ -747,7 +909,8 @@ class ControllerService:
             self.config.read_token()
             checks["gitlab_token"] = {
                 "ok": True,
-                "source": "dispatcher_profile",
+                "source": str(self.config.controller_token_file),
+                "identity": "dedicated-controller",
             }
         except Exception as exc:  # noqa: BLE001 - structured preflight result
             checks["gitlab_token"] = {
@@ -786,6 +949,15 @@ class ControllerService:
             "ok": self._protected_executable(agent_git.with_name("lark-cli")),
             "path": str(agent_git.with_name("lark-cli")),
         }
+        checks["toolchain"] = self._toolchain_preflight()
+        checks["offline_cache_preparer"] = {
+            "ok": (
+                self.config.offline_cache_command.is_file()
+                and not self.config.offline_cache_command.is_symlink()
+                and os.access(self.config.offline_cache_command, os.X_OK)
+            ),
+            "path": str(self.config.offline_cache_command),
+        }
         profile_credentials = summarize_profile_preflight(
             self.config,
             deep=deep,
@@ -807,6 +979,53 @@ class ControllerService:
             credential_contract_digest=credential_contract_digest,
         )
         return result
+
+    @staticmethod
+    def _toolchain_preflight() -> dict:
+        probes = {
+            "jq": (["jq", "--version"], lambda value: value.startswith("jq-")),
+            "node": (
+                ["node", "--version"],
+                lambda value: (
+                    value.startswith("v")
+                    and int(value[1:].split(".", 1)[0]) >= 22
+                ),
+            ),
+            "npm": (
+                ["npm", "--version"],
+                lambda value: int(value.split(".", 1)[0]) >= 10,
+            ),
+            "dotnet": (
+                ["dotnet", "--version"],
+                lambda value: value == "8.0.423",
+            ),
+        }
+        versions: dict[str, str] = {}
+        errors: list[str] = []
+        for name, (command, validator) in probes.items():
+            try:
+                completed = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+                value = completed.stdout.strip()
+                valid = completed.returncode == 0 and validator(value)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                value = "unavailable"
+                valid = False
+            versions[name] = value[:80]
+            if not valid:
+                errors.append(name)
+        return {
+            "ok": not errors,
+            "versions": versions,
+            "error_code": (
+                "tool_unavailable:" + ",".join(errors) if errors else None
+            ),
+        }
 
     def assert_activation_preflight(self) -> None:
         """Fail closed if active mode did not pass the current deep contract."""
@@ -887,6 +1106,394 @@ class ControllerService:
             "stage": metadata.stage.value,
             "iteration": metadata.iteration,
             "context": "controller-verified",
+        }
+
+    def _managed_work(self, card_id: str) -> tuple[ManagedCard, HistoryItem, RunRecord]:
+        matches = [
+            card
+            for run_key in self.store.run_keys()
+            for card in self.store.cards_for_run(run_key)
+            if card.card_id == card_id and card.purpose == "work"
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "card_id must identify exactly one managed Hollysys work card"
+            )
+        managed = matches[0]
+        history, run = self._history(managed.run_key)
+        item = next(entry for entry in history if entry.task.id == card_id)
+        return managed, item, run
+
+    def publish_delivery(self, raw: dict) -> dict:
+        card_id = str(raw.get("card_id") or "")
+        head_sha = str(raw.get("head_sha") or "")
+        description = str(raw.get("description") or "")
+        if not card_id or not description.strip():
+            raise ValueError("card_id and non-empty description are required")
+        managed, item, run = self._managed_work(card_id)
+        record = parse_card_body(item.task.body)
+        if (
+            managed.stage != Stage.SPEC_WRITE.value
+            or managed.iteration != 1
+            or record.mode != WorkMode.NORMAL
+        ):
+            raise ValueError(
+                "only the first normal SPEC writer card may publish delivery"
+            )
+        if item.task.status not in ACTIVE_STATUSES:
+            raise ValueError("publish-delivery card is no longer active")
+        if self.store.delivery_binding(run.run_key) is not None:
+            raise ValueError(f"delivery_already_bound:{run.run_key}")
+        result = self._operation(
+            f"{run.run_key}:publish-delivery",
+            "publish-delivery",
+            {
+                "run_key": run.run_key,
+                "card_id": card_id,
+                "head_sha": head_sha,
+                "description_digest": hashlib.sha256(
+                    description.encode()
+                ).hexdigest(),
+            },
+            lambda: self.gitlab.publish_delivery(
+                run,
+                head_sha=head_sha,
+                description=description,
+            ).model_dump(mode="json"),
+            run_key=run.run_key,
+            expected_state_version=int(
+                self._run_control(run.run_key)["state_version"]
+            ),
+            expected_head_sha=head_sha,
+        )
+        binding = DeliveryBinding.model_validate(result)
+        self.store.bind_delivery(run.run_key, binding)
+        return {
+            "ok": True,
+            "run_key": run.run_key,
+            "card_id": card_id,
+            "delivery": binding.model_dump(mode="json"),
+        }
+
+    def card_context(self, raw: dict) -> dict:
+        card_id = str(raw.get("card_id") or "")
+        managed, item, run = self._managed_work(card_id)
+        record = parse_card_body(item.task.body)
+        binding = self.store.delivery_binding(run.run_key)
+        live_mr = self._delivery_mr(run)
+        return {
+            "protocol_version": "hollysys-controller/v4",
+            "trusted": True,
+            "card_id": card_id,
+            "status": item.task.status,
+            "run": {
+                "run_key": run.run_key,
+                "source_key": run.source_key,
+                "run_generation": run.run_generation,
+                "started_at": run.started_at.isoformat(),
+                "provenance": run.provenance,
+            },
+            "stage": managed.stage,
+            "iteration": managed.iteration,
+            "mode": record.mode.value,
+            "project": {
+                "id": run.project.project_id,
+                "path": run.project.project_path,
+                "default_branch": run.project.default_branch,
+            },
+            "source": run.source.model_dump(mode="json"),
+            "workspace": run.workspace.model_dump(mode="json"),
+            "expected_head_sha": record.expected_head_sha,
+            "context_digest": record.context_digest,
+            "scratch_dir": record.scratch_dir,
+            "delivery": (
+                {
+                    **binding.model_dump(mode="json"),
+                    "current_head_sha": str(live_mr.get("sha") or ""),
+                    "state": str(live_mr.get("state") or ""),
+                    "draft": bool(live_mr.get("draft", False)),
+                }
+                if binding is not None and live_mr is not None
+                else None
+            ),
+            "frozen_baselines": [
+                item.model_dump(mode="json")
+                for item in record.frozen_baselines
+            ],
+            "repair_context": (
+                record.repair_context.model_dump(mode="json")
+                if record.repair_context is not None
+                else None
+            ),
+            "resume_answer": record.resume_answer,
+        }
+
+    def completion_template(self, raw: dict) -> dict:
+        card_id = str(raw.get("card_id") or "")
+        try:
+            outcome = Outcome(str(raw.get("outcome") or ""))
+        except ValueError as exc:
+            raise ValueError("outcome must be pass, fail, or cancelled") from exc
+        managed, item, run = self._managed_work(card_id)
+        record = parse_card_body(item.task.body)
+        stage = Stage(managed.stage)
+        document_stages = {
+            Stage.SPEC_WRITE,
+            Stage.SPEC_REVIEW,
+            Stage.PLAN_WRITE,
+            Stage.PLAN_REVIEW,
+            Stage.TASKS_WRITE,
+            Stage.TASKS_REVIEW,
+        }
+        if record.mode == WorkMode.FINALIZATION and outcome == Outcome.PASS:
+            raise ValueError(
+                "completion_template_requires_forced_advance_evidence"
+            )
+        binding = self.store.delivery_binding(run.run_key)
+        mr = self._delivery_mr(run)
+        current_head = (
+            str(mr.get("sha") or "")
+            if mr is not None
+            else record.expected_head_sha
+        )
+        data: dict = {
+            "protocol_version": "hollysys-controller/v4",
+            "run_key": run.run_key,
+            "source_key": run.source_key,
+            "run_generation": run.run_generation,
+            "context_digest": record.context_digest,
+            "stage": stage.value,
+            "iteration": managed.iteration,
+            "mode": record.mode.value,
+            "outcome": outcome.value,
+            "project_id": run.project.project_id,
+            "project_path": run.project.project_path,
+            "checkout": run.workspace.checkout,
+            "worktree": run.workspace.worktree,
+            "branch": run.workspace.branch,
+            "target_branch": run.workspace.target_branch,
+            "prd_path": run.source.prd_path,
+            "prd_commit_sha": run.source.prd_commit_sha,
+            "prd_blob_sha": run.source.prd_blob_sha,
+            "prd_mr_url": str(run.source.prd_mr_url),
+            "kanban_card_id": card_id,
+            "head_before_sha": record.expected_head_sha,
+            "deterministic_checks": [],
+            "verification": [],
+            "issues": (
+                ["REPLACE_WITH_CONCRETE_FINDING"]
+                if outcome == Outcome.FAIL
+                else []
+            ),
+        }
+        if binding is not None and mr is not None:
+            data.update(
+                {
+                    "mr_iid": binding.mr_iid,
+                    "mr_url": str(binding.mr_url),
+                    "head_sha": current_head,
+                }
+            )
+        if stage in document_stages and outcome in {
+            Outcome.PASS,
+            Outcome.FAIL,
+        }:
+            validation = self.validate_artifact({"card_id": card_id})
+            paths = list(validation["artifact_paths"])
+            artifact_digest = self.gitlab.artifact_digest(
+                run.project.project_id,
+                str(validation["head_sha"]),
+                paths,
+            )
+            data.update(
+                {
+                    "artifact_commit_sha": validation["head_sha"],
+                    "artifact_digest": artifact_digest,
+                    "artifact_paths": paths,
+                    "deterministic_checks": [
+                        {
+                            key: validation[key]
+                            for key in (
+                                "validator",
+                                "validator_version",
+                                "input_digest",
+                                "passed",
+                                "error_codes",
+                                "result_digest",
+                            )
+                        }
+                    ],
+                }
+            )
+        if (
+            stage
+            in {
+                Stage.SPEC_WRITE,
+                Stage.PLAN_WRITE,
+                Stage.TASKS_WRITE,
+                Stage.IMPLEMENT,
+            }
+            and outcome == Outcome.PASS
+        ):
+            data["repository_evidence"] = {
+                "repository_base_sha": run.workspace.repository_base_sha,
+                "inspected_paths": [run.source.prd_path],
+                "existing_capabilities": [
+                    "REPLACE_WITH_INSPECTED_EXISTING_CAPABILITY"
+                ],
+                "change_strategy": "extend_existing",
+                "reuse_decisions": [
+                    "REPLACE_WITH_CONCRETE_REUSE_DECISION"
+                ],
+            }
+        if stage in {
+            Stage.SPEC_REVIEW,
+            Stage.PLAN_REVIEW,
+            Stage.TASKS_REVIEW,
+        } and outcome == Outcome.PASS:
+            data["baseline_disposition"] = "reviewed"
+        if stage == Stage.TEST and outcome in {Outcome.PASS, Outcome.FAIL}:
+            data["test_disposition"] = "executed"
+        if (
+            stage in {Stage.TASKS_REVIEW, Stage.CODE_REVIEW}
+            and outcome == Outcome.PASS
+        ):
+            baseline = next(
+                (
+                    candidate
+                    for candidate in reversed(record.frozen_baselines)
+                    if candidate.phase == "tasks"
+                ),
+                None,
+            )
+            gate_paths = (
+                baseline.artifact_paths
+                if baseline is not None
+                else list(data.get("artifact_paths") or [])
+            )
+            gate_commit = (
+                baseline.artifact_commit_sha
+                if baseline is not None
+                else data.get("artifact_commit_sha")
+            )
+            gate_digest = (
+                baseline.artifact_digest
+                if baseline is not None
+                else data.get("artifact_digest")
+            )
+            data.update(
+                {
+                    "gate_phase": (
+                        "implementation_entry"
+                        if stage == Stage.TASKS_REVIEW
+                        else "implementation_completion"
+                    ),
+                    "gate_decision": "approved",
+                    "gate_reviewer": "id:1",
+                    "gate_reviewed_at": run.started_at.isoformat(),
+                    "gate_reason": "REPLACE_WITH_CONCRETE_GATE_REASON",
+                    "gate_evidence_refs": [
+                        f"{binding.mr_url}#note_1"
+                        if binding is not None
+                        else "evidence/missing-binding"
+                    ],
+                    "gate_artifact_paths": gate_paths,
+                    "gate_artifact_commit_sha": gate_commit,
+                    "gate_artifact_digest": gate_digest,
+                    "contract_refs": ["REPLACE_WITH_CONTRACT_REF"],
+                    "requirement_ids": ["REPLACE_WITH_REQUIREMENT_ID"],
+                }
+            )
+        return CompletionMetadata.model_validate(data).model_dump(mode="json")
+
+    def validate_artifact(self, raw: dict) -> dict:
+        started = time.monotonic()
+        card_id = str(raw.get("card_id") or "")
+        managed, _item, run = self._managed_work(card_id)
+        stage = Stage(managed.stage)
+        pattern_stage = {
+            Stage.SPEC_WRITE: Stage.SPEC_REVIEW,
+            Stage.SPEC_REVIEW: Stage.SPEC_REVIEW,
+            Stage.PLAN_WRITE: Stage.PLAN_REVIEW,
+            Stage.PLAN_REVIEW: Stage.PLAN_REVIEW,
+            Stage.TASKS_WRITE: Stage.TASKS_REVIEW,
+            Stage.TASKS_REVIEW: Stage.TASKS_REVIEW,
+        }.get(stage)
+        if pattern_stage is None:
+            raise ValueError(f"stage_has_no_artifact_validator:{stage.value}")
+        mr = self._delivery_mr(run)
+        if mr is None or not mr.get("sha"):
+            raise ValueError("artifact validation requires a bound delivery MR")
+        head_sha = str(mr["sha"])
+        fetch_started = time.monotonic()
+        paths = self.gitlab.artifact_paths(
+            run.project.project_id,
+            head_sha,
+            self.config.artifact_patterns.get(pattern_stage.value, []),
+        )
+        documents: list[str] = []
+        for path in paths:
+            payload = self.gitlab.file(run.project.project_id, path, head_sha)
+            encoding = str(payload.get("encoding") or "")
+            content = str(payload.get("content") or "")
+            if encoding != "base64":
+                raise ValueError("artifact_content_encoding_unsupported")
+            try:
+                documents.append(
+                    base64.b64decode(content, validate=True).decode("utf-8")
+                )
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise ValueError("artifact_content_invalid_utf8") from exc
+        fetch_ms = int((time.monotonic() - fetch_started) * 1000)
+        validator_started = time.monotonic()
+        if pattern_stage == Stage.TASKS_REVIEW:
+            validation = validate_task_documents(documents).as_dict()
+        else:
+            input_digest = hashlib.sha256(
+                json.dumps(
+                    documents,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            result_digest = hashlib.sha256(
+                f"artifact-set/v1:{input_digest}:pass".encode()
+            ).hexdigest()
+            validation = {
+                "validator": "artifact-set",
+                "validator_version": "artifact-set/v1",
+                "input_digest": input_digest,
+                "passed": True,
+                "error_codes": [],
+                "result_digest": result_digest,
+            }
+        validator_ms = int((time.monotonic() - validator_started) * 1000)
+        total_ms = int((time.monotonic() - started) * 1000)
+        timing = {
+            "git_artifact_ms": fetch_ms,
+            "deterministic_check_ms": validator_ms,
+            "total_ms": total_ms,
+        }
+        validation_id = self.store.record_validation(
+            run_key=run.run_key,
+            card_id=card_id,
+            validator=str(validation["validator"]),
+            validator_version=str(validation["validator_version"]),
+            input_digest=str(validation["input_digest"]),
+            result_digest=str(validation["result_digest"]),
+            passed=bool(validation["passed"]),
+            error_codes=list(validation["error_codes"]),
+            timing=timing,
+        )
+        return {
+            "ok": bool(validation["passed"]),
+            "validation_id": validation_id,
+            "run_key": run.run_key,
+            "card_id": card_id,
+            "head_sha": head_sha,
+            "artifact_paths": paths,
+            **validation,
+            "timing": timing,
         }
 
     def abort_request(self, raw: dict) -> dict:
@@ -1104,10 +1711,22 @@ class ControllerService:
                     stage=Stage(managed.stage),
                 ):
                     raise ValueError(
-                        "human block is not an allowed v3 technical/safety block"
+                        "human block is not an allowed v4 technical/safety block"
                     )
                 stage = Stage(managed.stage)
                 original_record = parse_card_body(task.body)
+                control = self._run_control(run.run_key)
+                if control["state"] == "human_blocked":
+                    self.store.transition_run(
+                        run.run_key,
+                        expected_states={"human_blocked"},
+                        new_state="active",
+                        reason=(
+                            f"human_resolve:{request.block_id}:"
+                            "actor=hollysys-controller"
+                        ),
+                        expected_version=int(control["state_version"]),
+                    )
                 retry = self._resolved_retry(
                     history,
                     task.id,
@@ -1178,12 +1797,20 @@ class ControllerService:
                     event_key,
                     run.run_key,
                     "resumed",
-                    {
-                        "origin": run.origin.model_dump(mode="json"),
-                        "text": self._mention(run.origin)
-                        + f"已记录并恢复自动交付。\nrun={run.run_key} "
-                        f"resolved={task.id} stage={stage.value} next={retry.id}",
-                    },
+                    markdown_payload(
+                        run.origin,
+                        self._render_notification(
+                            run,
+                            icon="✅",
+                            title="已记录并恢复自动交付",
+                            fields=[
+                                ("任务 ID", inline_code(run.run_key)),
+                                ("阶段", format_stage(stage)),
+                                ("已解决 Card", inline_code(task.id)),
+                                ("新 Card", inline_code(retry.id)),
+                            ],
+                        ),
+                    ),
                 )
                 response = {
                     "run_key": run.run_key,
@@ -1278,13 +1905,22 @@ class ControllerService:
                 ),
                 request.run_key,
                 "exception-recovered",
-                {
-                    "origin": run.origin.model_dump(mode="json"),
-                    "text": self._mention(run.origin)
-                    + "人类已授权从异常状态恢复自动交付。\n"
-                    f"run={request.run_key} sender={request.sender} "
-                    f"reason={request.reason[:500]}",
-                },
+                markdown_payload(
+                    run.origin,
+                    self._render_notification(
+                        run,
+                        icon="✅",
+                        title="已授权从异常状态恢复自动交付",
+                        fields=[
+                            ("任务 ID", inline_code(request.run_key)),
+                            ("授权人", inline_code(request.sender)),
+                            (
+                                "恢复原因",
+                                escape_markdown(request.reason, limit=500),
+                            ),
+                        ],
+                    ),
+                ),
             )
             response = {
                 "run_key": request.run_key,
@@ -1314,7 +1950,7 @@ class ControllerService:
 
     def poll_once(self) -> None:
         try:
-            pending_reconcile: set[str] = set()
+            pending_reconcile: dict[str, tuple[int, str]] = {}
             boards = self.reader.discover_boards()
             for card in [
                 card
@@ -1336,29 +1972,16 @@ class ControllerService:
                     self.store.set_cursor(board, event.id)
                     if not managed or event.kind not in TERMINAL_EVENT_KINDS:
                         continue
-                    try:
-                        if event.kind in {"gave_up", "spawn_auto_blocked"}:
-                            _, run = self._history(managed.run_key)
-                            self._enqueue_failure_limit(run, event)
-                        pending_reconcile.add(managed.run_key)
-                    except ReconcileSuperseded:
-                        continue
-                    except DependencyContractError as exc:
-                        self._record_run_exception(managed.run_key, exc)
-                    except DependencyError as exc:
-                        self._handle_dependency_error(managed.run_key, exc)
-                    except RunPolicyError as exc:
-                        self._record_run_exception(managed.run_key, exc)
-                    except (ValidationError, ValueError, TypeError) as exc:
-                        self._record_run_exception(managed.run_key, exc)
-                    except ControllerFatalError:
-                        raise
-                    except Exception as exc:
-                        raise ControllerFatalError(
-                            f"poll_reconcile_failed:{managed.run_key}:{exc}"
-                        ) from exc
-            self._reconcile_run_keys(sorted(pending_reconcile))
-            self.flush_outbox()
+                    pending_reconcile[managed.run_key] = (
+                        event.id,
+                        f"kanban:{event.kind}",
+                    )
+            for run_key, (event_id, reason) in pending_reconcile.items():
+                self.store.enqueue_reconcile(
+                    run_key,
+                    reason=reason,
+                    event_id=event_id,
+                )
             self.last_poll_at = int(time.time())
             self.last_poll_error = None
         except Exception as exc:
@@ -1477,12 +2100,57 @@ class ControllerService:
                 self.flush_outbox()
                 return
             self._enqueue_stale_worker_notices()
-            self._reconcile_run_keys(self.store.active_reconcile_run_keys())
+            for run_key in self.store.active_reconcile_run_keys():
+                self.store.enqueue_reconcile(
+                    run_key,
+                    reason="periodic-full-reconcile",
+                )
             self.last_reconcile_at = int(time.time())
             self.last_reconcile_error = None
             self.flush_outbox()
         except Exception as exc:
             self.last_reconcile_error = str(exc)
+            raise
+
+    def consume_reconcile_once(self, lease_owner: str) -> bool:
+        intent = self.store.claim_reconcile(
+            lease_owner=lease_owner,
+            lease_seconds=max(60, self.config.command_timeout_seconds * 3),
+        )
+        if intent is None:
+            return False
+        intent_id = str(intent["intent_id"])
+        run_key = str(intent["run_key"])
+        started = time.monotonic()
+        try:
+            self.store.update_reconcile_step(
+                intent_id,
+                lease_owner=lease_owner,
+                step="recompute-kanban-gitlab",
+                lease_seconds=max(60, self.config.command_timeout_seconds * 3),
+            )
+            self._reconcile_run_with_policy(run_key)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            self.store.update_reconcile_step(
+                intent_id,
+                lease_owner=lease_owner,
+                step=f"completed:{duration_ms}ms",
+                lease_seconds=60,
+            )
+            self.store.finish_reconcile(
+                intent_id,
+                lease_owner=lease_owner,
+            )
+            self.last_reconcile_at = int(time.time())
+            self.last_reconcile_error = None
+            return True
+        except Exception as exc:
+            self.store.finish_reconcile(
+                intent_id,
+                lease_owner=lease_owner,
+                error=self._error_text(exc),
+            )
+            self.last_reconcile_error = self._error_text(exc)
             raise
 
     def _recover_sensitive_request(self, request: dict) -> None:
@@ -1599,10 +2267,33 @@ class ControllerService:
             return
         if control and control["state"] in TERMINAL_RUN_STATES | {"exception"}:
             return
+        if control and control["state"] == "human_blocked":
+            return
         if self._dependency_retry_blocked("gitlab"):
             return
         history, run = self._history(run_key)
-        mr = self.gitlab.delivery_mr(run)
+        unauthorized_promotion = next(
+            (
+                item
+                for item in history
+                if "promoted_manual" in item.task.event_kinds
+                and not any(
+                    "[human-resolution:v1]" in str(comment["body"])
+                    and "resolved_by:" in str(comment["body"])
+                    and "new_card_id:" in str(comment["body"])
+                    for comment in item.task.comments
+                )
+            ),
+            None,
+        )
+        if unauthorized_promotion is not None:
+            self._exception(
+                run,
+                unauthorized_promotion.task.id,
+                "unknown promoted_manual event without matching human resolve",
+            )
+            return
+        mr = self._delivery_mr(run)
         if mr and mr.get("state") == "merged":
             self._finalize_merged(run, history, mr)
             return
@@ -1686,7 +2377,7 @@ class ControllerService:
                         if missing:
                             reason += "; missing=" + ",".join(sorted(missing))
                         if not any(
-                            "[controller-block-rejected:v3]"
+                            "[controller-block-rejected:v4]"
                             in str(comment["body"])
                             for comment in item.task.comments
                         ):
@@ -1694,16 +2385,33 @@ class ControllerService:
                             self.kanban.comment(
                                 run.workspace.board,
                                 item.task.id,
-                                "[controller-block-rejected:v3]\n"
+                                "[controller-block-rejected:v4]\n"
                                 f"reason: {reason}",
                                 "hollysys-controller",
                             )
-                        self._assert_reconcile_mutable(run_key)
-                        self.kanban.release(
-                            run.workspace.board, item.task.id
+                        self._exception(
+                            run,
+                            item.task.id,
+                            reason,
                         )
                         return
                     self._enqueue_human_block(run, item, human_block_comment)
+                    current = self._run_control(run_key)
+                    if current["state"] != "human_blocked":
+                        self.store.transition_run(
+                            run_key,
+                            expected_states={
+                                "active",
+                                "dependency_degraded",
+                                "merge_wait",
+                                "transition_pending",
+                                "retry_wait",
+                            },
+                            new_state="human_blocked",
+                            reason=f"human_block:{item.task.id}",
+                            expected_version=int(current["state_version"]),
+                        )
+                    return
                 if (
                     item.task.latest_outcome == "blocked"
                     and human_block_comment is None
@@ -1715,6 +2423,12 @@ class ControllerService:
                             "[human-block:v1] comment"
                         ),
                     )
+                    self._exception(
+                        run,
+                        item.task.id,
+                        "blocked card has no valid human block contract",
+                    )
+                    return
         if len(active) > 1:
             # A blocked parent plus its todo retry is a valid, short resolve
             # transaction; all other multi-active shapes violate seriality.
@@ -1886,6 +2600,24 @@ class ControllerService:
             mr_iid=metadata.mr_iid,
             head_sha=metadata.head_sha,
         )
+        if metadata.stage == Stage.IMPLEMENT and metadata.outcome == Outcome.PASS:
+            binding = self.store.delivery_binding(run.run_key)
+            if binding is None:
+                raise ValueError("IMPLEMENT completion has no delivery binding")
+            self._operation(
+                f"{run.run_key}:delivery-ready",
+                "delivery-ready",
+                {
+                    "run_key": run.run_key,
+                    "mr_iid": binding.mr_iid,
+                    "head_sha": metadata.head_sha,
+                },
+                lambda: self.gitlab.mark_delivery_ready(
+                    run,
+                    binding,
+                ),
+                expected_head_sha=metadata.head_sha,
+            )
         self._enqueue_agent_completed(run, latest, metadata)
 
         review_attempts = self._review_attempts_by_stage(history)
@@ -2177,13 +2909,45 @@ class ControllerService:
                     f"merge-wait:{blocker.kind}:{current_head}:"
                     f"{merge_wait_control['state_version']}"
                 ),
-                self._mention(run.origin)
-                + "代码门禁已完成，但合并条件尚未满足。\n"
-                f"run={run.run_key} stage=merge-wait "
-                f"blocker={blocker.kind} mr={live_mr.get('web_url')} "
-                f"head={current_head} owner={blocker.owner or 'unknown'} "
-                f"url={blocker.url or live_mr.get('web_url')} "
-                f"next_retry_at={waiting['next_retry_at']}",
+                self._render_notification(
+                    run,
+                    icon="⚠️",
+                    title="代码门禁已完成，正在等待合并条件",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        ("阶段", format_stage("merge-wait")),
+                        (
+                            "阻塞原因",
+                            escape_markdown(blocker.kind, limit=100),
+                        ),
+                        ("Head", inline_code(short_sha(current_head))),
+                        (
+                            "责任人",
+                            escape_markdown(
+                                blocker.owner or "unknown",
+                                limit=100,
+                            ),
+                        ),
+                        (
+                            "MR",
+                            markdown_link(
+                                f"!{live_mr.get('iid') or 'MR'}",
+                                live_mr.get("web_url") or blocker.url or "",
+                            ),
+                        ),
+                        (
+                            "相关链接",
+                            markdown_link(
+                                "查看阻塞详情",
+                                blocker.url or live_mr.get("web_url") or "",
+                            ),
+                        ),
+                        (
+                            "下次重试时间",
+                            inline_code(waiting["next_retry_at"]),
+                        ),
+                    ],
+                ),
                 allow_minimal=blocker.kind
                 in {
                     "draft",
@@ -2250,12 +3014,30 @@ class ControllerService:
             try:
                 payload = json.loads(item["payload"])
                 origin = FeishuOrigin.model_validate(payload["origin"])
-                self.notifier.send(item["outbox_key"], origin, payload["text"])
+                if "content" in payload:
+                    content = str(payload["content"])
+                    message_format = str(payload.get("format") or "markdown")
+                else:
+                    # Preserve historical outbox payloads exactly when a
+                    # controller restart replays them.
+                    content = str(payload["text"])
+                    message_format = "text"
+                if message_format not in {"text", "markdown"}:
+                    raise ValueError(
+                        f"unsupported outbox message format:{message_format}"
+                    )
+                self.notifier.send(
+                    item["outbox_key"],
+                    origin,
+                    content,
+                    message_format=message_format,
+                )
                 self.store.finish_outbox(item["outbox_key"])
             except (
                 json.JSONDecodeError,
                 KeyError,
                 TypeError,
+                ValueError,
                 ValidationError,
                 DependencyContractError,
             ) as exc:
@@ -2318,8 +3100,10 @@ class ControllerService:
                     item.task.id,
                     f"run aborted by human: {reason}",
                 )
+        binding = self.store.delivery_binding(run_key)
         mr = self.gitlab.abort_delivery(
             run,
+            mr_iid=(binding.mr_iid if binding is not None else None),
             requested_by=str(control.get("abort_requested_by") or "unknown"),
             reason=reason,
         )
@@ -2342,19 +3126,40 @@ class ControllerService:
             f"{run_key}:aborted:{terminal}",
             run_key,
             "aborted",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + (
-                    "废止请求到达前交付已经完成合并，未关闭已合并 MR。\n"
-                    if terminal == "completed_before_abort"
-                    else "自动交付已按人类确认废止。\n"
-                )
-                + f"run={run_key} requested_by="
-                f"{control.get('abort_requested_by')} reason={reason[:500]}\n"
-                f"mr={mr.get('web_url')} state={mr.get('state')} "
-                "branch_worktree=preserved",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="⛔",
+                    title=(
+                        "废止请求到达前交付已完成合并"
+                        if terminal == "completed_before_abort"
+                        else "自动交付已按人类确认废止"
+                    ),
+                    fields=[
+                        ("任务 ID", inline_code(run_key)),
+                        (
+                            "申请人",
+                            inline_code(
+                                control.get("abort_requested_by") or "unknown"
+                            ),
+                        ),
+                        ("原因", escape_markdown(reason, limit=500)),
+                        (
+                            "MR",
+                            markdown_link(
+                                f"!{mr.get('iid') or 'MR'}",
+                                mr.get("web_url") or "",
+                            ),
+                        ),
+                        (
+                            "MR 状态",
+                            escape_markdown(mr.get("state") or "unknown"),
+                        ),
+                        ("分支与 Worktree", "已保留"),
+                    ],
+                ),
+            ),
         )
         self.flush_outbox()
 
@@ -2701,6 +3506,11 @@ class ControllerService:
                 card_id=managed.card_id,
                 kind=event.kind,
                 created_at=event.created_at,
+                run_id=(
+                    f"{managed.board}:{event.run_id}"
+                    if event.run_id is not None
+                    else None
+                ),
                 worker_session_id=worker_session_id,
                 worker_pid=worker_pid,
                 lease_seconds=self.config.worker_progress_lease_seconds,
@@ -2748,19 +3558,34 @@ class ControllerService:
             self._run_control(run.run_key).get("state_version") or 1
         )
         if started:
+            agent_label = format_agent(task.assignee)
             self._enqueue_progress(
                 run,
                 (
                     f"agent:{managed.card_id}:{attempt}:"
                     f"started:{state_version}"
                 ),
-                self._mention(run.origin)
-                + "Agent 已开始工作。\n"
-                f"run={run.run_key} stage={managed.stage} "
-                f"iteration={managed.iteration} agent={task.assignee} "
-                f"card={task.id}",
+                self._render_notification(
+                    run,
+                    icon="ℹ️",
+                    title=f"{agent_label} Agent 已开始工作",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        ("阶段", format_stage(managed.stage)),
+                        (
+                            "轮次",
+                            format_attempt(
+                                attempt,
+                                self.config.worker_redispatch_limit,
+                            ),
+                        ),
+                        ("Agent", agent_label),
+                        ("Card", inline_code(task.id)),
+                    ],
+                ),
             )
         elif interrupted:
+            agent_label = format_agent(task.assignee)
             self._enqueue_progress(
                 run,
                 (
@@ -2768,11 +3593,25 @@ class ControllerService:
                     f"interrupted-{event.kind}:"
                     f"{state_version}"
                 ),
-                self._mention(run.origin)
-                + "Agent 工作已中断。\n"
-                f"run={run.run_key} stage={managed.stage} "
-                f"iteration={managed.iteration} agent={task.assignee} "
-                f"card={task.id} event={event.kind}",
+                self._render_notification(
+                    run,
+                    icon="⚠️",
+                    title=f"{agent_label} Agent 工作已中断",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        ("阶段", format_stage(managed.stage)),
+                        (
+                            "轮次",
+                            format_attempt(
+                                attempt,
+                                self.config.worker_redispatch_limit,
+                            ),
+                        ),
+                        ("Agent", agent_label),
+                        ("Card", inline_code(task.id)),
+                        ("事件", format_event(event.kind)),
+                    ],
+                ),
             )
 
     def _enqueue_stale_worker_notices(self) -> None:
@@ -2879,14 +3718,15 @@ class ControllerService:
                     )
                     continue
                 try:
-                    mr = self.gitlab.delivery_mr(
-                        run,
-                        (
-                            int(runtime["mr_iid"])
-                            if runtime.get("mr_iid")
-                            else None
-                        ),
-                    )
+                    binding = self.store.delivery_binding(run.run_key)
+                    if runtime.get("mr_iid") and (
+                        binding is None
+                        or binding.mr_iid != int(runtime["mr_iid"])
+                    ):
+                        raise ValueError(
+                            "runtime MR is not the persisted delivery binding"
+                        )
+                    mr = self._delivery_mr(run)
                 except DependencyError as exc:
                     self._handle_dependency_error(run_key, exc)
                     self._enqueue_worker_lease_notice(
@@ -2900,7 +3740,12 @@ class ControllerService:
                 persisted_mr = runtime.get("mr_iid")
                 persisted_head = str(runtime.get("head_sha") or "")
                 if mr is None:
-                    mr_evidence_matches = not persisted_mr and not persisted_head
+                    mr_evidence_matches = bool(
+                        runtime.get("stage") == Stage.SPEC_WRITE.value
+                        and int(runtime.get("iteration") or 0) == 1
+                        and not persisted_mr
+                        and not persisted_head
+                    )
                 else:
                     live_iid = int(mr.get("iid") or 0)
                     live_head = str(mr.get("sha") or "")
@@ -2995,13 +3840,36 @@ class ControllerService:
                                 f"{redispatch_count + 1}:"
                                 f"{self._run_control(run.run_key).get('state_version', 1)}"
                             ),
-                            self._mention(run.origin)
-                            + "Agent 失联证据已确认，Hermes 已请求有限重派。\n"
-                            f"run={run_key} stage={runtime['stage']} "
-                            f"card={runtime['card_id']} "
-                            f"attempt={runtime.get('attempt')} "
-                            f"redispatch={redispatch_count + 1}/"
-                            f"{self.config.worker_redispatch_limit}",
+                            self._render_notification(
+                                run,
+                                icon="⚠️",
+                                title="Agent 失联，已请求有限重派",
+                                fields=[
+                                    ("任务 ID", inline_code(run_key)),
+                                    (
+                                        "阶段",
+                                        format_stage(runtime["stage"]),
+                                    ),
+                                    (
+                                        "轮次",
+                                        format_attempt(
+                                            runtime.get("attempt"),
+                                            self.config.worker_redispatch_limit,
+                                        ),
+                                    ),
+                                    (
+                                        "Card",
+                                        inline_code(runtime["card_id"]),
+                                    ),
+                                    (
+                                        "重派次数",
+                                        (
+                                            f"{redispatch_count + 1}/"
+                                            f"{self.config.worker_redispatch_limit}"
+                                        ),
+                                    ),
+                                ],
+                            ),
                         )
                 except DependencyContractError as exc:
                     self._record_run_exception(run_key, exc)
@@ -3077,17 +3945,44 @@ class ControllerService:
             ),
             run.run_key,
             "worker-lease-expired",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "Agent 超过进展租约，但自动重派证据不足。\n"
-                f"run={run.run_key} stage={runtime['stage']} "
-                f"card={runtime['card_id']} attempt={runtime.get('attempt')} "
-                f"session={runtime.get('worker_session_id') or 'unknown'} "
-                f"pid={runtime.get('worker_pid') or 'unknown'} "
-                f"error_code={error_code}\n"
-                f"evidence={explanation}; Controller 未终止或重派该 Agent。",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="⚠️",
+                    title="Agent 超过进展租约，暂未自动重派",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        ("阶段", format_stage(runtime["stage"])),
+                        (
+                            "轮次",
+                            format_attempt(
+                                runtime.get("attempt"),
+                                self.config.worker_redispatch_limit,
+                            ),
+                        ),
+                        ("Card", inline_code(runtime["card_id"])),
+                        (
+                            "Session",
+                            inline_code(
+                                runtime.get("worker_session_id") or "unknown"
+                            ),
+                        ),
+                        (
+                            "PID",
+                            inline_code(runtime.get("worker_pid") or "unknown"),
+                        ),
+                        ("错误码", inline_code(error_code)),
+                        ("处理", "证据不足，Controller 未终止或重派该 Agent"),
+                    ],
+                    sections=[
+                        (
+                            "判断依据",
+                            [escape_markdown(explanation, limit=700)],
+                        )
+                    ],
+                ),
+            ),
         )
 
     def _enqueue_agent_completed(
@@ -3115,6 +4010,16 @@ class ControllerService:
             else None
         )
         attempt = int((runtime or {}).get("attempt") or 1)
+        agent_label = format_agent(item.task.assignee)
+        related_links = list(
+            dict.fromkeys(
+                [
+                    *([str(metadata.mr_url)] if metadata.mr_url else []),
+                    *(str(url) for url in metadata.gitlab_urls),
+                    *(str(url) for url in metadata.gate_evidence_refs),
+                ]
+            )
+        )
         self._enqueue_progress(
             run,
             (
@@ -3122,12 +4027,38 @@ class ControllerService:
                 f"completed-accepted:{metadata.outcome.value}:"
                 f"{self._run_control(run.run_key).get('state_version', 1)}"
             ),
-            self._mention(run.origin)
-            + "Agent completed / accepted。\n"
-            f"run={run.run_key} stage={metadata.stage.value} "
-            f"iteration={metadata.iteration} agent={item.task.assignee} "
-            f"card={item.task.id} outcome={metadata.outcome.value} "
-            f"duration_seconds={duration if duration is not None else 'unknown'}",
+            self._render_notification(
+                run,
+                icon="✅",
+                title=f"{agent_label} Agent 工作已完成",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("阶段", format_stage(metadata.stage)),
+                    (
+                        "轮次",
+                        format_attempt(
+                            attempt,
+                            self.config.worker_redispatch_limit,
+                        ),
+                    ),
+                    ("Agent", agent_label),
+                    ("Card", inline_code(item.task.id)),
+                    ("结论", format_outcome(metadata.outcome)),
+                    ("耗时", format_duration(duration)),
+                ],
+                sections=[
+                    (
+                        "相关链接",
+                        [
+                            markdown_link(f"链接 {index}", url)
+                            for index, url in enumerate(
+                                related_links,
+                                start=1,
+                            )
+                        ],
+                    )
+                ],
+            ),
         )
 
     def _enqueue_agent_completion_rejected(
@@ -3150,6 +4081,7 @@ class ControllerService:
             else None
         )
         attempt = int((runtime or {}).get("attempt") or 1)
+        agent_label = format_agent(item.task.assignee)
         self._enqueue_progress(
             run,
             (
@@ -3157,11 +4089,31 @@ class ControllerService:
                 f"completed-rejected:"
                 f"{self._run_control(run.run_key).get('state_version', 1)}"
             ),
-            self._mention(run.origin)
-            + "Agent completed / rejected。\n"
-            f"run={run.run_key} stage={item.managed.stage} "
-            f"iteration={item.managed.iteration} agent={item.task.assignee} "
-            f"card={item.task.id} reason={reason[:700]}",
+            self._render_notification(
+                run,
+                icon="⚠️",
+                title=f"{agent_label} Agent 完成结果未被接受",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("阶段", format_stage(item.managed.stage)),
+                    (
+                        "轮次",
+                        format_attempt(
+                            attempt,
+                            self.config.worker_redispatch_limit,
+                        ),
+                    ),
+                    ("Agent", agent_label),
+                    ("Card", inline_code(item.task.id)),
+                    ("结论", format_outcome("rejected")),
+                ],
+                sections=[
+                    (
+                        "拒绝原因",
+                        [escape_markdown(reason, limit=700)],
+                    )
+                ],
+            ),
         )
 
     def health(self, probe: str = "readiness") -> dict:
@@ -3271,7 +4223,7 @@ class ControllerService:
         self._assert_reconcile_mutable(run.run_key)
         full_history, _ = self._history(run.run_key)
         frozen_baselines = self._frozen_baselines(full_history, run)
-        mr = self.gitlab.delivery_mr(run)
+        mr = self._delivery_mr(run)
         self._assert_reconcile_mutable(run.run_key)
         frozen_repair = (
             repair_context is not None
@@ -3313,10 +4265,24 @@ class ControllerService:
                     run,
                     f"{phase.value}:preflight-frozen-repair:"
                     f"{hashlib.sha256(violation.encode()).hexdigest()[:12]}",
-                    self._mention(run.origin)
-                    + f"释放下一张卡前发现冻结工件被修改，"
-                    f"已改派 {phase.value.upper()} 恢复任务。\n"
-                    f"run={run.run_key} reason={violation[:500]}",
+                    self._render_notification(
+                        run,
+                        icon="⚠️",
+                        title="发现冻结工件被修改，已改派恢复任务",
+                        fields=[
+                            ("任务 ID", inline_code(run.run_key)),
+                            (
+                                "恢复阶段",
+                                escape_markdown(phase.value.upper()),
+                            ),
+                        ],
+                        sections=[
+                            (
+                                "发现的问题",
+                                [escape_markdown(violation, limit=500)],
+                            )
+                        ],
+                    ),
                 )
         if repair_context is not None:
             repair_context = repair_context.model_copy(
@@ -3332,6 +4298,103 @@ class ControllerService:
         key = f"{run.run_key}:{stage.value}:{iteration}:{mode.value}:work"
         assignee = self.config.stage_assignees[stage]
         skills = self.config.stage_skills[stage]
+        accepted_preflight = self.store.deployment_preflight(
+            include_digest=True
+        )
+        if (
+            accepted_preflight is not None
+            and accepted_preflight.get("ok")
+            and accepted_preflight.get("deep")
+        ):
+            admission = profile_preflight(
+                self.config,
+                assignee,
+                deep=True,
+                project_path=run.project.project_path,
+                branch=run.workspace.branch,
+            )
+            self.store.record_profile_preflight(admission, deep=True)
+            if not admission.get("ok"):
+                error_code = str(
+                    admission.get("error_code")
+                    or "profile_admission_failed"
+                )
+                control = self._run_control(run.run_key)
+                if control["state"] in {
+                    "active",
+                    "transition_pending",
+                    "dependency_degraded",
+                    "merge_wait",
+                    "retry_wait",
+                }:
+                    transient = error_code in {
+                        "dependency_unavailable",
+                        "rate_limited",
+                    }
+                    self.store.transition_run(
+                        run.run_key,
+                        expected_states={str(control["state"])},
+                        new_state=(
+                            "retry_wait" if transient else "human_blocked"
+                        ),
+                        reason=(
+                            f"profile_admission:{assignee}:{error_code}"
+                        ),
+                        expected_version=int(control["state_version"]),
+                        next_retry_at=(
+                            int(time.time())
+                            + int(
+                                self.config.dependency_backoff_initial_seconds
+                            )
+                            if transient
+                            else None
+                        ),
+                    )
+                raise RunPolicyError(
+                    f"profile_admission_failed:{assignee}:{error_code}"
+                )
+        binding = self.store.delivery_binding(run.run_key)
+        expected_head_sha = (
+            str(mr.get("sha"))
+            if mr is not None and mr.get("sha")
+            else run.workspace.repository_base_sha
+        )
+        context_payload = {
+            "protocol_version": "hollysys-controller/v4",
+            "run_key": run.run_key,
+            "source_key": run.source_key,
+            "run_generation": run.run_generation,
+            "stage": stage.value,
+            "iteration": iteration,
+            "mode": mode.value,
+            "idempotency_key": key,
+            "parent_card_id": parent_card_id,
+            "assignee": assignee,
+            "skills": skills,
+            "expected_head_sha": expected_head_sha,
+            "delivery": (
+                binding.model_dump(mode="json") if binding is not None else None
+            ),
+            "frozen_baselines": [
+                baseline.model_dump(mode="json")
+                for baseline in frozen_baselines
+            ],
+            "repair_context": (
+                repair_context.model_dump(mode="json")
+                if repair_context is not None
+                else None
+            ),
+            "resume_answer": resume_answer,
+            "resumed_from_card_id": resumed_from,
+        }
+        context_digest = hashlib.sha256(
+            json.dumps(
+                context_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         record = CardRecord(
             run=run,
             stage=stage,
@@ -3345,6 +4408,13 @@ class ControllerService:
             repair_context=repair_context,
             resume_answer=resume_answer,
             resumed_from_card_id=resumed_from,
+            expected_head_sha=expected_head_sha,
+            context_digest=context_digest,
+            scratch_dir=(
+                f"/opt/data/scratch/{run.run_generation}/"
+                f"{hashlib.sha256(key.encode()).hexdigest()[:20]}"
+            ),
+            delivery=binding,
         )
         task = self.kanban.create_work(record)
         self._verify_work(task, record)
@@ -3507,6 +4577,12 @@ class ControllerService:
             self._verify_work(item.task, record)
         return items, run
 
+    def _delivery_mr(self, run: RunRecord) -> dict | None:
+        binding = self.store.delivery_binding(run.run_key)
+        if binding is None:
+            return None
+        return self.gitlab.validate_delivery_binding(run, binding)
+
     def _attempts_by_stage(self, history: list[HistoryItem]) -> dict[Stage, int]:
         result: dict[Stage, int] = {}
         for item in history:
@@ -3514,7 +4590,7 @@ class ControllerService:
                 continue
             stage = Stage(item.managed.stage)
             if any(
-                "[controller-protocol-error:v3]" in str(comment["body"])
+                "[controller-protocol-error:v4]" in str(comment["body"])
                 for comment in item.task.comments
             ):
                 continue
@@ -3537,7 +4613,7 @@ class ControllerService:
                 or item.managed.stage not in review_stage_values
                 or item.task.status != "done"
                 or any(
-                    "[controller-protocol-error:v3]" in str(comment["body"])
+                    "[controller-protocol-error:v4]" in str(comment["body"])
                     for comment in item.task.comments
                 )
             ):
@@ -3545,11 +4621,6 @@ class ControllerService:
             try:
                 metadata = validate_persisted_completion_metadata(
                     item.task.latest_metadata
-                )
-                self._validate_completion_context(
-                    parse_card_body(item.task.body).run,
-                    item,
-                    metadata,
                 )
             except (ValidationError, ValueError, TypeError):
                 continue
@@ -3725,9 +4796,21 @@ class ControllerService:
         self._enqueue_progress(
             run,
             f"{phase.value}:frozen-repair:{hashlib.sha256(violation.encode()).hexdigest()[:12]}",
-            self._mention(run.origin)
-            + f"检测到冻结工件被修改，已在 {phase.value.upper()} 阶段派发恢复任务。\n"
-            f"run={run.run_key} reason={violation[:500]}",
+            self._render_notification(
+                run,
+                icon="⚠️",
+                title="检测到冻结工件被修改，已派发恢复任务",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("恢复阶段", escape_markdown(phase.value.upper())),
+                ],
+                sections=[
+                    (
+                        "发现的问题",
+                        [escape_markdown(violation, limit=500)],
+                    )
+                ],
+            ),
         )
         return self._create_work(
             run,
@@ -3745,7 +4828,7 @@ class ControllerService:
             if item.managed.purpose != "work":
                 continue
             if any(
-                "[controller-protocol-error:v3]" in str(comment["body"])
+                "[controller-protocol-error:v4]" in str(comment["body"])
                 for comment in item.task.comments
             ):
                 stage = Stage(item.managed.stage)
@@ -3758,11 +4841,15 @@ class ControllerService:
         item: HistoryItem,
         metadata: CompletionMetadata,
     ) -> None:
+        card = parse_card_body(item.task.body)
         expected = {
             "run_key": run.run_key,
+            "source_key": run.source_key,
+            "run_generation": run.run_generation,
+            "context_digest": card.context_digest,
             "stage": item.managed.stage,
             "iteration": item.managed.iteration,
-            "mode": parse_card_body(item.task.body).mode.value,
+            "mode": card.mode.value,
             "project_id": run.project.project_id,
             "project_path": run.project.project_path,
             "checkout": run.workspace.checkout,
@@ -3774,6 +4861,7 @@ class ControllerService:
             "prd_blob_sha": run.source.prd_blob_sha,
             "prd_mr_url": str(run.source.prd_mr_url),
             "kanban_card_id": item.task.id,
+            "head_before_sha": card.expected_head_sha,
         }
         actual = metadata.model_dump(mode="json")
         mismatches = [
@@ -3783,6 +4871,53 @@ class ControllerService:
             raise ValueError(
                 "completion context mismatch: " + ", ".join(sorted(mismatches))
             )
+        binding = self.store.delivery_binding(run.run_key)
+        if binding is not None:
+            if (
+                metadata.mr_iid != binding.mr_iid
+                or metadata.mr_url is None
+                or str(metadata.mr_url) != str(binding.mr_url)
+            ):
+                raise ValueError(
+                    "completion MR does not match persisted delivery binding"
+                )
+            mr = self.gitlab.validate_delivery_binding(run, binding)
+            if (
+                metadata.head_sha is not None
+                and metadata.head_sha != str(mr.get("sha") or "")
+            ):
+                raise ValueError("completion head is not the bound current MR head")
+        elif metadata.mr_iid is not None or metadata.mr_url is not None:
+            raise ValueError("completion references an unbound delivery MR")
+        if metadata.deterministic_checks:
+            persisted = self.store.validation_runs(
+                run.run_key,
+                card_id=item.task.id,
+            )
+            accepted = {
+                (
+                    entry["validator"],
+                    entry["validator_version"],
+                    entry["input_digest"],
+                    entry["result_digest"],
+                    entry["passed"],
+                    tuple(entry["error_codes"]),
+                )
+                for entry in persisted
+            }
+            for check in metadata.deterministic_checks:
+                candidate = (
+                    check.validator,
+                    check.validator_version,
+                    check.input_digest,
+                    check.result_digest,
+                    check.passed,
+                    tuple(check.error_codes),
+                )
+                if candidate not in accepted:
+                    raise ValueError(
+                        "deterministic check was not recomputed by Controller"
+                    )
         if (
             metadata.repository_evidence is not None
             and metadata.repository_evidence.repository_base_sha
@@ -3985,7 +5120,7 @@ class ControllerService:
     ) -> None:
         self._assert_reconcile_mutable(run.run_key)
         self._reject_agent_completion(run, latest, reason)
-        marker = "[controller-protocol-error:v3]"
+        marker = "[controller-protocol-error:v4]"
         already_marked = any(
             marker in str(comment["body"]) for comment in latest.task.comments
         )
@@ -4091,15 +5226,30 @@ class ControllerService:
             outbox_key,
             run.run_key,
             "exception",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "自动交付需要异常处理。\n"
-                f"run={run.run_key} stage=exception agent=dispatcher "
-                f"card={task.id}\n"
-                f"evidence={reason[:700]}\n"
-                "action=请查看异常卡与证据，明确决定恢复、调整授权或停止交付。",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="❗",
+                    title="自动交付需要异常处理",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        ("阶段", format_stage("exception")),
+                        ("Agent", format_agent("dispatcher")),
+                        ("Card", inline_code(task.id)),
+                        (
+                            "需要操作",
+                            "请查看异常卡与证据，明确决定恢复、调整授权或停止交付",
+                        ),
+                    ],
+                    sections=[
+                        (
+                            "异常证据",
+                            [escape_markdown(reason, limit=700)],
+                        )
+                    ],
+                ),
+            ),
         )
         return task
 
@@ -4113,9 +5263,27 @@ class ControllerService:
         mode: WorkMode = WorkMode.NORMAL,
         issues: list[str],
     ) -> dict:
+        managed_item = next(
+            (
+                item
+                for item in self._history(run.run_key)[0]
+                if item.task.id == card_id
+            ),
+            None,
+        )
+        card = (
+            parse_card_body(managed_item.task.body)
+            if managed_item is not None
+            else None
+        )
+        if card is None:
+            raise ValueError(f"unknown managed card {card_id}")
         return CompletionMetadata(
-            protocol_version="hollysys-controller/v3",
+            protocol_version="hollysys-controller/v4",
             run_key=run.run_key,
+            source_key=run.source_key,
+            run_generation=run.run_generation,
+            context_digest=card.context_digest,
             stage=Stage(managed.stage),
             iteration=managed.iteration,
             mode=mode,
@@ -4131,6 +5299,8 @@ class ControllerService:
             prd_blob_sha=run.source.prd_blob_sha,
             prd_mr_url=run.source.prd_mr_url,
             kanban_card_id=card_id,
+            head_before_sha=card.expected_head_sha,
+            deterministic_checks=[],
             issues=issues,
         ).model_dump(mode="json")
 
@@ -4170,11 +5340,6 @@ class ControllerService:
             try:
                 metadata = validate_persisted_completion_metadata(
                     item.task.latest_metadata
-                )
-                self._validate_completion_context(
-                    parse_card_body(item.task.body).run,
-                    item,
-                    metadata,
                 )
             except (ValidationError, ValueError, TypeError):
                 continue
@@ -4284,11 +5449,28 @@ class ControllerService:
                 f"operation_failed_without_classification:{kind}:{exc}"
             ) from exc
 
+    def _render_notification(
+        self,
+        run: RunRecord,
+        *,
+        icon: str,
+        title: str,
+        fields: list[tuple[str, str]],
+        sections: list[tuple[str, list[str]]] | None = None,
+    ) -> str:
+        return render_message(
+            mention=self._mention(run.origin),
+            icon=icon,
+            title=title,
+            fields=fields,
+            sections=sections or [],
+        )
+
     def _enqueue_progress(
         self,
         run: RunRecord,
         event_key: str,
-        text: str,
+        content: str,
         *,
         allow_minimal: bool = False,
     ) -> None:
@@ -4303,10 +5485,7 @@ class ControllerService:
             f"{run.run_key}:progress:{event_key}",
             run.run_key,
             "progress",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": text,
-            },
+            markdown_payload(run.origin, content),
         )
 
     def _enqueue_phase_started(
@@ -4315,9 +5494,16 @@ class ControllerService:
         self._enqueue_progress(
             run,
             f"{phase.value}:started",
-            self._mention(run.origin)
-            + f"自动交付进入 {phase.value.upper()} 阶段。\n"
-            f"run={run.run_key} agent={task.assignee} card={task.id}",
+            self._render_notification(
+                run,
+                icon="ℹ️",
+                title=f"自动交付进入 {phase.value.upper()} 阶段",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("Agent", format_agent(task.assignee)),
+                    ("Card", inline_code(task.id)),
+                ],
+            ),
         )
 
     def _enqueue_review_failed(
@@ -4336,12 +5522,37 @@ class ControllerService:
         self._enqueue_progress(
             run,
             f"{phase.value}:review-failed:{review_attempt}:{metadata.kanban_card_id}",
-            self._mention(run.origin)
-            + f"{phase.value.upper()} review 未通过 "
-            f"({review_attempt}/{self.config.document_review_limit})。\n"
-            f"run={run.run_key} findings={summary[:500]}\n"
-            f"next_agent={self.config.stage_assignees[PRODUCER_FOR_PHASE[phase]]} "
-            f"{action}",
+            self._render_notification(
+                run,
+                icon="⚠️",
+                title=f"{phase.value.upper()} Review 未通过",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    (
+                        "审查轮次",
+                        f"{review_attempt}/{self.config.document_review_limit}",
+                    ),
+                    (
+                        "下一位 Agent",
+                        format_agent(
+                            self.config.stage_assignees[
+                                PRODUCER_FOR_PHASE[phase]
+                            ]
+                        ),
+                    ),
+                    ("后续处理", escape_markdown(action, limit=300)),
+                ],
+                sections=[
+                    (
+                        "主要问题",
+                        [
+                            escape_markdown(issue, limit=300)
+                            for issue in metadata.issues[:3]
+                        ]
+                        or [escape_markdown(summary, limit=500)],
+                    )
+                ],
+            ),
         )
 
     def _enqueue_phase_frozen(
@@ -4356,24 +5567,56 @@ class ControllerService:
             if disposition == BaselineDisposition.REVIEWED
             else "达到 review 上限后强制收敛"
         )
-        urls = " ".join(
+        urls = list(
             dict.fromkeys(
                 [
                     *([str(metadata.mr_url)] if metadata.mr_url else []),
                     *(str(url) for url in metadata.gitlab_urls),
+                    *(str(url) for url in metadata.gate_evidence_refs),
                 ]
             )
         )
-        risks = "；".join(metadata.residual_risk[:3]) or "无"
-        decisions = "；".join(metadata.key_decisions[:3]) or "无"
         self._enqueue_progress(
             run,
             f"{phase.value}:frozen:{disposition}:{metadata.artifact_digest}",
-            self._mention(run.origin)
-            + f"{phase.value.upper()} 已冻结（{label}）。\n"
-            f"run={run.run_key} decisions={decisions[:300]} "
-            f"risks={risks[:500]}"
-            + (f"\nlinks={urls}" if urls else ""),
+            self._render_notification(
+                run,
+                icon="✅",
+                title=f"{phase.value.upper()} 阶段工件已冻结",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("冻结结论", escape_markdown(label)),
+                    (
+                        "工件摘要",
+                        inline_code(str(metadata.artifact_digest)[:12]),
+                    ),
+                ],
+                sections=[
+                    (
+                        "关键决策",
+                        [
+                            escape_markdown(decision, limit=300)
+                            for decision in metadata.key_decisions[:3]
+                        ]
+                        or ["无"],
+                    ),
+                    (
+                        "残余风险",
+                        [
+                            escape_markdown(risk, limit=300)
+                            for risk in metadata.residual_risk[:3]
+                        ]
+                        or ["无"],
+                    ),
+                    (
+                        "相关链接",
+                        [
+                            markdown_link(f"证据 {index}", url)
+                            for index, url in enumerate(urls, start=1)
+                        ],
+                    ),
+                ],
+            ),
         )
 
     def _enqueue_code_retry(
@@ -4383,18 +5626,46 @@ class ControllerService:
         review: CompletionMetadata,
         next_modification: int,
     ) -> None:
-        summary = "；".join(self._code_gate_issues(test, review)[:6])
+        issues = self._code_gate_issues(test, review)[:6]
         self._enqueue_progress(
             run,
             f"code:gates-failed:{review.head_sha}:modification:{next_modification}",
-            self._mention(run.origin)
-            + "CODE 同一提交的双门禁未同时通过，已汇总 tester 与 "
-            "code-reviewer 意见退回 coder；代码 push 后将重新执行两道门禁。\n"
-            f"run={run.run_key} head={review.head_sha} "
-            f"tester={test.outcome.value} code-reviewer={review.outcome.value} "
-            f"modification={next_modification}/"
-            f"{self.config.code_modification_limit}\n"
-            f"findings={summary[:700]}",
+            self._render_notification(
+                run,
+                icon="⚠️",
+                title="CODE 双门禁未同时通过，已退回修改",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("Head", inline_code(short_sha(review.head_sha))),
+                    ("Tester", format_outcome(test.outcome)),
+                    ("Code Reviewer", format_outcome(review.outcome)),
+                    (
+                        "MR",
+                        markdown_link(
+                            f"!{review.mr_iid or test.mr_iid or 'MR'}",
+                            review.mr_url or test.mr_url or "",
+                        ),
+                    ),
+                    (
+                        "修改轮次",
+                        (
+                            f"{next_modification}/"
+                            f"{self.config.code_modification_limit}"
+                        ),
+                    ),
+                    ("下一位 Agent", format_agent("coder")),
+                    ("后续处理", "代码 push 后重新执行两道门禁"),
+                ],
+                sections=[
+                    (
+                        "主要问题",
+                        [
+                            escape_markdown(issue, limit=300)
+                            for issue in issues
+                        ],
+                    )
+                ],
+            ),
         )
 
     def _enqueue_test_skipped(
@@ -4407,12 +5678,46 @@ class ControllerService:
         self._enqueue_progress(
             run,
             f"code:test-skipped:{metadata.head_sha}:{metadata.kanban_card_id}",
-            self._mention(run.origin)
-            + "TEST 的必要条件经预检确认不具备，已结构化跳过该部分测试；"
-            "code-reviewer 将继续审查同一提交。\n"
-            f"run={run.run_key} head={metadata.head_sha} "
-            f"reason={metadata.skip_reason}\n"
-            f"verification={verification[:500]} risks={risks[:500]}",
+            self._render_notification(
+                run,
+                icon="⚠️",
+                title="部分测试条件不可用，已结构化跳过",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("阶段", format_stage(Stage.TEST)),
+                    ("Head", inline_code(short_sha(metadata.head_sha))),
+                    (
+                        "MR",
+                        markdown_link(
+                            f"!{metadata.mr_iid or 'MR'}",
+                            metadata.mr_url or "",
+                        ),
+                    ),
+                    (
+                        "跳过原因",
+                        escape_markdown(metadata.skip_reason, limit=500),
+                    ),
+                    ("后续处理", "Code Reviewer 将继续审查同一提交"),
+                ],
+                sections=[
+                    (
+                        "已完成检查",
+                        [
+                            escape_markdown(item, limit=300)
+                            for item in metadata.verification[:3]
+                        ]
+                        or [escape_markdown(verification, limit=500)],
+                    ),
+                    (
+                        "残余风险",
+                        [
+                            escape_markdown(item, limit=300)
+                            for item in metadata.residual_risk[:3]
+                        ]
+                        or [escape_markdown(risks, limit=500)],
+                    ),
+                ],
+            ),
         )
 
     def _enqueue_human_block(
@@ -4429,15 +5734,43 @@ class ControllerService:
             f"{run.run_key}:human-block:{token}",
             run.run_key,
             "human-block",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "自动交付遇到真正阻塞，需要你的处理。\n"
-                f"run={run.run_key} stage={item.managed.stage} "
-                f"agent={item.task.assignee} card={item.task.id}\n"
-                f"summary={summary[:300]}\nevidence={evidence[:300]}\n"
-                f"action={action[:300]}",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="❗",
+                    title="自动交付遇到阻塞，需要你的处理",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        ("阶段", format_stage(item.managed.stage)),
+                        ("Agent", format_agent(item.task.assignee)),
+                        ("Card", inline_code(item.task.id)),
+                        (
+                            "需要操作",
+                            escape_markdown(action, limit=300),
+                        ),
+                        (
+                            "回复方式",
+                            (
+                                f"回复本消息并 @dispatcher：处理阻塞 "
+                                f"{inline_code(run.run_key)} "
+                                f"{inline_code(item.task.id)} "
+                                f"{inline_code('答案/已完成动作')}"
+                            ),
+                        ),
+                    ],
+                    sections=[
+                        (
+                            "阻塞摘要",
+                            [escape_markdown(summary, limit=300)],
+                        ),
+                        (
+                            "判断依据",
+                            [escape_markdown(evidence, limit=300)],
+                        ),
+                    ],
+                ),
+            ),
         )
 
     @staticmethod
@@ -4500,13 +5833,37 @@ class ControllerService:
             key,
             run.run_key,
             "merged",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin) + "PRD 自动交付完成。\n"
-                f"run={run.run_key} project={run.project.project_display_name} "
-                f"({run.project.project_path})\n"
-                f"mr={mr.get('web_url')} merge={merge_sha}",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="✅",
+                    title="PRD 自动交付完成",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        (
+                            "项目",
+                            escape_markdown(
+                                run.project.project_display_name,
+                                limit=200,
+                            ),
+                        ),
+                        (
+                            "仓库",
+                            inline_code(run.project.project_path),
+                        ),
+                        (
+                            "MR",
+                            markdown_link(
+                                f"!{mr.get('iid') or 'MR'}",
+                                mr.get("web_url") or "",
+                            ),
+                        ),
+                        ("Merge SHA", inline_code(short_sha(merge_sha))),
+                        ("结论", "verified（门禁已验证）"),
+                    ],
+                ),
+            ),
         )
 
     def _finalize_merged(
@@ -4646,15 +6003,33 @@ class ControllerService:
                 f"{run.run_key}:completed-before-abort:{merge_sha or mr_iid}",
                 run.run_key,
                 "completed-before-abort",
-                {
-                    "origin": run.origin.model_dump(mode="json"),
-                    "text": self._mention(run.origin)
-                    + "废止与合并发生竞争；重新核验后确认 MR 已合并。\n"
-                    f"run={run.run_key} mr={mr.get('web_url')} "
-                    f"head={checked_head or 'unknown'} "
-                    f"merge={merge_sha or 'unknown'}\n"
-                    "state=completed_before_abort",
-                },
+                markdown_payload(
+                    run.origin,
+                    self._render_notification(
+                        run,
+                        icon="⛔",
+                        title="废止请求到达前 MR 已完成合并",
+                        fields=[
+                            ("任务 ID", inline_code(run.run_key)),
+                            (
+                                "MR",
+                                markdown_link(
+                                    f"!{mr.get('iid') or mr_iid}",
+                                    mr.get("web_url") or "",
+                                ),
+                            ),
+                            ("Head", inline_code(short_sha(checked_head))),
+                            (
+                                "Merge SHA",
+                                inline_code(short_sha(merge_sha)),
+                            ),
+                            (
+                                "状态",
+                                "completed_before_abort（合并先于废止完成）",
+                            ),
+                        ],
+                    ),
+                ),
             )
             return
         if control["state"] in TERMINAL_RUN_STATES:
@@ -4675,15 +6050,42 @@ class ControllerService:
             f"{run.run_key}:merged-policy-violation:{merge_sha or mr_iid}",
             run.run_key,
             "merged-policy-violation",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "检测到流程已合并，但长期版 Controller 无法验证同一 head 的完整门禁证据。\n"
-                f"run={run.run_key} mr={mr.get('web_url')} "
-                f"head={checked_head or 'unknown'} merge={merge_sha or 'unknown'}\n"
-                f"compliance=unverified reason={compliance_reason[:500]}\n"
-                "状态已终止为 completed（source=external），不会再次调度或合并。",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="❗",
+                    title="流程已合并，但门禁证据无法完整验证",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        (
+                            "MR",
+                            markdown_link(
+                                f"!{mr.get('iid') or mr_iid}",
+                                mr.get("web_url") or "",
+                            ),
+                        ),
+                        ("Head", inline_code(short_sha(checked_head))),
+                        ("Merge SHA", inline_code(short_sha(merge_sha))),
+                        ("合规结论", "unverified（未验证）"),
+                        (
+                            "后续处理",
+                            "状态已终止为 completed，不会再次调度或合并",
+                        ),
+                    ],
+                    sections=[
+                        (
+                            "原因",
+                            [
+                                escape_markdown(
+                                    compliance_reason,
+                                    limit=500,
+                                )
+                            ],
+                        )
+                    ],
+                ),
+            ),
         )
 
     def _enqueue_failure_limit(self, run: RunRecord, event: EventRecord) -> None:
@@ -4695,15 +6097,41 @@ class ControllerService:
             key,
             run.run_key,
             "failure-limit",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "Hermes 工作卡已触发失败熔断，需要人工检查。\n"
-                f"run={run.run_key} stage={managed.stage if managed else 'unknown'} "
-                f"agent={task.assignee if task else 'unknown'} card={event.task_id} "
-                f"event={event.kind}\nevidence={details}\n"
-                "action=检查该卡的脱敏运行证据并修复环境后查询 status",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="❗",
+                    title="Hermes 工作卡触发失败熔断",
+                    fields=[
+                        ("任务 ID", inline_code(run.run_key)),
+                        (
+                            "阶段",
+                            format_stage(
+                                managed.stage if managed else "unknown"
+                            ),
+                        ),
+                        (
+                            "Agent",
+                            format_agent(
+                                task.assignee if task else "unknown"
+                            ),
+                        ),
+                        ("Card", inline_code(event.task_id)),
+                        ("事件", format_event(event.kind)),
+                        (
+                            "需要操作",
+                            "检查该卡的脱敏运行证据，修复环境后查询 status",
+                        ),
+                    ],
+                    sections=[
+                        (
+                            "运行证据",
+                            [escape_markdown(details, limit=500)],
+                        )
+                    ],
+                ),
+            ),
         )
 
     def _enqueue_controller_failure(self, run_key: str, error: Exception) -> None:
@@ -4725,13 +6153,27 @@ class ControllerService:
             f"{run_key}:controller-failure:{suffix}",
             run_key,
             "controller-failure",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "Hollysys Controller 对账失败，需要管理员检查。\n"
-                f"run={run_key}\nevidence={reason[:700]}\n"
-                "action=修复 Controller/GitLab/Kanban 连通性后运行 health 和 status",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="❗",
+                    title="Hollysys Controller 对账失败",
+                    fields=[
+                        ("任务 ID", inline_code(run_key)),
+                        (
+                            "需要操作",
+                            "修复 Controller/GitLab/Kanban 连通性后运行 health 和 status",
+                        ),
+                    ],
+                    sections=[
+                        (
+                            "异常证据",
+                            [escape_markdown(reason, limit=700)],
+                        )
+                    ],
+                ),
+            ),
         )
 
     def _enqueue_dependency_outage(self, run_key: str, outage: dict) -> None:
@@ -4749,17 +6191,37 @@ class ControllerService:
             f"{run_key}:dependency-outage:{outage_id}",
             run_key,
             "dependency-outage",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "外部依赖暂时不可用，当前 Run 已进入自动退避。\n"
-                f"run={run_key} "
-                f"dependency={str(outage['dependency']).split(':', 1)[0]} "
-                f"outage={outage_id} "
-                f"class={outage['error_class']} failures={outage['failures']} "
-                f"next_retry_at={outage['next_retry_at']}\n"
-                "Controller、状态查询及其他本地服务保持运行，无需重启容器。",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="⚠️",
+                    title="外部依赖暂时不可用，已进入自动退避",
+                    fields=[
+                        ("任务 ID", inline_code(run_key)),
+                        (
+                            "依赖",
+                            escape_markdown(
+                                str(outage["dependency"]).split(":", 1)[0]
+                            ),
+                        ),
+                        ("Outage ID", inline_code(outage_id)),
+                        (
+                            "错误分类",
+                            inline_code(outage["error_class"]),
+                        ),
+                        ("连续失败", escape_markdown(outage["failures"])),
+                        (
+                            "下次重试时间",
+                            inline_code(outage["next_retry_at"]),
+                        ),
+                        (
+                            "当前状态",
+                            "Controller、状态查询及本地服务保持运行，无需重启容器",
+                        ),
+                    ],
+                ),
+            ),
         )
 
     def _enqueue_dependency_recovered(
@@ -4785,15 +6247,30 @@ class ControllerService:
             f"{run_key}:dependency-recovered:{outage_id}",
             run_key,
             "dependency-recovered",
-            {
-                "origin": run.origin.model_dump(mode="json"),
-                "text": self._mention(run.origin)
-                + "外部依赖已恢复，Controller 正按原 run/worktree/MR 继续对账。\n"
-                f"run={run_key} "
-                f"dependency={str(outage['dependency']).split(':', 1)[0]} "
-                f"outage={outage_id} "
-                f"duration_seconds={duration} retries={outage['failures']}",
-            },
+            markdown_payload(
+                run.origin,
+                self._render_notification(
+                    run,
+                    icon="✅",
+                    title="外部依赖已恢复，自动交付继续对账",
+                    fields=[
+                        ("任务 ID", inline_code(run_key)),
+                        (
+                            "依赖",
+                            escape_markdown(
+                                str(outage["dependency"]).split(":", 1)[0]
+                            ),
+                        ),
+                        ("Outage ID", inline_code(outage_id)),
+                        ("中断耗时", format_duration(duration)),
+                        ("重试次数", escape_markdown(outage["failures"])),
+                        (
+                            "继续方式",
+                            "沿用原 run、worktree 和 MR 继续对账",
+                        ),
+                    ],
+                ),
+            ),
         )
 
     @staticmethod

@@ -1,0 +1,13 @@
+.git
+.env
+.venv
+data
+projects
+reports
+tmp
+controller-data
+controller-socket
+secrets
+__pycache__
+*.pyc
+

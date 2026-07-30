@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://hollysys.example/schemas/card-completion-v7.json",
+  "$id": "https://hollysys.example/schemas/card-completion-v8.json",
   "$defs": {
     "BaselineDisposition": {
       "enum": [
@@ -19,6 +19,53 @@
       ],
       "title": "ChangeStrategy",
       "type": "string"
+    },
+    "DeterministicCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "validator": {
+          "minLength": 1,
+          "title": "Validator",
+          "type": "string"
+        },
+        "validator_version": {
+          "minLength": 1,
+          "title": "Validator Version",
+          "type": "string"
+        },
+        "input_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Digest",
+          "type": "string"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "error_codes": {
+          "items": {
+            "pattern": "^[a-z0-9_]+$",
+            "type": "string"
+          },
+          "title": "Error Codes",
+          "type": "array"
+        },
+        "result_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Result Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "validator",
+        "validator_version",
+        "input_digest",
+        "passed",
+        "error_codes",
+        "result_digest"
+      ],
+      "title": "DeterministicCheck",
+      "type": "object"
     },
     "ForcedAdvance": {
       "additionalProperties": false,
@@ -211,13 +258,28 @@
   "additionalProperties": false,
   "properties": {
     "protocol_version": {
-      "const": "hollysys-controller/v3",
+      "const": "hollysys-controller/v4",
       "title": "Protocol Version",
       "type": "string"
     },
     "run_key": {
       "pattern": "^hollysys-[a-z0-9]{20}$",
       "title": "Run Key",
+      "type": "string"
+    },
+    "source_key": {
+      "pattern": "^source-[a-z0-9]{20}$",
+      "title": "Source Key",
+      "type": "string"
+    },
+    "run_generation": {
+      "pattern": "^[a-z0-9]{20}$",
+      "title": "Run Generation",
+      "type": "string"
+    },
+    "context_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Context Digest",
       "type": "string"
     },
     "stage": {
@@ -311,6 +373,18 @@
       ],
       "default": null,
       "title": "Mr Url"
+    },
+    "head_before_sha": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Head Before Sha"
     },
     "head_sha": {
       "anyOf": [
@@ -570,11 +644,21 @@
       },
       "title": "Requirement Ids",
       "type": "array"
+    },
+    "deterministic_checks": {
+      "items": {
+        "$ref": "#/$defs/DeterministicCheck"
+      },
+      "title": "Deterministic Checks",
+      "type": "array"
     }
   },
   "required": [
     "protocol_version",
     "run_key",
+    "source_key",
+    "run_generation",
+    "context_digest",
     "stage",
     "iteration",
     "outcome",
@@ -588,7 +672,9 @@
     "prd_commit_sha",
     "prd_blob_sha",
     "prd_mr_url",
-    "kanban_card_id"
+    "kanban_card_id",
+    "head_before_sha",
+    "deterministic_checks"
   ],
   "title": "CompletionMetadata",
   "type": "object",

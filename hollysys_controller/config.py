@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -72,13 +73,20 @@ class ControllerConfig(BaseModel):
     lark_command: str = "/usr/local/bin/lark-cli"
     system_git_command: str = "/usr/bin/git"
     agent_git_command: str = "/usr/local/bin/git"
+    offline_cache_command: Path = Path(
+        "/opt/fleet/container/prepare-offline-caches.sh"
+    )
     controller_profile: str = "dispatcher"
+    controller_token_file: Path = Path(
+        "/run/secrets/hollysys_controller_gitlab_token"
+    )
     controller_mode: str = "preflight"
     poll_interval_seconds: float = Field(default=2.0, gt=0)
     reconcile_interval_seconds: float = Field(default=30.0, gt=0)
     reconcile_workers: int = Field(default=4, ge=1, le=32)
     outbox_poll_interval_seconds: float = Field(default=2.0, gt=0)
     command_timeout_seconds: int = Field(default=120, gt=0)
+    offline_cache_timeout_seconds: int = Field(default=1800, ge=60, le=7200)
     gitlab_host: str = ""
     allowed_groups: list[str] = Field(default_factory=list)
     preflight_project_path: str = ""
@@ -244,6 +252,12 @@ class ControllerConfig(BaseModel):
                 "projects_root": Path(
                     os.environ.get("HOLLYSYS_PROJECTS_ROOT", "/workspace/projects")
                 ),
+                "controller_token_file": Path(
+                    os.environ.get(
+                        "HOLLYSYS_CONTROLLER_GITLAB_TOKEN_FILE",
+                        "/run/secrets/hollysys_controller_gitlab_token",
+                    )
+                ),
             }
         )
         env_map = {
@@ -280,6 +294,10 @@ class ControllerConfig(BaseModel):
             "HOLLYSYS_PREFLIGHT_PROJECT_PATH": "preflight_project_path",
             "HOLLYSYS_PREFLIGHT_COMMAND_TIMEOUT_SECONDS": (
                 "preflight_command_timeout_seconds",
+                int,
+            ),
+            "HOLLYSYS_OFFLINE_CACHE_TIMEOUT_SECONDS": (
+                "offline_cache_timeout_seconds",
                 int,
             ),
             "HOLLYSYS_NOTIFICATION_LEVEL": "notification_level",
@@ -354,9 +372,19 @@ class ControllerConfig(BaseModel):
         return cls.model_validate(data)
 
     def read_token(self) -> str:
-        # Controller and Dispatcher intentionally share one credential source.
-        # A function-local import avoids a module cycle while preserving the
-        # complete Profile identity, host, group, ownership, and mode checks.
-        from .git_auth import profile_credential
-
-        return profile_credential(self, "dispatcher").token
+        path = self.controller_token_file
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("controller_gitlab_token_file_invalid")
+        info = path.stat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_mode & 0o077
+            or info.st_uid not in trusted_runtime_uids()
+        ):
+            raise PermissionError(
+                "controller_gitlab_token_file_permissions"
+            )
+        token = path.read_text(encoding="utf-8").strip()
+        if not token or "\n" in token or "\r" in token:
+            raise ValueError("controller_gitlab_token_invalid")
+        return token

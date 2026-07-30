@@ -4,6 +4,8 @@ import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -18,6 +20,7 @@ from hollysys_controller.models import (
     BaselineDisposition,
     CardRecord,
     CompletionMetadata,
+    DeliveryBinding,
     NotificationLevel,
     Phase,
     RepairContext,
@@ -28,6 +31,40 @@ from hollysys_controller.models import (
 from hollysys_controller.service import ControllerService, HistoryItem
 from hollysys_controller.store import ControllerStore, ManagedCard
 from tests.helpers import completion, config, run_record
+
+
+def attach_test_store(
+    service: ControllerService,
+    root: Path,
+    run,
+    *,
+    delivery: bool,
+) -> None:
+    if not hasattr(service, "store"):
+        service.store = ControllerStore(root / "bound-controller.db")
+    service.store.save_run(run)
+    if not delivery:
+        return
+    binding = DeliveryBinding(
+        mr_iid=2,
+        mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+        creator="controller-bot",
+        created_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        initial_head_sha="d" * 40,
+        claim_note_id=99,
+    )
+    service.store.bind_delivery(run.run_key, binding)
+
+    def validate_delivery_binding(current_run, current_binding):
+        try:
+            return service.gitlab.delivery_mr(
+                current_run,
+                current_binding.mr_iid,
+            )
+        except TypeError:
+            return service.gitlab.delivery_mr(current_run)
+
+    service.gitlab.validate_delivery_binding = validate_delivery_binding
 
 
 def task_record(
@@ -87,6 +124,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_blocked",
             assignee="coder",
             skills=["hollysys-implement", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
             resume_answer="use the approved interface",
             resumed_from_card_id="t_blocked",
         )
@@ -143,6 +183,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_tasks_review",
             assignee="coder",
             skills=["hollysys-implement", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         triage = task_record(
             task_id="t_blocked",
@@ -175,6 +218,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=triage.id,
             assignee="coder",
             skills=["hollysys-implement", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
             resume_answer="continue local implementation; preserve deployment gates",
             resumed_from_card_id=triage.id,
         )
@@ -287,13 +333,14 @@ class ServiceRecoveryTests(unittest.TestCase):
             created_at=1,
         )
         service = object.__new__(ControllerService)
-        service._run_protocol_version = lambda _: "hollysys-controller/v3"
+        service._run_protocol_version = lambda _: "hollysys-controller/v4"
         service._history = lambda _: ([HistoryItem(managed, root)], self.run)
         service.gitlab = type(
             "NoMergeRequest",
             (),
             {"delivery_mr": staticmethod(lambda run: None)},
         )()
+        attach_test_store(service, self.root, self.run, delivery=False)
         created: list[tuple[Stage, str]] = []
         service._create_work = lambda run, stage, parent: created.append(
             (stage, parent)
@@ -319,6 +366,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=root.id,
             assignee="spec-writer",
             skills=["hollysys-write-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         held = task_record(
             task_id="t_held",
@@ -354,7 +404,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             created_at=2,
         )
         service = object.__new__(ControllerService)
-        service._run_protocol_version = lambda _: "hollysys-controller/v3"
+        service._run_protocol_version = lambda _: "hollysys-controller/v4"
         service._history = lambda _: (
             [
                 HistoryItem(root_managed, root),
@@ -367,6 +417,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             (),
             {"delivery_mr": staticmethod(lambda run: None)},
         )()
+        attach_test_store(service, self.root, self.run, delivery=False)
         service.reader = type("Reader", (), {})()
         released: list[str] = []
         service.kanban = type(
@@ -388,6 +439,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_implement",
             assignee="tester",
             skills=["hollysys-test", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         metadata = completion(
             self.root,
@@ -423,7 +477,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         service = object.__new__(ControllerService)
         service.config = config(self.root)
-        service._run_protocol_version = lambda _: "hollysys-controller/v3"
+        service._run_protocol_version = lambda _: "hollysys-controller/v4"
         service._history = lambda _: ([HistoryItem(managed, task)], self.run)
         service.gitlab = type(
             "CurrentHead",
@@ -435,6 +489,7 @@ class ServiceRecoveryTests(unittest.TestCase):
                 ),
             },
         )()
+        attach_test_store(service, self.root, self.run, delivery=True)
         service._frozen_violation = lambda run, history, ref: None
         service._review_attempts_by_stage = lambda history: {}
         service._code_modification_count = lambda history: 0
@@ -458,6 +513,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_implement",
             assignee="tester",
             skills=["hollysys-test", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         test_metadata = completion(
             self.root,
@@ -499,6 +557,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=test_task.id,
             assignee="code-reviewer",
             skills=["hollysys-review-code", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         review_metadata = completion(
             self.root,
@@ -538,7 +599,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         ]
         service = object.__new__(ControllerService)
         service.config = config(self.root)
-        service._run_protocol_version = lambda _: "hollysys-controller/v3"
+        service._run_protocol_version = lambda _: "hollysys-controller/v4"
         service._history = lambda _: (history, self.run)
         service.gitlab = type(
             "CurrentHead",
@@ -550,6 +611,7 @@ class ServiceRecoveryTests(unittest.TestCase):
                 ),
             },
         )()
+        attach_test_store(service, self.root, self.run, delivery=True)
         service._frozen_violation = lambda run, history, ref: None
         service._review_attempts_by_stage = lambda history: {}
         service._code_modification_count = lambda history: 2
@@ -632,9 +694,65 @@ class ServiceRecoveryTests(unittest.TestCase):
         pending = service.store.pending_outbox()
         self.assertEqual(len(pending), 1)
         payload = json.loads(pending[0]["payload"])
-        self.assertIn("next_agent=spec-writer", payload["text"])
-        self.assertIn("finalization", payload["text"])
-        self.assertIn(self.run.origin.initiator_open_id, payload["text"])
+        self.assertEqual(payload["format"], "markdown")
+        self.assertIn("**下一位 Agent：** SPEC Writer", payload["content"])
+        self.assertIn("**审查轮次：** 3/3", payload["content"])
+        self.assertIn("finalization", payload["content"])
+        self.assertIn(self.run.origin.initiator_open_id, payload["content"])
+
+    def test_agent_completion_uses_friendly_markdown_and_runtime_attempt(
+        self,
+    ) -> None:
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "controller.db")
+        service.config = config(self.root)
+        task = task_record(
+            task_id="t_61010b84",
+            body="completed",
+            status="done",
+            assignee="tasker",
+        )
+        task = replace(task, created_at=1, completed_at=535)
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=Stage.TASKS_WRITE.value,
+            iteration=3,
+            idempotency_key="tasks-write-3",
+            parent_card_id="t_parent",
+            purpose="work",
+            created_at=1,
+        )
+        metadata = completion(
+            self.root,
+            Stage.TASKS_WRITE,
+            outcome="pass",
+        )
+
+        service._enqueue_agent_completed(
+            self.run,
+            HistoryItem(managed, task),
+            metadata,
+        )
+
+        pending = service.store.pending_outbox()
+        self.assertEqual(len(pending), 1)
+        payload = json.loads(pending[0]["payload"])
+        content = payload["content"]
+        self.assertEqual(payload["format"], "markdown")
+        self.assertIn("**✅ Tasker Agent 工作已完成**", content)
+        self.assertIn(
+            f"**任务 ID：** `{self.run.run_key}`",
+            content,
+        )
+        self.assertIn("**阶段：** tasks-write（拆分 TASKS）", content)
+        self.assertIn("**轮次：** 1/3", content)
+        self.assertIn("**Agent：** Tasker", content)
+        self.assertNotIn("**Agent：** Tester", content)
+        self.assertIn("**Card：** `t_61010b84`", content)
+        self.assertIn("**结论：** pass（通过）", content)
+        self.assertIn("**耗时：** 8分54秒", content)
 
     def test_code_gate_notification_aggregates_both_roles_and_modification(self) -> None:
         service = object.__new__(ControllerService)
@@ -665,10 +783,19 @@ class ServiceRecoveryTests(unittest.TestCase):
         pending = service.store.pending_outbox()
         self.assertEqual(len(pending), 1)
         payload = json.loads(pending[0]["payload"])
-        self.assertIn("tester=fail code-reviewer=fail", payload["text"])
-        self.assertIn("modification=3/5", payload["text"])
-        self.assertIn("[tester]", payload["text"])
-        self.assertIn("[code-reviewer]", payload["text"])
+        self.assertEqual(payload["format"], "markdown")
+        self.assertIn("**Tester：** fail（未通过）", payload["content"])
+        self.assertIn(
+            "**Code Reviewer：** fail（未通过）",
+            payload["content"],
+        )
+        self.assertIn("**修改轮次：** 3/5", payload["content"])
+        self.assertIn(
+            "[!2](https://gitlab.example.com/group/project/-/merge_requests/2)",
+            payload["content"],
+        )
+        self.assertIn("dashboard browser assertion failed", payload["content"])
+        self.assertIn("P&amp;ID redraws the full canvas", payload["content"])
 
     def test_skipped_test_notification_is_durable_and_idempotent(self) -> None:
         service = object.__new__(ControllerService)
@@ -691,9 +818,17 @@ class ServiceRecoveryTests(unittest.TestCase):
         pending = service.store.pending_outbox()
         self.assertEqual(len(pending), 1)
         payload = json.loads(pending[0]["payload"])
-        self.assertIn("结构化跳过", payload["text"])
-        self.assertIn("browser runtime unavailable", payload["text"])
-        self.assertIn("code-reviewer 将继续审查同一提交", payload["text"])
+        self.assertEqual(payload["format"], "markdown")
+        self.assertIn("结构化跳过", payload["content"])
+        self.assertIn("browser runtime unavailable", payload["content"])
+        self.assertIn(
+            "Code Reviewer 将继续审查同一提交",
+            payload["content"],
+        )
+        self.assertIn(
+            "[!2](https://gitlab.example.com/group/project/-/merge_requests/2)",
+            payload["content"],
+        )
 
     def test_code_modification_count_excludes_initial_implementation(self) -> None:
         history: list[HistoryItem] = []
@@ -710,6 +845,9 @@ class ServiceRecoveryTests(unittest.TestCase):
                 parent_card_id=parent,
                 assignee="coder",
                 skills=["hollysys-implement", "glab"],
+                context_digest="e" * 64,
+                expected_head_sha=self.run.workspace.repository_base_sha,
+                scratch_dir="/opt/data/scratch/test-attempt",
             )
             metadata = completion(
                 self.root,
@@ -743,6 +881,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent = card_id
 
         service = object.__new__(ControllerService)
+        service._validate_completion_context = lambda *args: None
         self.assertEqual(service._code_modification_count(history), 5)
 
     def test_completion_repository_evidence_must_match_run_base(self) -> None:
@@ -754,6 +893,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_tasks",
             assignee="coder",
             skills=["hollysys-implement", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         metadata = completion(
             self.root,
@@ -786,6 +928,16 @@ class ServiceRecoveryTests(unittest.TestCase):
             created_at=1,
         )
         service = object.__new__(ControllerService)
+        service.gitlab = type(
+            "CurrentHead",
+            (),
+            {
+                "delivery_mr": staticmethod(
+                    lambda run, mr_iid=None: {"iid": 2, "sha": "d" * 40}
+                )
+            },
+        )()
+        attach_test_store(service, self.root, self.run, delivery=True)
         with self.assertRaisesRegex(
             ValueError, "not bound to the run base commit"
         ):
@@ -839,9 +991,12 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["event"], "human-block")
         payload = json.loads(pending[0]["payload"])
-        self.assertIn("stage=test agent=tester card=t_blocked", payload["text"])
-        self.assertIn("为 tester 授予测试环境只读权限", payload["text"])
-        self.assertIn(self.run.origin.initiator_open_id, payload["text"])
+        self.assertEqual(payload["format"], "markdown")
+        self.assertIn("**阶段：** test（测试）", payload["content"])
+        self.assertIn("**Agent：** Tester", payload["content"])
+        self.assertIn("**Card：** `t_blocked`", payload["content"])
+        self.assertIn("为 tester 授予测试环境只读权限", payload["content"])
+        self.assertIn(self.run.origin.initiator_open_id, payload["content"])
 
     def test_business_ambiguity_block_is_rejected_and_released(self) -> None:
         root = task_record(
@@ -859,6 +1014,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=root.id,
             assignee="planner",
             skills=["hollysys-write-plan", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         blocked = task_record(
             task_id="t_blocked",
@@ -907,7 +1065,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             created_at=2,
         )
         service = object.__new__(ControllerService)
-        service._run_protocol_version = lambda _: "hollysys-controller/v3"
+        service._run_protocol_version = lambda _: "hollysys-controller/v4"
         service._history = lambda _: (
             [
                 HistoryItem(root_managed, root),
@@ -920,6 +1078,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             (),
             {"delivery_mr": staticmethod(lambda run: None)},
         )()
+        attach_test_store(service, self.root, self.run, delivery=False)
         comments: list[str] = []
         released: list[str] = []
         service.kanban = type(
@@ -934,11 +1093,16 @@ class ServiceRecoveryTests(unittest.TestCase):
                 ),
             },
         )()
+        exceptions: list[str] = []
+        service._exception = lambda run, card_id, reason: exceptions.append(
+            reason
+        )
 
         service.reconcile_run(self.run.run_key)
 
-        self.assertEqual(released, ["t_blocked"])
-        self.assertIn("[controller-block-rejected:v3]", comments[0])
+        self.assertEqual(released, [])
+        self.assertIn("[controller-block-rejected:v4]", comments[0])
+        self.assertIn("unsupported human block", exceptions[0])
 
     def test_finalization_freezes_reconstructable_baseline(self) -> None:
         root_task = task_record(
@@ -973,6 +1137,9 @@ class ServiceRecoveryTests(unittest.TestCase):
                 parent_card_id=prior_parent,
                 assignee="spec-reviewer",
                 skills=["hollysys-review-spec", "glab"],
+                context_digest="e" * 64,
+                expected_head_sha=self.run.workspace.repository_base_sha,
+                scratch_dir="/opt/data/scratch/test-attempt",
             )
             prior_metadata = completion(
                 self.root,
@@ -1026,6 +1193,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=prior_parent,
             assignee="spec-reviewer",
             skills=["hollysys-review-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         review_metadata = completion(
             self.root,
@@ -1080,6 +1250,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=review_task.id,
             assignee="spec-writer",
             skills=["hollysys-write-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
             repair_context=repair_context,
         )
         final_metadata = completion(
@@ -1140,6 +1313,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         ]
         service = object.__new__(ControllerService)
         service.config = config(self.root)
+        service._validate_completion_context = lambda *args: None
 
         service._validate_finalization_context(
             history, history[-1], final_metadata
@@ -1194,6 +1368,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=root.id,
             assignee="spec-reviewer",
             skills=["hollysys-review-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         review_metadata = completion(
             self.root,
@@ -1235,6 +1412,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=review_task.id,
             assignee="planner",
             skills=["hollysys-write-plan", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         plan_task = task_record(
             task_id="t_plan",
@@ -1265,7 +1445,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         service = object.__new__(ControllerService)
         service._lock = threading.RLock()
         service.config = config(self.root)
-        service._run_protocol_version = lambda _: "hollysys-controller/v3"
+        service._run_protocol_version = lambda _: "hollysys-controller/v4"
         service._history = lambda _: (history, self.run)
         service.gitlab = type(
             "StatusGitLab",
@@ -1294,6 +1474,7 @@ class ServiceRecoveryTests(unittest.TestCase):
                 ),
             },
         )()
+        attach_test_store(service, self.root, self.run, delivery=True)
 
         status = service.status(self.run.run_key)
 
@@ -1405,6 +1586,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_root",
             assignee="spec-writer",
             skills=["hollysys-write-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         task = task_record(
             task_id="t_invalid",
@@ -1415,7 +1599,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             tenant=self.run.run_key,
             skills=card.skills,
             parents=[card.parent_card_id],
-            comments=[{"body": "[controller-protocol-error:v3]\nreason: bad metadata"}],
+            comments=[{"body": "[controller-protocol-error:v4]\nreason: bad metadata"}],
         )
         managed = ManagedCard(
             board=self.run.workspace.board,
@@ -1472,6 +1656,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_root",
             assignee="spec-reviewer",
             skills=["hollysys-review-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         metadata = completion(
             self.root,
@@ -1553,6 +1740,9 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id="t_root",
             assignee="coder",
             skills=["hollysys-implement", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
         )
         task = task_record(
             task_id="t_work",
@@ -1597,13 +1787,14 @@ class ServiceRecoveryTests(unittest.TestCase):
             (),
             {
                 "abort_delivery": staticmethod(
-                    lambda run, requested_by, reason: {
+                    lambda run, mr_iid, requested_by, reason: {
                         "state": "closed",
                         "web_url": "https://gitlab.example/mr/2",
                     }
                 )
             },
         )()
+        attach_test_store(service, self.root, self.run, delivery=True)
         service.flush_outbox = lambda: calls.append(("flush",))
         service.last_reconcile_error = None
 
@@ -1882,6 +2073,7 @@ class ServiceRecoveryTests(unittest.TestCase):
                 ),
             },
         )()
+        attach_test_store(service, self.root, self.run, delivery=True)
         redispatched: list[str] = []
         service.kanban = type(
             "WatchdogKanban",
@@ -1901,7 +2093,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             "mr_head_mismatch",
             service.store.pending_outbox()[0]["payload"],
         )
-        live_mr[0] = None
+        live_mr[0] = {"iid": 2, "sha": "d" * 40}
         service._enqueue_stale_worker_notices()
 
         self.assertEqual(redispatched, [task.id])
@@ -1930,6 +2122,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         service = object.__new__(ControllerService)
         service.store = ControllerStore(self.root / "notify-controller.db")
+        service.store.save_run(self.run)
         service.config = config(self.root).model_copy(
             update={"notification_level": NotificationLevel.VERBOSE}
         )
@@ -1959,6 +2152,17 @@ class ServiceRecoveryTests(unittest.TestCase):
             payload={},
             created_at=9,
         )
+        service.store.add_managed_card(
+            board=managed.board,
+            card_id=managed.card_id,
+            run_key=managed.run_key,
+            stage=managed.stage,
+            iteration=managed.iteration,
+            idempotency_key=managed.idempotency_key,
+            parent_card_id=managed.parent_card_id,
+            purpose=managed.purpose,
+            created_at=managed.created_at,
+        )
 
         service._record_agent_lifecycle_event(managed, event)
         pending = service.store.pending_outbox()
@@ -1974,6 +2178,17 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent_card_id=task.id,
             purpose="work",
             created_at=2,
+        )
+        service.store.add_managed_card(
+            board=second_managed.board,
+            card_id=second_managed.card_id,
+            run_key=second_managed.run_key,
+            stage=second_managed.stage,
+            iteration=second_managed.iteration,
+            idempotency_key=second_managed.idempotency_key,
+            parent_card_id=second_managed.parent_card_id,
+            purpose=second_managed.purpose,
+            created_at=second_managed.created_at,
         )
         service._record_agent_lifecycle_event(
             second_managed,

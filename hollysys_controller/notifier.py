@@ -7,6 +7,7 @@ import subprocess
 
 from .config import ControllerConfig
 from .kanban import CommandError
+from .messages import MessageFormat
 from .models import FeishuOrigin
 
 
@@ -14,7 +15,15 @@ class LarkNotifier:
     def __init__(self, config: ControllerConfig):
         self.config = config
 
-    def send(self, key: str, origin: FeishuOrigin, text: str) -> dict:
+    def send(
+        self,
+        key: str,
+        origin: FeishuOrigin,
+        content: str,
+        message_format: MessageFormat = "markdown",
+    ) -> dict:
+        if message_format not in {"text", "markdown"}:
+            raise ValueError(f"unsupported Feishu message format: {message_format}")
         env = os.environ.copy()
         env.update(
             {
@@ -35,8 +44,8 @@ class LarkNotifier:
             "+messages-reply",
             "--message-id",
             origin.message_id,
-            "--text",
-            text,
+            f"--{message_format}",
+            content,
             "--as",
             "bot",
             "--idempotency-key",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -25,6 +26,13 @@ class RpcServer:
         self.server = await asyncio.start_unix_server(
             self._handle_connection, path=str(self.socket_path)
         )
+        if os.geteuid() == 0:
+            try:
+                socket_uid = int(os.environ.get("PUID", "1000"))
+                socket_gid = int(os.environ.get("PGID", "1000"))
+            except ValueError as exc:
+                raise ValueError("PUID and PGID must be numeric") from exc
+            os.chown(self.socket_path, socket_uid, socket_gid)
         self.socket_path.chmod(0o660)
 
     async def close(self) -> None:

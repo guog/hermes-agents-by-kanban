@@ -4,8 +4,12 @@
 
 <!-- HOLLYSYS-RUN:BEGIN -->
 ```yaml
-protocol_version: hollysys-controller/v3
+protocol_version: hollysys-controller/v4
 run_key: <run_key>
+source_key: <source_key>
+run_generation: <run_generation>
+started_at: <RFC3339-with-timezone>
+provenance: fresh_v4
 project_id: <gitlab-project-id>
 project_path: <group/project>
 project_display_name: <display-name>
@@ -30,6 +34,10 @@ gates:
   tasks_digest: <sha256-or-null>
 ```
 <!-- HOLLYSYS-RUN:END -->
+
+本 MR 由独立 Hollysys Controller 身份在首次受控 SPEC push 后创建并绑定。Agent
+不得创建、发现、选择或切换 MR；run-claim note 与 creator/created_at/initial head
+必须和 Controller 持久 Delivery binding 一致。
 
 ## 现有 MES 基线与定制方式
 

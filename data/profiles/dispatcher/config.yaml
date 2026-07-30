@@ -5,6 +5,10 @@ model:
   base_url: https://chatgpt.com/backend-api/codex
 agent:
   reasoning_effort: high
+tool_output:
+  max_bytes: 12000
+  max_lines: 400
+  max_line_length: 1000
 toolsets: [terminal, file]
 platform_toolsets:
   feishu: [terminal, file]
@@ -25,6 +29,10 @@ terminal:
     - LARKSUITE_CLI_NO_UPDATE_NOTIFIER
     - LARKSUITE_CLI_NO_SKILLS_NOTIFIER
     - HOLLYSYS_CONTROLLER_SOCKET
+    - HERMES_SCRATCH_DIR
+    - NPM_CONFIG_OFFLINE
+    - NPM_CONFIG_CACHE
+    - NUGET_PACKAGES
 
 approvals:
   mode: off

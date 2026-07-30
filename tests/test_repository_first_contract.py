@@ -19,10 +19,11 @@ class RepositoryFirstContractTests(unittest.TestCase):
                 text = (ROOT / relative).read_text(encoding="utf-8")
                 self.assertIn("repository_base_sha", text)
                 self.assertIn("repository_evidence", text)
-                self.assertIn("现有", text)
-                self.assertIn("run.workspace.checkout", text)
-                self.assertIn("当前卡片 iteration", text)
-                self.assertIn("git cat-file -e", text)
+                self.assertTrue("现有" in text or "已有" in text)
+                self.assertIn("card-context", text)
+                self.assertIn("completion-template", text)
+                self.assertIn("validate-completion", text)
+                self.assertNotIn("kanban_show()", text)
 
     def test_reviewers_reject_greenfield_assumptions(self) -> None:
         skills = (
@@ -57,6 +58,27 @@ class RepositoryFirstContractTests(unittest.TestCase):
         )
         self.assertNotIn("建立本功能所需的最小项目结构", tasks)
         self.assertIn("reuse|modify|extend|create", tasks)
+
+    def test_feishu_human_messages_use_the_friendly_markdown_contract(
+        self,
+    ) -> None:
+        template = (ROOT / "templates/feishu-messages.md").read_text(
+            encoding="utf-8"
+        )
+        dispatcher = (
+            ROOT
+            / "data/profiles/dispatcher/skills/"
+            "hollysys-dispatch-kanban/SKILL.md"
+        ).read_text(encoding="utf-8")
+        for text in (template, dispatcher):
+            with self.subTest(document=text[:40]):
+                self.assertIn("飞书 Markdown", text)
+                self.assertIn("**任务 ID：**", text)
+                self.assertTrue("Stage" in text or "**阶段：**" in text)
+                self.assertIn("Agent", text)
+                self.assertIn("原", text)
+        self.assertIn("1 + worker_redispatch_limit", template)
+        self.assertIn("不回复 `run=... stage=...`", dispatcher)
 
 
 if __name__ == "__main__":

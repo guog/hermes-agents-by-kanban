@@ -85,6 +85,29 @@ def build_parser() -> argparse.ArgumentParser:
     validate_completion.add_argument("--card-id", required=True)
     validate_completion.add_argument("--metadata", required=True, type=Path)
 
+    publish_delivery = sub.add_parser("publish-delivery")
+    publish_delivery.add_argument("--card-id", required=True)
+    publish_delivery.add_argument("--head-sha", required=True)
+    publish_delivery.add_argument(
+        "--description-file",
+        required=True,
+        type=Path,
+    )
+
+    card_context = sub.add_parser("card-context")
+    card_context.add_argument("--card-id", required=True)
+
+    completion_template = sub.add_parser("completion-template")
+    completion_template.add_argument("--card-id", required=True)
+    completion_template.add_argument(
+        "--outcome",
+        required=True,
+        choices=["pass", "fail", "cancelled"],
+    )
+
+    validate_artifact = sub.add_parser("validate-artifact")
+    validate_artifact.add_argument("--card-id", required=True)
+
     preflight = sub.add_parser("preflight")
     preflight.add_argument(
         "--deep",
@@ -119,6 +142,13 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
         values["metadata"] = json.loads(
             metadata_path.read_text(encoding="utf-8")
         )
+    elif method == "publish-delivery":
+        description_path = values.pop("description_file")
+        if not description_path.is_file():
+            raise ValueError(
+                f"description file does not exist: {description_path}"
+            )
+        values["description"] = description_path.read_text(encoding="utf-8")
     return method, {key: value for key, value in values.items() if value is not None}
 
 
