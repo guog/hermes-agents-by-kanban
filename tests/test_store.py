@@ -241,7 +241,8 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(runtime["worker_started_at"], 100)
         self.assertEqual(runtime["worker_session_id"], "session-1")
         self.assertEqual(runtime["last_heartbeat_at"], 200)
-        self.assertEqual(runtime["deadline_at"], 800)
+        # Heartbeats refresh liveness only; they do not extend progress.
+        self.assertEqual(runtime["deadline_at"], 700)
 
 
 if __name__ == "__main__":

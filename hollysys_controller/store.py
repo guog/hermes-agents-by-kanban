@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import ControllerFatalError
+from .models import DeliveryBinding, RunRecord
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TERMINAL_RUN_STATES = {
     "completed",
     "aborted",
@@ -19,6 +20,9 @@ TERMINAL_RUN_STATES = {
 }
 RUN_STATES = {
     "active",
+    "transition_pending",
+    "human_blocked",
+    "retry_wait",
     "dependency_degraded",
     "merge_wait",
     "abort_requested",
@@ -35,6 +39,31 @@ CREATE TABLE IF NOT EXISTS event_cursor (
     board TEXT PRIMARY KEY,
     event_id INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_key TEXT PRIMARY KEY,
+    source_key TEXT NOT NULL,
+    run_generation TEXT NOT NULL UNIQUE,
+    started_at TEXT NOT NULL,
+    provenance TEXT NOT NULL CHECK(provenance = 'fresh_v4'),
+    record_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runs_source
+    ON runs(source_key, created_at, run_key);
+
+CREATE TABLE IF NOT EXISTS delivery_bindings (
+    run_key TEXT PRIMARY KEY,
+    mr_iid INTEGER NOT NULL UNIQUE,
+    mr_url TEXT NOT NULL,
+    creator TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    initial_head_sha TEXT NOT NULL,
+    claim_note_id INTEGER NOT NULL,
+    binding_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(run_key) REFERENCES runs(run_key)
 );
 
 CREATE TABLE IF NOT EXISTS managed_cards (
@@ -76,6 +105,83 @@ CREATE TABLE IF NOT EXISTS card_runtime (
     terminal_reason TEXT,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (board, card_id)
+);
+
+CREATE TABLE IF NOT EXISTS card_attempts (
+    run_id TEXT PRIMARY KEY,
+    board TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    run_key TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    profile TEXT,
+    dispatch_key TEXT,
+    worker_pid INTEGER,
+    worker_session_id TEXT,
+    started_at INTEGER,
+    blocked_at INTEGER,
+    completion_at INTEGER,
+    exited_at INTEGER,
+    last_heartbeat_at INTEGER,
+    last_progress_at INTEGER,
+    status TEXT NOT NULL,
+    terminal_reason TEXT,
+    recovery_reason TEXT,
+    redispatched_from_run_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(board, card_id, attempt),
+    FOREIGN KEY(run_key) REFERENCES runs(run_key)
+);
+CREATE INDEX IF NOT EXISTS idx_card_attempts_card
+    ON card_attempts(board, card_id, attempt);
+CREATE INDEX IF NOT EXISTS idx_card_attempts_run
+    ON card_attempts(run_key, created_at, run_id);
+
+CREATE TABLE IF NOT EXISTS reconcile_intents (
+    intent_id TEXT PRIMARY KEY,
+    run_key TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    event_id INTEGER,
+    lease_owner TEXT,
+    lease_until INTEGER,
+    current_step TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 1,
+    leased_revision INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(run_key) REFERENCES runs(run_key)
+);
+CREATE INDEX IF NOT EXISTS idx_reconcile_pending
+    ON reconcile_intents(status, lease_until, created_at);
+
+CREATE TABLE IF NOT EXISTS validation_runs (
+    validation_id TEXT PRIMARY KEY,
+    run_key TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    validator TEXT NOT NULL,
+    validator_version TEXT NOT NULL,
+    input_digest TEXT NOT NULL,
+    result_digest TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    error_codes TEXT NOT NULL,
+    timing_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(run_key) REFERENCES runs(run_key)
+);
+CREATE INDEX IF NOT EXISTS idx_validation_card
+    ON validation_runs(run_key, card_id, created_at);
+
+CREATE TABLE IF NOT EXISTS attempt_metrics (
+    run_id TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    summary TEXT,
+    recorded_at INTEGER NOT NULL,
+    PRIMARY KEY(run_id, metric),
+    FOREIGN KEY(run_id) REFERENCES card_attempts(run_id)
 );
 
 CREATE TABLE IF NOT EXISTS requests (
@@ -226,6 +332,7 @@ CREATE TABLE IF NOT EXISTS profile_preflight (
     remote_protocol TEXT,
     error_code TEXT,
     deep INTEGER NOT NULL,
+    wrapper_checked_at INTEGER,
     checked_at INTEGER NOT NULL
 );
 
@@ -237,7 +344,7 @@ CREATE TABLE IF NOT EXISTS deployment_preflight (
     checked_at INTEGER NOT NULL
 );
 
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 """
 
 
@@ -284,7 +391,7 @@ class ControllerStore:
             if version != SCHEMA_VERSION:
                 raise ControllerFatalError(
                     f"unsupported_controller_schema:{version}; "
-                    f"expected:{SCHEMA_VERSION}; fresh v3 state is required"
+                    f"expected:{SCHEMA_VERSION}; fresh v4 state is required"
                 )
             result = str(conn.execute("PRAGMA quick_check").fetchone()[0])
             if result != "ok":
@@ -292,6 +399,59 @@ class ControllerStore:
                     f"controller_store_quick_check_failed:{result}"
                 )
             required_columns = {
+                "runs": {
+                    "run_key",
+                    "source_key",
+                    "run_generation",
+                    "started_at",
+                    "provenance",
+                    "record_json",
+                },
+                "delivery_bindings": {
+                    "run_key",
+                    "mr_iid",
+                    "creator",
+                    "initial_head_sha",
+                    "claim_note_id",
+                    "binding_json",
+                },
+                "card_attempts": {
+                    "run_id",
+                    "card_id",
+                    "run_key",
+                    "attempt",
+                    "worker_pid",
+                    "worker_session_id",
+                    "last_heartbeat_at",
+                    "last_progress_at",
+                    "status",
+                    "redispatched_from_run_id",
+                },
+                "reconcile_intents": {
+                    "intent_id",
+                    "run_key",
+                    "status",
+                    "lease_owner",
+                    "lease_until",
+                    "current_step",
+                    "attempts",
+                    "revision",
+                    "leased_revision",
+                },
+                "validation_runs": {
+                    "validation_id",
+                    "run_key",
+                    "card_id",
+                    "validator_version",
+                    "input_digest",
+                    "result_digest",
+                    "timing_json",
+                },
+                "attempt_metrics": {
+                    "run_id",
+                    "metric",
+                    "duration_ms",
+                },
                 "run_control": {
                     "state",
                     "state_version",
@@ -363,6 +523,7 @@ class ControllerStore:
                     "https_username_ok",
                     "error_code",
                     "deep",
+                    "wrapper_checked_at",
                     "checked_at",
                 },
                 "deployment_preflight": {
@@ -385,7 +546,8 @@ class ControllerStore:
                 "unknown_run_state": """
                     SELECT 1 FROM run_control
                     WHERE state NOT IN (
-                        'active', 'dependency_degraded', 'merge_wait',
+                        'active', 'transition_pending', 'human_blocked',
+                        'retry_wait', 'dependency_degraded', 'merge_wait',
                         'abort_requested', 'aborting', 'exception',
                         'completed', 'aborted', 'completed_before_abort'
                     ) LIMIT 1
@@ -409,11 +571,13 @@ class ControllerStore:
                 "retry_schedule_mismatch": """
                     SELECT 1 FROM run_control
                     WHERE (
-                        state IN ('dependency_degraded', 'merge_wait')
+                        state IN (
+                            'dependency_degraded', 'merge_wait', 'retry_wait'
+                        )
                         AND next_retry_at IS NULL
                     ) OR (
                         state NOT IN (
-                            'dependency_degraded', 'merge_wait',
+                            'dependency_degraded', 'merge_wait', 'retry_wait',
                             'abort_requested', 'aborting'
                         )
                         AND next_retry_at IS NOT NULL
@@ -522,6 +686,420 @@ class ControllerStore:
                 (board, event_id, now),
             )
 
+    def save_run(self, run: RunRecord) -> None:
+        now = int(time.time())
+        payload = run.model_dump_json()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT record_json FROM runs WHERE run_key=?",
+                (run.run_key,),
+            ).fetchone()
+            if existing is not None:
+                persisted = RunRecord.model_validate_json(existing["record_json"])
+                if persisted != run:
+                    raise ControllerFatalError(
+                        f"run_identity_conflict:{run.run_key}"
+                    )
+                return
+            conn.execute(
+                """
+                INSERT INTO runs(
+                    run_key, source_key, run_generation, started_at,
+                    provenance, record_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.run_key,
+                    run.source_key,
+                    run.run_generation,
+                    run.started_at.isoformat(),
+                    run.provenance,
+                    payload,
+                    now,
+                ),
+            )
+
+    def run_record(self, run_key: str) -> RunRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT record_json FROM runs WHERE run_key=?",
+                (run_key,),
+            ).fetchone()
+        return (
+            RunRecord.model_validate_json(row["record_json"])
+            if row is not None
+            else None
+        )
+
+    def runs_for_source(self, source_key: str) -> list[RunRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT record_json FROM runs
+                WHERE source_key=? ORDER BY created_at, run_key
+                """,
+                (source_key,),
+            ).fetchall()
+        return [
+            RunRecord.model_validate_json(row["record_json"])
+            for row in rows
+        ]
+
+    def bind_delivery(
+        self,
+        run_key: str,
+        binding: DeliveryBinding,
+    ) -> None:
+        if self.run_record(run_key) is None:
+            raise ValueError(f"unknown_run:{run_key}")
+        now = int(time.time())
+        payload = binding.model_dump_json()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT binding_json FROM delivery_bindings WHERE run_key=?",
+                (run_key,),
+            ).fetchone()
+            if existing is not None:
+                persisted = DeliveryBinding.model_validate_json(
+                    existing["binding_json"]
+                )
+                if persisted != binding:
+                    raise ControllerFatalError(
+                        f"delivery_binding_conflict:{run_key}"
+                    )
+                return
+            conn.execute(
+                """
+                INSERT INTO delivery_bindings(
+                    run_key, mr_iid, mr_url, creator, created_at,
+                    initial_head_sha, claim_note_id, binding_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_key,
+                    binding.mr_iid,
+                    str(binding.mr_url),
+                    binding.creator,
+                    binding.created_at.isoformat(),
+                    binding.initial_head_sha,
+                    binding.claim_note_id,
+                    payload,
+                    now,
+                ),
+            )
+
+    def delivery_binding(self, run_key: str) -> DeliveryBinding | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT binding_json FROM delivery_bindings WHERE run_key=?",
+                (run_key,),
+            ).fetchone()
+        return (
+            DeliveryBinding.model_validate_json(row["binding_json"])
+            if row is not None
+            else None
+        )
+
+    def enqueue_reconcile(
+        self,
+        run_key: str,
+        *,
+        reason: str,
+        event_id: int | None = None,
+    ) -> str:
+        if self.run_record(run_key) is None:
+            raise ValueError(f"unknown_run:{run_key}")
+        now = int(time.time())
+        intent_id = uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO reconcile_intents(
+                    intent_id, run_key, reason, status, event_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(run_key) DO UPDATE SET
+                    reason=excluded.reason,
+                    event_id=MAX(
+                        COALESCE(reconcile_intents.event_id, 0),
+                        COALESCE(excluded.event_id, 0)
+                    ),
+                    status=CASE
+                        WHEN reconcile_intents.status='leased'
+                        THEN 'leased' ELSE 'pending'
+                    END,
+                    revision=reconcile_intents.revision+1,
+                    updated_at=excluded.updated_at
+                """,
+                (intent_id, run_key, reason[:1000], event_id, now, now),
+            )
+            row = conn.execute(
+                "SELECT intent_id FROM reconcile_intents WHERE run_key=?",
+                (run_key,),
+            ).fetchone()
+        return str(row["intent_id"])
+
+    def claim_reconcile(
+        self,
+        *,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> dict | None:
+        now = int(time.time())
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM reconcile_intents
+                WHERE status='pending'
+                   OR (status='leased' AND lease_until < ?)
+                ORDER BY created_at, intent_id
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if row is None:
+                return None
+            changed = conn.execute(
+                """
+                UPDATE reconcile_intents
+                SET status='leased', lease_owner=?, lease_until=?,
+                    leased_revision=revision, attempts=attempts+1,
+                    current_step='claimed', updated_at=?
+                WHERE intent_id=?
+                  AND (
+                    status='pending'
+                    OR (status='leased' AND lease_until < ?)
+                  )
+                """,
+                (
+                    lease_owner,
+                    now + lease_seconds,
+                    now,
+                    row["intent_id"],
+                    now,
+                ),
+            )
+            if changed.rowcount != 1:
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM reconcile_intents WHERE intent_id=?",
+                (row["intent_id"],),
+            ).fetchone()
+        return dict(claimed)
+
+    def update_reconcile_step(
+        self,
+        intent_id: str,
+        *,
+        lease_owner: str,
+        step: str,
+        lease_seconds: int,
+    ) -> None:
+        now = int(time.time())
+        with self.connect() as conn:
+            changed = conn.execute(
+                """
+                UPDATE reconcile_intents
+                SET current_step=?, lease_until=?, updated_at=?
+                WHERE intent_id=? AND status='leased' AND lease_owner=?
+                """,
+                (
+                    step[:200],
+                    now + lease_seconds,
+                    now,
+                    intent_id,
+                    lease_owner,
+                ),
+            )
+        if changed.rowcount != 1:
+            raise ValueError(f"reconcile_lease_lost:{intent_id}")
+
+    def finish_reconcile(
+        self,
+        intent_id: str,
+        *,
+        lease_owner: str,
+        error: str | None = None,
+    ) -> None:
+        now = int(time.time())
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT revision, leased_revision FROM reconcile_intents
+                WHERE intent_id=? AND status='leased' AND lease_owner=?
+                """,
+                (intent_id, lease_owner),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"reconcile_lease_lost:{intent_id}")
+            rerun = int(row["revision"]) != int(row["leased_revision"])
+            conn.execute(
+                """
+                UPDATE reconcile_intents
+                SET status=?, lease_owner=NULL, lease_until=NULL,
+                    current_step=NULL, last_error=?, updated_at=?
+                WHERE intent_id=?
+                """,
+                (
+                    "pending" if rerun or error else "done",
+                    error[:1000] if error else None,
+                    now,
+                    intent_id,
+                ),
+            )
+
+    def reconcile_intents(self, run_key: str | None = None) -> list[dict]:
+        with self.connect() as conn:
+            if run_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM reconcile_intents
+                    WHERE status != 'done'
+                    ORDER BY created_at, intent_id
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM reconcile_intents
+                    WHERE run_key=? AND status != 'done'
+                    ORDER BY created_at, intent_id
+                    """,
+                    (run_key,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_validation(
+        self,
+        *,
+        run_key: str,
+        card_id: str,
+        validator: str,
+        validator_version: str,
+        input_digest: str,
+        result_digest: str,
+        passed: bool,
+        error_codes: list[str],
+        timing: dict[str, int],
+    ) -> str:
+        validation_id = uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO validation_runs(
+                    validation_id, run_key, card_id, validator,
+                    validator_version, input_digest, result_digest, passed,
+                    error_codes, timing_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    validation_id,
+                    run_key,
+                    card_id,
+                    validator,
+                    validator_version,
+                    input_digest,
+                    result_digest,
+                    int(passed),
+                    json.dumps(error_codes, separators=(",", ":")),
+                    json.dumps(timing, sort_keys=True, separators=(",", ":")),
+                    int(time.time()),
+                ),
+            )
+        return validation_id
+
+    def validation_runs(
+        self,
+        run_key: str,
+        *,
+        card_id: str | None = None,
+    ) -> list[dict]:
+        with self.connect() as conn:
+            if card_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM validation_runs
+                    WHERE run_key=? ORDER BY created_at, validation_id
+                    """,
+                    (run_key,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM validation_runs
+                    WHERE run_key=? AND card_id=?
+                    ORDER BY created_at, validation_id
+                    """,
+                    (run_key, card_id),
+                ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["passed"] = bool(item["passed"])
+            item["error_codes"] = json.loads(item["error_codes"])
+            item["timing"] = json.loads(item.pop("timing_json"))
+            results.append(item)
+        return results
+
+    def record_attempt_metric(
+        self,
+        run_id: str,
+        *,
+        metric: str,
+        duration_ms: int,
+        summary: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO attempt_metrics(
+                    run_id, metric, duration_ms, summary, recorded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, metric) DO UPDATE SET
+                    duration_ms=excluded.duration_ms,
+                    summary=excluded.summary,
+                    recorded_at=excluded.recorded_at
+                """,
+                (
+                    run_id,
+                    metric,
+                    duration_ms,
+                    summary[:500] if summary else None,
+                    int(time.time()),
+                ),
+            )
+
+    def attempts_for_run(self, run_key: str) -> list[dict]:
+        with self.connect() as conn:
+            attempts = conn.execute(
+                """
+                SELECT * FROM card_attempts
+                WHERE run_key=? ORDER BY created_at, run_id
+                """,
+                (run_key,),
+            ).fetchall()
+            metrics = conn.execute(
+                """
+                SELECT metrics.* FROM attempt_metrics AS metrics
+                JOIN card_attempts AS attempts
+                  ON attempts.run_id=metrics.run_id
+                WHERE attempts.run_key=?
+                ORDER BY metrics.run_id, metrics.metric
+                """,
+                (run_key,),
+            ).fetchall()
+        by_run_id: dict[str, list[dict]] = {}
+        for row in metrics:
+            item = dict(row)
+            by_run_id.setdefault(str(item.pop("run_id")), []).append(item)
+        results = []
+        for row in attempts:
+            item = dict(row)
+            item["metrics"] = by_run_id.get(str(item["run_id"]), [])
+            results.append(item)
+        return results
+
     def add_managed_card(
         self,
         *,
@@ -592,10 +1170,11 @@ class ControllerStore:
         worker_session_id: str | None,
         worker_pid: int | None = None,
         lease_seconds: int,
+        run_id: str | None = None,
     ) -> None:
         started = kind in {"claimed", "started", "worker_started"}
         heartbeat = kind in {"heartbeat", "worker_heartbeat"}
-        progress = started or heartbeat or kind in {
+        progress = started or kind in {
             "progress",
             "completed",
             "blocked",
@@ -613,6 +1192,137 @@ class ControllerStore:
             "spawn_auto_blocked",
         }
         with self.connect() as conn:
+            if run_id:
+                managed = conn.execute(
+                    """
+                    SELECT run_key FROM managed_cards
+                    WHERE board=? AND card_id=?
+                    """,
+                    (board, card_id),
+                ).fetchone()
+                if managed is None:
+                    raise ValueError(f"unknown_managed_card:{board}:{card_id}")
+                attempt_row = conn.execute(
+                    "SELECT * FROM card_attempts WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if attempt_row is not None and (
+                    attempt_row["board"] != board
+                    or attempt_row["card_id"] != card_id
+                    or attempt_row["run_key"] != managed["run_key"]
+                ):
+                    raise ControllerFatalError(
+                        f"attempt_run_id_conflict:{run_id}"
+                    )
+                if attempt_row is None:
+                    next_attempt = int(
+                        conn.execute(
+                            """
+                            SELECT COALESCE(MAX(attempt), 0) + 1
+                            FROM card_attempts
+                            WHERE board=? AND card_id=?
+                            """,
+                            (board, card_id),
+                        ).fetchone()[0]
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO card_attempts(
+                            run_id, board, card_id, run_key, attempt,
+                            worker_pid, worker_session_id, started_at,
+                            blocked_at, completion_at, exited_at,
+                            last_heartbeat_at, last_progress_at, status,
+                            terminal_reason, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            board,
+                            card_id,
+                            managed["run_key"],
+                            next_attempt,
+                            worker_pid,
+                            worker_session_id,
+                            created_at if started else None,
+                            created_at if kind == "blocked" else None,
+                            created_at if kind == "completed" else None,
+                            created_at if kind == "worker_exited" else None,
+                            created_at if heartbeat else None,
+                            created_at if progress else None,
+                            (
+                                "exited"
+                                if kind == "worker_exited"
+                                else "blocked"
+                                if kind == "blocked"
+                                else "completion_recorded"
+                                if kind == "completed"
+                                else "running"
+                            ),
+                            kind if terminal else None,
+                            created_at,
+                            int(time.time()),
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE card_attempts
+                        SET worker_pid=COALESCE(?, worker_pid),
+                            worker_session_id=COALESCE(?, worker_session_id),
+                            started_at=COALESCE(
+                                started_at, CASE WHEN ? THEN ? END
+                            ),
+                            blocked_at=COALESCE(
+                                blocked_at, CASE WHEN ?='blocked' THEN ? END
+                            ),
+                            completion_at=COALESCE(
+                                completion_at, CASE WHEN ?='completed' THEN ? END
+                            ),
+                            exited_at=COALESCE(
+                                exited_at, CASE WHEN ?='worker_exited' THEN ? END
+                            ),
+                            last_heartbeat_at=CASE
+                                WHEN ? THEN ? ELSE last_heartbeat_at
+                            END,
+                            last_progress_at=CASE
+                                WHEN ? THEN ? ELSE last_progress_at
+                            END,
+                            status=CASE
+                                WHEN ?='worker_exited' THEN 'exited'
+                                WHEN ?='blocked' THEN 'blocked'
+                                WHEN ?='completed' THEN 'completion_recorded'
+                                ELSE status
+                            END,
+                            terminal_reason=CASE
+                                WHEN ? THEN ? ELSE terminal_reason
+                            END,
+                            updated_at=?
+                        WHERE run_id=?
+                        """,
+                        (
+                            worker_pid,
+                            worker_session_id,
+                            int(started),
+                            created_at,
+                            kind,
+                            created_at,
+                            kind,
+                            created_at,
+                            kind,
+                            created_at,
+                            int(heartbeat),
+                            created_at,
+                            int(progress),
+                            created_at,
+                            kind,
+                            kind,
+                            kind,
+                            int(terminal),
+                            kind,
+                            int(time.time()),
+                            run_id,
+                        ),
+                    )
             previous = conn.execute(
                 "SELECT * FROM card_runtime WHERE board=? AND card_id=?",
                 (board, card_id),
@@ -974,6 +1684,9 @@ class ControllerStore:
             run_key,
             expected_states={
                 "active",
+                "transition_pending",
+                "human_blocked",
+                "retry_wait",
                 "dependency_degraded",
                 "merge_wait",
                 "exception",
@@ -994,7 +1707,14 @@ class ControllerStore:
             return current
         return self.transition_run(
             run_key,
-            expected_states={"active", "dependency_degraded", "merge_wait"},
+            expected_states={
+                "active",
+                "transition_pending",
+                "human_blocked",
+                "retry_wait",
+                "dependency_degraded",
+                "merge_wait",
+            },
             new_state="exception",
             reason=reason,
         )
@@ -1005,7 +1725,10 @@ class ControllerStore:
             rows = conn.execute(
                 """
                 SELECT run_key FROM run_control
-                WHERE state IN ('active', 'dependency_degraded', 'merge_wait')
+                WHERE state IN (
+                    'active', 'transition_pending', 'retry_wait',
+                    'dependency_degraded', 'merge_wait'
+                )
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY updated_at, run_key
                 """,
@@ -1549,6 +2272,20 @@ class ControllerStore:
             )
         return None
 
+    def request(self, key: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM requests WHERE request_key=?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = json.loads(result["payload"])
+        if result["response"]:
+            result["response"] = json.loads(result["response"])
+        return result
+
     def finish_request(self, key: str, response: dict) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -1869,8 +2606,8 @@ class ControllerStore:
                 INSERT INTO profile_preflight(
                     profile, role, api_ok, repository_read_ok,
                     repository_write_ok, https_username_ok, remote_protocol,
-                    error_code, deep, checked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_code, deep, wrapper_checked_at, checked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(profile) DO UPDATE SET
                     role=excluded.role,
                     api_ok=excluded.api_ok,
@@ -1880,6 +2617,10 @@ class ControllerStore:
                     remote_protocol=excluded.remote_protocol,
                     error_code=excluded.error_code,
                     deep=excluded.deep,
+                    wrapper_checked_at=COALESCE(
+                        excluded.wrapper_checked_at,
+                        profile_preflight.wrapper_checked_at
+                    ),
                     checked_at=excluded.checked_at
                 """,
                 (
@@ -1908,6 +2649,7 @@ class ControllerStore:
                     result.get("remote_protocol"),
                     result.get("error_code"),
                     int(deep),
+                    now if deep else None,
                     now,
                 ),
             )
@@ -2090,6 +2832,28 @@ class ControllerStore:
                     (int(time.time()),),
                 )
             ]
+            reconcile_rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM reconcile_intents
+                    WHERE status != 'done'
+                    ORDER BY created_at, intent_id
+                    """
+                )
+            ]
+            recent_attempts = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT run_id, run_key, card_id, attempt, status,
+                           started_at, blocked_at, completion_at, exited_at,
+                           updated_at
+                    FROM card_attempts
+                    ORDER BY updated_at DESC, run_id DESC LIMIT 50
+                    """
+                )
+            ]
         now = int(time.time())
         for item in merge_waits:
             item["waiting_seconds"] = max(
@@ -2111,7 +2875,18 @@ class ControllerStore:
             "failed_operations": failed_ops,
             "uncertain_operations": uncertain_ops,
             "aborting_runs": aborting,
+            "transition_pending": state_counts.get("transition_pending", 0),
+            "human_blocked": state_counts.get("human_blocked", 0),
+            "retry_wait": state_counts.get("retry_wait", 0),
             "run_states": state_counts,
+            "reconcile_pending": len(reconcile_rows),
+            "reconcile_oldest_age_seconds": (
+                max(0, now - int(reconcile_rows[0]["created_at"]))
+                if reconcile_rows
+                else 0
+            ),
+            "reconcile_queue": reconcile_rows,
+            "attempt_timeline": recent_attempts,
             "merge_waits": merge_waits,
             "stale_workers": stale_workers,
             "dependency_outages": self.open_dependency_outages(),

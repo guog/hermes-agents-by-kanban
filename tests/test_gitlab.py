@@ -248,11 +248,13 @@ class GitLabGateTests(unittest.TestCase):
     def test_abort_delivery_comments_once_and_closes_open_mr(self) -> None:
         first = self.client.abort_delivery(
             self.run,
+            mr_iid=2,
             requested_by="ou_owner",
             reason="human requested stop",
         )
         second = self.client.abort_delivery(
             self.run,
+            mr_iid=2,
             requested_by="ou_owner",
             reason="human requested stop",
         )
@@ -262,7 +264,7 @@ class GitLabGateTests(unittest.TestCase):
         abort_notes = [
             note
             for note in self.client.notes
-            if "[hollysys-aborted:v3]" in str(note.get("body"))
+            if "[hollysys-aborted:v4]" in str(note.get("body"))
         ]
         self.assertEqual(len(abort_notes), 1)
         close_calls = [
@@ -387,7 +389,7 @@ class GitLabGateTests(unittest.TestCase):
                     "HOLLYSYS-GATE: v=5 run=hollysys-abcdefghijklmnopqrst "
                     "stage=spec-review result=pass "
                     f"digest={'b' * 64} artifact={'c' * 40} "
-                    "head=na test=na task=t_abc"
+                    f"head={'d' * 40} test=na task=t_abc"
                 ),
             }
         ]
@@ -561,12 +563,9 @@ class GitLabGateTests(unittest.TestCase):
         self.assertNotIn(token, str(error))
         self.assertIn("[REDACTED]", str(error))
 
-    def test_invalid_dispatcher_profile_env_is_local_fatal(self) -> None:
-        write_profile_env(
-            self.client.config,
-            token="controller-token",
-            mode=0o644,
-        )
+    def test_invalid_controller_secret_is_local_fatal(self) -> None:
+        write_profile_env(self.client.config, token="profile-token")
+        self.client.config.controller_token_file.chmod(0o644)
         with self.assertRaisesRegex(
             ControllerFatalError,
             "controller_gitlab_token_invalid",
@@ -589,7 +588,10 @@ class GitLabGateTests(unittest.TestCase):
         with patch.dict(os.environ, inherited, clear=False):
             env = self.client._env()
 
-        self.assertEqual(env["GITLAB_TOKEN"], "controller-token")
+        self.assertEqual(
+            env["GITLAB_TOKEN"],
+            "dedicated-controller-token",
+        )
         for key in inherited:
             self.assertNotIn(key, env)
 
@@ -766,13 +768,13 @@ class GitLabGateTests(unittest.TestCase):
     def test_merge_always_sends_checked_head(self) -> None:
         result = self.client.merge(self.run, 2, "d" * 40)
         self.assertEqual(result["state"], "merged")
-        self.assertTrue(result["_hollysys_controller_merge_submitted_v3"])
+        self.assertTrue(result["_hollysys_controller_merge_submitted_v4"])
         self.assertEqual(self.client.merge_fields, {"sha": "d" * 40})
 
     def test_merge_readback_before_submission_is_not_claimed(self) -> None:
         self.client.mr["state"] = "merged"
         result = self.client.merge(self.run, 2, "d" * 40)
-        self.assertFalse(result["_hollysys_controller_merge_submitted_v3"])
+        self.assertFalse(result["_hollysys_controller_merge_submitted_v4"])
         self.assertIsNone(self.client.merge_fields)
 
     def test_merge_rejects_a_merged_response_for_another_head(self) -> None:

@@ -71,6 +71,26 @@ class ControllerDaemon:
                     self.service.validate_completion,
                     request.params,
                 )
+            if request.method == "publish-delivery":
+                return await asyncio.to_thread(
+                    self.service.publish_delivery,
+                    request.params,
+                )
+            if request.method == "card-context":
+                return await asyncio.to_thread(
+                    self.service.card_context,
+                    request.params,
+                )
+            if request.method == "completion-template":
+                return await asyncio.to_thread(
+                    self.service.completion_template,
+                    request.params,
+                )
+            if request.method == "validate-artifact":
+                return await asyncio.to_thread(
+                    self.service.validate_artifact,
+                    request.params,
+                )
             if request.method == "health":
                 return await asyncio.to_thread(
                     self.service.health,
@@ -111,6 +131,15 @@ class ControllerDaemon:
                         self._outbox_loop(),
                         name="durable-outbox",
                     ),
+                    *[
+                        asyncio.create_task(
+                            self._reconcile_intent_loop(index),
+                            name=f"reconcile-intent-{index}",
+                        )
+                        for index in range(
+                            max(1, int(self.config.reconcile_workers))
+                        )
+                    ],
                 ]
             done, _ = await asyncio.wait(
                 (stop_task, fatal_task, *background),
@@ -217,6 +246,23 @@ class ControllerDaemon:
                     int(outage["next_retry_at"]) - int(outage["updated_at"]),
                 )
                 await asyncio.sleep(delay)
+
+    async def _reconcile_intent_loop(self, index: int) -> None:
+        lease_owner = f"{self.boot_id}:{index}"
+        while True:
+            try:
+                consumed = await asyncio.to_thread(
+                    self.service.consume_reconcile_once,
+                    lease_owner,
+                )
+            except ControllerFatalError:
+                raise
+            except Exception:
+                LOG.exception("persistent reconcile intent failed")
+                await asyncio.sleep(1)
+                continue
+            if not consumed:
+                await asyncio.sleep(0.5)
 
     async def _outbox_loop(self) -> None:
         while True:

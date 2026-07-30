@@ -41,7 +41,7 @@ class LongRunningStoreTests(unittest.TestCase):
             connection.commit()
         with self.assertRaisesRegex(
             ControllerFatalError,
-            "fresh v3 state is required",
+            "fresh v4 state is required",
         ):
             ControllerStore(legacy)
 
@@ -306,10 +306,12 @@ class LongRunningServiceTests(unittest.TestCase):
         cfg = config(self.root)
         store = ControllerStore(cfg.state_dir / "controller.db")
         service = ControllerService(cfg, store=store)
+        persisted_run = run_record(self.root)
+        store.save_run(persisted_run)
         managed = ManagedCard(
             board="gitlab-p12",
             card_id="t_agent",
-            run_key="hollysys-lifecycle-replay-01",
+            run_key=persisted_run.run_key,
             stage="implement",
             iteration=1,
             idempotency_key="dispatch-1",
@@ -324,6 +326,17 @@ class LongRunningServiceTests(unittest.TestCase):
             kind="worker_started",
             payload={"worker_session_id": "session-1", "worker_pid": 101},
             created_at=100,
+        )
+        store.add_managed_card(
+            board=managed.board,
+            card_id=managed.card_id,
+            run_key=managed.run_key,
+            stage=managed.stage,
+            iteration=managed.iteration,
+            idempotency_key=managed.idempotency_key,
+            parent_card_id=managed.parent_card_id,
+            purpose=managed.purpose,
+            created_at=managed.created_at,
         )
         unavailable = DependencyTransientError(
             "Kanban DB is locked",

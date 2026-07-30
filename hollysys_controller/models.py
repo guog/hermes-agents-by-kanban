@@ -9,6 +9,8 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
 RUN_KEY_BODY_PATTERN = r"[a-z0-9]{20}"
 RUN_KEY_PATTERN = rf"^hollysys-{RUN_KEY_BODY_PATTERN}$"
+SOURCE_KEY_PATTERN = rf"^source-{RUN_KEY_BODY_PATTERN}$"
+RUN_GENERATION_PATTERN = rf"^{RUN_KEY_BODY_PATTERN}$"
 CARD_ID_PATTERN = r"^t_[A-Za-z0-9_-]+$"
 BLOCK_ID_PATTERN = rf"^hollysys-{RUN_KEY_BODY_PATTERN}:t_[A-Za-z0-9_-]+:[1-9][0-9]*$"
 SHA_PATTERN = r"^[0-9a-f]{40}$"
@@ -126,13 +128,38 @@ class WorkspaceFacts(StrictModel):
 
 
 class RunRecord(StrictModel):
-    protocol_version: Literal["hollysys-controller/v3"] = "hollysys-controller/v3"
+    protocol_version: Literal["hollysys-controller/v4"] = "hollysys-controller/v4"
     kind: Literal["run-init"] = "run-init"
     run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
+    source_key: Annotated[str, Field(pattern=SOURCE_KEY_PATTERN)]
+    run_generation: Annotated[str, Field(pattern=RUN_GENERATION_PATTERN)]
+    started_at: datetime
+    provenance: Literal["fresh_v4"] = "fresh_v4"
     project: ProjectFacts
     source: SourceFacts
     workspace: WorkspaceFacts
     origin: FeishuOrigin
+
+    @model_validator(mode="after")
+    def validate_started_at(self) -> RunRecord:
+        if self.started_at.tzinfo is None:
+            raise ValueError("started_at must include a timezone")
+        return self
+
+
+class DeliveryBinding(StrictModel):
+    mr_iid: Annotated[int, Field(gt=0)]
+    mr_url: AnyHttpUrl
+    creator: Annotated[str, Field(min_length=1)]
+    created_at: datetime
+    initial_head_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
+    claim_note_id: Annotated[int, Field(gt=0)]
+
+    @model_validator(mode="after")
+    def validate_created_at(self) -> DeliveryBinding:
+        if self.created_at.tzinfo is None:
+            raise ValueError("delivery created_at must include a timezone")
+        return self
 
 
 class ArtifactBaseline(StrictModel):
@@ -212,7 +239,7 @@ class RepairContext(StrictModel):
 
 
 class CardRecord(StrictModel):
-    protocol_version: Literal["hollysys-controller/v3"] = "hollysys-controller/v3"
+    protocol_version: Literal["hollysys-controller/v4"] = "hollysys-controller/v4"
     kind: Literal["work"] = "work"
     run: RunRecord
     stage: Stage
@@ -226,6 +253,25 @@ class CardRecord(StrictModel):
     repair_context: RepairContext | None = None
     resume_answer: str | None = None
     resumed_from_card_id: str | None = None
+    expected_head_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)] = None
+    context_digest: Annotated[str, Field(pattern=DIGEST_PATTERN)]
+    scratch_dir: str
+    delivery: DeliveryBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_scratch_dir(self) -> CardRecord:
+        path = PurePosixPath(self.scratch_dir)
+        root = PurePosixPath("/opt/data/scratch")
+        if (
+            not path.is_absolute()
+            or path == root
+            or path.parts[: len(root.parts)] != root.parts
+            or ".." in path.parts
+        ):
+            raise ValueError(
+                "scratch_dir must be a child of /opt/data/scratch"
+            )
+        return self
 
 
 class ForcedAdvance(StrictModel):
@@ -272,9 +318,31 @@ class RepositoryEvidence(StrictModel):
         return self
 
 
+class DeterministicCheck(StrictModel):
+    validator: Annotated[str, Field(min_length=1)]
+    validator_version: Annotated[str, Field(min_length=1)]
+    input_digest: Annotated[str, Field(pattern=DIGEST_PATTERN)]
+    passed: bool
+    error_codes: list[Annotated[str, Field(pattern=r"^[a-z0-9_]+$")]]
+    result_digest: Annotated[str, Field(pattern=DIGEST_PATTERN)]
+
+    @model_validator(mode="after")
+    def validate_result(self) -> DeterministicCheck:
+        if self.passed and self.error_codes:
+            raise ValueError("passed deterministic check cannot have errors")
+        if not self.passed and not self.error_codes:
+            raise ValueError("failed deterministic check requires error_codes")
+        if len(self.error_codes) != len(set(self.error_codes)):
+            raise ValueError("deterministic error_codes must be unique")
+        return self
+
+
 class CompletionMetadata(StrictModel):
-    protocol_version: Literal["hollysys-controller/v3"]
+    protocol_version: Literal["hollysys-controller/v4"]
     run_key: Annotated[str, Field(pattern=RUN_KEY_PATTERN)]
+    source_key: Annotated[str, Field(pattern=SOURCE_KEY_PATTERN)]
+    run_generation: Annotated[str, Field(pattern=RUN_GENERATION_PATTERN)]
+    context_digest: Annotated[str, Field(pattern=DIGEST_PATTERN)]
     stage: Stage
     iteration: Annotated[int, Field(ge=1)]
     mode: WorkMode = WorkMode.NORMAL
@@ -294,6 +362,7 @@ class CompletionMetadata(StrictModel):
 
     mr_iid: Annotated[int | None, Field(gt=0)] = None
     mr_url: AnyHttpUrl | None = None
+    head_before_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)]
     head_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)] = None
     artifact_commit_sha: Annotated[str | None, Field(pattern=SHA_PATTERN)] = None
     artifact_digest: Annotated[str | None, Field(pattern=DIGEST_PATTERN)] = None
@@ -336,6 +405,7 @@ class CompletionMetadata(StrictModel):
     requirement_ids: list[Annotated[str, Field(min_length=1)]] = Field(
         default_factory=list
     )
+    deterministic_checks: list[DeterministicCheck]
 
     @model_validator(mode="after")
     def validate_stage_contract(self) -> CompletionMetadata:
@@ -659,6 +729,10 @@ class RpcRequest(StrictModel):
         "abort-request",
         "abort-confirm",
         "validate-completion",
+        "publish-delivery",
+        "card-context",
+        "completion-template",
+        "validate-artifact",
     ]
     params: dict = Field(default_factory=dict)
 

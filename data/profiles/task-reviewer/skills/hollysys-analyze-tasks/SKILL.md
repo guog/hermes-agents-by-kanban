@@ -1,36 +1,25 @@
 ---
 name: hollysys-analyze-tasks
-description: 当 Kanban 卡要求审查 TASKS 时，核对 SPEC/PLAN 映射、DAG、覆盖与验收并发布门禁。
-version: 2.1.0
+description: 用与 Writer 相同的 v4 validator 审查 TASKS 与 implementation-entry Gate。
+version: 4.0.0
 ---
 
-# 审查 TASKS 集合
+# 审查 TASKS
 
-## 全体 Agent 执行规则
+- 只读 Controller 指定 worktree、branch、绑定 MR/head 和冻结基线；不得编辑、push、
+  创建/选择 MR。GitLab 操作只用锁定的 `glab`。
 
-- GitLab 项目、仓库元数据、MR、流水线、讨论和评论操作只能通过锁定版本的 `glab` CLI 或已安装的官方 `glab` Skill 完成。不得改用原始 HTTP/`curl`、临时 SDK、浏览器或人工 UI 操作。本 Skill 明确要求的常规只读 `git` 命令仍可使用。
-- 卡片指定的 Hermes 共享 `worktree` 是准确工作副本。Controller 已在发卡前对账；不要例行 fetch/pull。只在缺少 ref 或已证实头不一致时 fetch，并记录原因。
-- 上游遗漏、歧义或矛盾不得要求回改冻结 SPEC/PLAN。检查 TASKS 的当前阶段决策是否安全、完整且可执行；只有 coder 无法安全开工的任务缺陷才 fail，其余记为 residual risk。
-- 只有权限、凭据、环境/能力缺失、自动重试不安全或破坏性动作待授权时才允许人类阻塞。
-
-1. 调用 `kanban_show()`；要求 `created_by=hollysys-controller`，并验证卡片 JSON 的 v3 protocol/mode/run/stage/iteration/assignee/parent、项目、worktree、分支、共享 MR 和冻结 PRD/SPEC/PLAN 基线。
-2. 读取 TASKS 模板并在 `repository_base_sha` 上核实目标路径和已有能力；验证
-   SPEC/PLAN/TASK 键、稳定唯一 ID、显式依赖、DAG、执行波次、需求覆盖、验收和测试。
-   每项任务必须有 `reuse|modify|extend|create` 动作，新增结构必须有“现有能力无法
-   承载”的仓库证据。绿地式搭架子、重复造已有能力或目标路径臆造均属实质性缺陷。
-3. 在审查 commit 上计算完整 TASKS path/blob 摘要，发布包含路径、digest、
-   `artifact_commit_sha`、card ID、v5 marker 和
-   `HOLLYSYS-SEMANTIC-GATE: v=1 run=<run> phase=implementation_entry
-   decision=approved artifact=<tasks-commit> digest=<tasks-digest>` 的幂等 gate。
-   pass metadata 的 `gate_evidence_refs` 必须包含这条 note 的精确 `#note_<id>` URL，
-   并填写当前 GitLab reviewer 的稳定 `id:<numeric-id>`、带时区时间、理由、
-   与本次审查工件完全相同且通过后即冻结的 TASKS paths/commit/digest，以及
-   TASKS 正文中真实存在的 `requirement_ids` 和 `contract_refs`。任一引用无法验证则不得 pass。
-4. 阻塞性任务缺陷使用 `fail` 并给 tasker 可在 TASKS 内完成的动作；不得跨阶段回退。
-5. 使用 v3 normal metadata；pass/fail 都绑定 paths/digest/artifact commit 和 gate URL，pass 填 `baseline_disposition=reviewed` 与完整 `implementation_entry` Gate，fail 给非空 issues，并把门禁评论中的关键自主决策摘要写入 `key_decisions`。不得编辑产物、实现、push、创建卡片或合并。
-   审查必须核实仓库证据，但 completion metadata 不得包含仅 authoring pass 可用的
-   `repository_evidence`；仓库核查结果写入 gate 评论、`verification` 和
-   `key_decisions`。
-- 调用完成工具前，必须将业务 metadata 保存为 JSON，并执行
-  `hollysysctl validate-completion --card-id '<当前卡 ID>' --metadata '<json-file>'`；
-  只有 Controller 返回 `ok=true` 才能完成卡片。
+1. 用 `hollysysctl card-context --card-id "$HERMES_KANBAN_TASK"` 获取受信上下文并保存
+   到其 `scratch_dir`。
+2. 使用与 Writer 相同的
+   `hollysysctl validate-artifact --card-id "$HERMES_KANBAN_TASK"`。确定性结果不是
+   `ok=true` 时必须 fail；不得自行实现另一套 DAG 校验或伪造 validator evidence。
+   必须以 `repository_base_sha` 拒绝绿地式平行框架或重复实现已有能力。
+3. 核实 SPEC/PLAN/TASK 键、真实目标路径与现有能力、动作、DAG、波次、需求覆盖、
+   验收和测试。只有 coder 无法安全开工的缺陷才 fail。
+4. pass 时发布绑定当前 card/head、TASKS paths/commit/digest 的幂等
+   `implementation_entry` Gate，引用真实 requirement IDs/contract refs 和精确 note
+   URL；fail 给出 TASKS 内可执行 findings。
+5. 用 `completion-template` 生成 pass/fail completion v8，保持 Controller 生成的
+   deterministic checks 原样，只填写真实 reviewer/gate/decision/risk。通过
+   `validate-completion` 后完成卡片并立即结束。

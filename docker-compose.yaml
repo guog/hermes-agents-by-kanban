@@ -1,31 +1,80 @@
 services:
-  hermes:
-    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}
+  controller:
+    image: ${HOLLYSYS_IMAGE:-hollysys/hermes-agent:v4}
+    build:
+      context: .
+      args:
+        HERMES_BASE_IMAGE: ${HERMES_BASE_IMAGE:-nousresearch/hermes-agent:v2026.7.20@sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a}
     platform: linux/amd64
-    pull_policy: missing
+    container_name: ${HOLLYSYS_CONTROLLER_CONTAINER_NAME:-hollysys-controller}
+    restart: unless-stopped
+    entrypoint:
+      - /opt/hermes/.venv/bin/python
+      - -m
+      - hollysys_controller.daemon
+    env_file:
+      - .env
+    environment:
+      HERMES_HOME: /opt/data
+      HERMES_SCRATCH_DIR: /opt/data/scratch
+      HERMES_WRITE_SAFE_ROOT: /opt/data:/workspace/projects
+      HOLLYSYS_CONTROLLER_CONFIG: /opt/hollysys-controller/config.yaml
+      HOLLYSYS_CONTROLLER_STATE_DIR: /var/lib/hollysys-controller
+      HOLLYSYS_CONTROLLER_LOCK: /var/lib/hollysys-controller/controller.lock
+      HOLLYSYS_CONTROLLER_SOCKET: /run/hollysys-controller/controller.sock
+      HOLLYSYS_CONTROLLER_GITLAB_TOKEN_FILE: /run/secrets/hollysys_controller_gitlab_token
+      PATH: /run/hollysys/bin:/opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PIP_CONFIG_FILE: /etc/pip.conf
+      NPM_CONFIG_USERCONFIG: /opt/fleet/container/mirrors/npmrc
+    volumes:
+      - ${HERMES_DATA_DIR:-./data}:/opt/data
+      - ${PROJECTS_DIR:-./projects}:/workspace/projects
+      - ${HOLLYSYS_CONTROLLER_DATA_DIR:-./controller-data}:/var/lib/hollysys-controller
+      - controller-socket:/run/hollysys-controller
+      - ./controller/config.yaml:/opt/hollysys-controller/config.yaml:ro
+      - ./container:/opt/fleet/container:ro
+      - ./templates:/opt/fleet/templates:ro
+      - ./schemas:/opt/fleet/schemas:ro
+    secrets:
+      - source: hollysys_controller_gitlab_token
+        target: hollysys_controller_gitlab_token
+        mode: 0400
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/hollysysctl
+        - health
+        - --probe
+        - liveness
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  hermes:
+    image: ${HOLLYSYS_IMAGE:-hollysys/hermes-agent:v4}
+    build:
+      context: .
+      args:
+        HERMES_BASE_IMAGE: ${HERMES_BASE_IMAGE:-nousresearch/hermes-agent:v2026.7.20@sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a}
+    platform: linux/amd64
     container_name: ${HERMES_CONTAINER_NAME:-hermes}
     restart: unless-stopped
-    # Keep the image's s6 tree alive. Hollysys Controller is independently
-    # supervised under /run/service so its restart does not interrupt gateways
-    # or the Dashboard.
     command: ["sleep", "infinity"]
-    # .env is both the Compose interpolation file and the container environment
-    # file. User settings and mirror addresses live there to keep this file small.
+    depends_on:
+      controller:
+        condition: service_healthy
     env_file:
       - .env
     environment:
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: "0.0.0.0"
-      # Keep the image's internal listener stable. Host publication is
-      # independently selected with HERMES_DASHBOARD_HOST_PORT below.
       HERMES_DASHBOARD_PORT: "9119"
       HERMES_HOME: /opt/data
+      HERMES_SCRATCH_DIR: /opt/data/scratch
       HERMES_WRITE_SAFE_ROOT: /opt/data:/workspace/projects
-      PYTHONPATH: /opt/hollysys-controller-src
-      HOLLYSYS_CONTROLLER_CONFIG: /opt/hollysys-controller/config.yaml
-      HOLLYSYS_CONTROLLER_STATE_DIR: /opt/data/controller
-      HOLLYSYS_CONTROLLER_SOCKET: /opt/data/controller/controller.sock
-      PATH: /run/hollysys/bin:/opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.dotnet:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      HOLLYSYS_CONTROLLER_SOCKET: /run/hollysys-controller/controller.sock
+      PATH: /run/hollysys/bin:/opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       PIP_CONFIG_FILE: /etc/pip.conf
       NPM_CONFIG_USERCONFIG: /opt/fleet/container/mirrors/npmrc
     ports:
@@ -33,29 +82,27 @@ services:
     volumes:
       - ${HERMES_DATA_DIR:-./data}:/opt/data
       - ${PROJECTS_DIR:-./projects}:/workspace/projects
-      - ./cli:/opt/cli:ro
-      - ./skills:/opt/skills:ro
-      - ./hollysys_controller:/opt/hollysys-controller-src/hollysys_controller:ro
-      - ./controller/config.yaml:/opt/hollysys-controller/config.yaml:ro
-      - ./hollysysctl:/usr/local/bin/hollysysctl:ro
+      - controller-socket:/run/hollysys-controller
       - ./container:/opt/fleet/container:ro
-      - ./container/ensure-dotnet8.sh:/etc/cont-init.d/00-hollysys-dotnet8:ro
-      - ./container/install-git-wrapper.sh:/etc/cont-init.d/01-hollysys-git-wrapper:ro
-      - ./container/ensure-feishu.sh:/etc/cont-init.d/02-hollysys-feishu:ro
-      # s6-overlay discovers legacy services from /etc/services.d and copies
-      # them into its writable /run tree. Mounting directly below /run makes
-      # preinit fail when it clears /run/s6 on current Docker releases.
-      - ./container/services.d/hollysys-controller:/etc/services.d/hollysys-controller:ro
-      - ./container/mirrors/debian.sources:/etc/apt/sources.list.d/debian.sources:ro
-      - ./container/mirrors/sources.list:/etc/apt/sources.list:ro
-      - ./container/mirrors/pip.conf:/etc/pip.conf:ro
-      - ./container/mirrors/uv.toml:/etc/uv/uv.toml:ro
       - ./templates:/opt/fleet/templates:ro
       - ./schemas:/opt/fleet/schemas:ro
+      - ./container/ensure-feishu.sh:/etc/cont-init.d/02-hollysys-feishu:ro
     healthcheck:
-      test: ["CMD", "/opt/hermes/.venv/bin/python", "-m", "hollysys_controller.cli", "health", "--probe", "liveness"]
+      test:
+        - CMD
+        - /usr/local/bin/hollysysctl
+        - health
+        - --probe
+        - liveness
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5m
     shm_size: 1gb
+
+secrets:
+  hollysys_controller_gitlab_token:
+    file: ${HOLLYSYS_CONTROLLER_GITLAB_TOKEN_FILE:-./secrets/controller-gitlab-token}
+
+volumes:
+  controller-socket:

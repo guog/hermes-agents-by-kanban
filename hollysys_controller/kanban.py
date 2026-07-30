@@ -19,8 +19,8 @@ from .errors import (
 )
 from .models import CardRecord, RunRecord
 
-CARD_MARKER = "[hollysys-controller-card:v3]"
-RUN_MARKER = "[hollysys-controller-run:v3]"
+CARD_MARKER = "[hollysys-controller-card:v4]"
+RUN_MARKER = "[hollysys-controller-run:v4]"
 
 
 class CommandError(RuntimeError):
@@ -490,7 +490,7 @@ class KanbanCLI:
             return
         metadata = json.dumps(
             {
-                "protocol_version": "hollysys-controller/v3",
+                "protocol_version": "hollysys-controller/v4",
                 "kind": "run-init",
                 "run_key": run.run_key,
             },
@@ -705,7 +705,7 @@ class KanbanCLI:
         if existing:
             return existing
         body = (
-            "[hollysys-controller-exception:v3]\n\n"
+            "[hollysys-controller-exception:v4]\n\n"
             f"run_key: {run.run_key}\n\n"
             f"reason: {reason[:1000]}\n\n"
             "该卡由 Dispatcher 作为异常入口处理；不得直接推进门禁或合并。"

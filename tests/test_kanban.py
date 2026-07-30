@@ -114,6 +114,9 @@ class KanbanReaderTests(unittest.TestCase):
             parent_card_id="t_root",
             assignee="spec-writer",
             skills=["hollysys-write-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
             resume_answer="Use this fenced example:\n```text\nvalue\n```",
         )
         self.assertEqual(parse_run_body(render_run_body(run)), run)

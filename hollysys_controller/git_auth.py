@@ -95,6 +95,8 @@ def profile_credential(config: ControllerConfig, profile: str) -> ProfileCredent
     if values["HERMES_PROFILE"] != profile:
         raise ValueError(f"profile_identity_mismatch:{profile}")
     try:
+        if values["GITLAB_HOST"] != config.gitlab_base_url:
+            raise ValueError
         endpoint = config.normalize_gitlab_endpoint(values["GITLAB_HOST"])
     except ValueError as exc:
         raise ValueError(f"invalid_gitlab_host:{profile}") from exc
@@ -279,6 +281,8 @@ def profile_preflight(
     profile: str,
     *,
     deep: bool,
+    project_path: str | None = None,
+    branch: str | None = None,
 ) -> dict:
     try:
         credential = profile_credential(config, profile)
@@ -327,7 +331,8 @@ def profile_preflight(
         return result
     if not deep:
         return result
-    if not config.preflight_project_path:
+    target_project = project_path or config.preflight_project_path
+    if not target_project:
         result.update(
             {
                 "ok": False,
@@ -393,7 +398,7 @@ def profile_preflight(
         return result
     result["identity_id"] = user["id"]
 
-    project = quote(config.preflight_project_path, safe="")
+    project = quote(target_project, safe="")
     membership = _run(
         [
             config.glab_command,
@@ -424,15 +429,26 @@ def profile_preflight(
         return result
 
     repository_url = (
-        f"{config.gitlab_base_url}/{config.preflight_project_path}.git"
+        f"{config.gitlab_base_url}/{target_project}.git"
+    )
+    ls_remote_ref = (
+        f"refs/heads/{branch}" if branch is not None else "HEAD"
     )
     repository_read = _run(
-        [config.agent_git_command, "ls-remote", repository_url, "HEAD"],
+        [
+            config.agent_git_command,
+            "ls-remote",
+            repository_url,
+            ls_remote_ref,
+        ],
         env=env,
         timeout=config.preflight_command_timeout_seconds,
     )
-    result["repository_read_ok"] = repository_read.returncode == 0
-    if repository_read.returncode != 0:
+    result["repository_read_ok"] = (
+        repository_read.returncode == 0
+        and bool(repository_read.stdout.strip())
+    )
+    if not result["repository_read_ok"]:
         result.update(
             {
                 "ok": False,
@@ -451,7 +467,7 @@ def profile_preflight(
         input_text=(
             "protocol=https\n"
             f"host={config.gitlab_hostname}\n"
-            f"path={config.preflight_project_path}.git\n\n"
+            f"path={target_project}.git\n\n"
         ),
         env=env,
         timeout=config.preflight_command_timeout_seconds,
@@ -480,17 +496,19 @@ def profile_preflight(
         dir=config.state_dir,
     ) as temporary:
         checkout = Path(temporary) / "repository"
-        cloned = _run(
-            [
+        clone_command = [
                 config.agent_git_command,
                 "clone",
                 "--depth=1",
                 "--filter=blob:none",
                 "--no-checkout",
                 "--single-branch",
-                repository_url,
-                str(checkout),
-            ],
+        ]
+        if branch is not None:
+            clone_command.extend(["--branch", branch])
+        clone_command.extend([repository_url, str(checkout)])
+        cloned = _run(
+            clone_command,
             env=env,
             timeout=config.preflight_command_timeout_seconds,
         )
@@ -630,14 +648,6 @@ def summarize_profile_preflight(
         if item.get("token_fingerprint")
     ]
     duplicates = len(fingerprints) != len(set(fingerprints))
-    dispatcher_fingerprint = next(
-        (
-            item.get("token_fingerprint")
-            for item in profiles
-            if item.get("profile") == "dispatcher"
-        ),
-        None,
-    )
     controller_fingerprint: str | None = None
     try:
         controller_fingerprint = hashlib.sha256(
@@ -645,10 +655,9 @@ def summarize_profile_preflight(
         ).hexdigest()
     except (OSError, ValueError):
         controller_fingerprint = None
-    controller_matches_dispatcher = bool(
+    controller_is_distinct = bool(
         controller_fingerprint
-        and dispatcher_fingerprint
-        and controller_fingerprint == dispatcher_fingerprint
+        and controller_fingerprint not in fingerprints
     )
     auth_executable_fingerprints: list[str] = []
     for path in (
@@ -690,12 +699,12 @@ def summarize_profile_preflight(
     return {
         "ok": all(item["ok"] for item in profiles)
         and not duplicates
-        and controller_matches_dispatcher,
+        and controller_is_distinct,
         "deep": deep,
         "profiles": safe_profiles,
         "unique_profile_tokens": not duplicates,
-        "controller_token_matches_dispatcher": controller_matches_dispatcher,
-        "controller_token_source": "dispatcher",
+        "controller_token_distinct_from_profiles": controller_is_distinct,
+        "controller_token_source": "dedicated-secret-file",
         # Internal activation binding. ControllerService removes this field
         # before returning or persisting any health/preflight report.
         "_credential_contract_digest": credential_contract_digest,

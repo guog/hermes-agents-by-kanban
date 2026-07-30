@@ -15,70 +15,55 @@ class ComposeContractTests(unittest.TestCase):
             (root / "docker-compose.yaml").read_text(encoding="utf-8")
         )
 
-    def test_controller_is_independently_supervised_by_s6(self) -> None:
-        service = self.compose["services"]["hermes"]
+    def test_controller_is_an_independent_compose_service(self) -> None:
+        controller = self.compose["services"]["controller"]
+        hermes = self.compose["services"]["hermes"]
+        self.assertEqual(controller["restart"], "unless-stopped")
         self.assertEqual(
-            service["command"],
-            ["sleep", "infinity"],
+            controller["entrypoint"],
+            [
+                "/opt/hermes/.venv/bin/python",
+                "-m",
+                "hollysys_controller.daemon",
+            ],
         )
-        self.assertEqual(service["restart"], "unless-stopped")
+        self.assertNotIn("secrets", hermes)
+        self.assertEqual(
+            controller["secrets"][0]["source"],
+            "hollysys_controller_gitlab_token",
+        )
+        self.assertEqual(
+            hermes["depends_on"]["controller"]["condition"],
+            "service_healthy",
+        )
         self.assertIn(
-            "./container/services.d/hollysys-controller:/etc/services.d/hollysys-controller:ro",
-            service["volumes"],
-        )
-        run_script = (
-            self.root / "container/services.d/hollysys-controller/run"
-        ).read_text(encoding="utf-8")
-        self.assertIn("s6-setuidgid hermes", run_script)
-        self.assertIn(
-            "/opt/hermes/.venv/bin/python -m hollysys_controller.daemon",
-            run_script,
+            "controller-socket:/run/hollysys-controller",
+            controller["volumes"],
         )
         self.assertIn(
-            "./container/install-git-wrapper.sh:/etc/cont-init.d/01-hollysys-git-wrapper:ro",
-            service["volumes"],
+            "controller-socket:/run/hollysys-controller",
+            hermes["volumes"],
         )
-        self.assertTrue(service["environment"]["PATH"].startswith(
-            "/run/hollysys/bin:"
-        ))
-        install_script = (
-            self.root / "container/install-git-wrapper.sh"
-        ).read_text(encoding="utf-8")
-        self.assertIn("-o root", install_script)
-        self.assertIn("-g root", install_script)
-        self.assertIn("-m 0555", install_script)
-        self.assertIn('"/usr/local/bin/$executable"', install_script)
-
-        finish_script = (
-            self.root / "container/services.d/hollysys-controller/finish"
-        ).read_text(encoding="utf-8")
-        self.assertIn("HOLLYSYS_FATAL_RESTART_BACKOFF_SECONDS", finish_script)
 
     def test_container_health_uses_local_liveness_probe(self) -> None:
         healthcheck = self.compose["services"]["hermes"]["healthcheck"]
         self.assertEqual(
             healthcheck["test"][1],
-            "/opt/hermes/.venv/bin/python",
+            "/usr/local/bin/hollysysctl",
         )
         self.assertEqual(healthcheck["test"][-2:], ["--probe", "liveness"])
 
-    def test_dotnet_sdk_is_reused_from_persistent_runtime_data(self) -> None:
-        script = (
-            self.root / "container/ensure-dotnet8.sh"
-        ).read_text(encoding="utf-8")
+    def test_derived_image_pins_base_and_toolchain(self) -> None:
+        dockerfile = (self.root / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
-            "PERSISTENT_DOTNET_ROOT=/opt/data/.dotnet",
-            script,
+            "v2026.7.20@sha256:f7b35053268f532f98955195c909f15a"
+            "230470fbcbdacaa9fdecb95707dad04a",
+            dockerfile,
         )
-        self.assertIn(
-            "mktemp -d /opt/data/.dotnet-stage.XXXXXX",
-            script,
-        )
-        self.assertIn('mv "$persistent_stage" "$PERSISTENT_DOTNET_ROOT"', script)
-        self.assertIn(
-            "persistent .NET root exists but does not contain a valid SDK 8",
-            script,
-        )
+        self.assertIn("NODE_VERSION=22.18.0", dockerfile)
+        self.assertIn("DOTNET_SDK_VERSION=8.0.423", dockerfile)
+        self.assertIn("jq", dockerfile)
+        self.assertIn("patch-hermes-terminal.py", dockerfile)
 
     def test_feishu_adapter_dependencies_are_pinned_and_verified(self) -> None:
         service = self.compose["services"]["hermes"]
@@ -121,14 +106,19 @@ class ComposeContractTests(unittest.TestCase):
             "${HERMES_CONTAINER_NAME:-hermes}",
         )
 
-    def test_image_uses_selected_release_tag_for_linux_amd64(self) -> None:
+    def test_image_uses_derived_v4_image_for_linux_amd64(self) -> None:
         service = self.compose["services"]["hermes"]
         self.assertEqual(service["platform"], "linux/amd64")
         self.assertEqual(
             service["image"],
-            "${HERMES_IMAGE:-nousresearch/hermes-agent:v2026.7.20}",
+            "${HOLLYSYS_IMAGE:-hollysys/hermes-agent:v4}",
         )
-        self.assertEqual(service["pull_policy"], "missing")
+        self.assertEqual(
+            service["build"]["args"]["HERMES_BASE_IMAGE"],
+            "${HERMES_BASE_IMAGE:-nousresearch/hermes-agent:v2026.7.20@"
+            "sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fde"
+            "cb95707dad04a}",
+        )
 
     def test_hollysysctl_uses_the_managed_python_environment(self) -> None:
         wrapper = (self.root / "hollysysctl").read_text(encoding="utf-8")
@@ -143,6 +133,10 @@ class ComposeContractTests(unittest.TestCase):
         self.assertEqual(
             environment["HERMES_WRITE_SAFE_ROOT"],
             "/opt/data:/workspace/projects",
+        )
+        self.assertEqual(
+            environment["HERMES_SCRATCH_DIR"],
+            "/opt/data/scratch",
         )
 
     def test_locked_clis_are_installed_for_login_shells(self) -> None:

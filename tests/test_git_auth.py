@@ -426,6 +426,11 @@ class GitAuthenticationTests(unittest.TestCase):
         cfg = config(self.root)
         cfg.gitlab_host = "green-git.hollysys.net"
         cfg.profiles_root = self.root / "profiles"
+        cfg.controller_token_file.write_text(
+            "dedicated-controller-token\n",
+            encoding="utf-8",
+        )
+        cfg.controller_token_file.chmod(0o600)
         for index, profile in enumerate(sorted(ALL_PROFILES), start=1):
             profile_root = cfg.profiles_root / profile
             (profile_root / "home").mkdir(parents=True)
@@ -447,8 +452,11 @@ class GitAuthenticationTests(unittest.TestCase):
         result = summarize_profile_preflight(cfg, deep=False)
         self.assertTrue(result["ok"])
         self.assertTrue(result["unique_profile_tokens"])
-        self.assertTrue(result["controller_token_matches_dispatcher"])
-        self.assertEqual(result["controller_token_source"], "dispatcher")
+        self.assertTrue(result["controller_token_distinct_from_profiles"])
+        self.assertEqual(
+            result["controller_token_source"],
+            "dedicated-secret-file",
+        )
         self.assertNotIn("token_fingerprint", str(result))
 
         duplicate = cfg.profiles_root / "tester" / ".env"
@@ -509,7 +517,7 @@ class GitAuthenticationTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "missing_profile_identity")
 
-    def test_profile_host_is_normalized_before_comparison(self) -> None:
+    def test_profile_host_must_be_exact_canonical_https_origin(self) -> None:
         cfg = config(self.root)
         profile_root = cfg.profiles_root / "dispatcher"
         (profile_root / "home").mkdir(parents=True)
@@ -523,8 +531,17 @@ class GitAuthenticationTests(unittest.TestCase):
         )
         env_file.chmod(0o600)
 
-        credential = profile_credential(cfg, "dispatcher")
+        with self.assertRaisesRegex(ValueError, "invalid_gitlab_host"):
+            profile_credential(cfg, "dispatcher")
 
+        env_file.write_text(
+            env_file.read_text(encoding="utf-8").replace(
+                'GITLAB_HOST=\"green-git.hollysys.net\"',
+                "GITLAB_HOST=https://green-git.hollysys.net",
+            ),
+            encoding="utf-8",
+        )
+        credential = profile_credential(cfg, "dispatcher")
         self.assertEqual(
             credential.host_url,
             "https://green-git.hollysys.net",
@@ -532,7 +549,7 @@ class GitAuthenticationTests(unittest.TestCase):
 
         env_file.write_text(
             env_file.read_text(encoding="utf-8").replace(
-                'GITLAB_HOST=\"green-git.hollysys.net\"',
+                "GITLAB_HOST=https://green-git.hollysys.net",
                 "GITLAB_HOST=http://green-git.hollysys.net",
             ),
             encoding="utf-8",
@@ -554,7 +571,7 @@ class GitAuthenticationTests(unittest.TestCase):
         env_file = profile_root / ".env"
         env_file.write_text(
             "HERMES_PROFILE=coder\n"
-            "GITLAB_HOST=green-git.hollysys.net\n"
+            "GITLAB_HOST=https://green-git.hollysys.net\n"
             "GITLAB_ALLOWED_GROUPS=group\n"
             "GITLAB_TOKEN=profile-token\n",
             encoding="utf-8",
