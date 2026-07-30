@@ -24,7 +24,7 @@ class ConfigTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_controller_uses_private_dedicated_token_file(self) -> None:
+    def test_controller_uses_private_dispatcher_token_mirror(self) -> None:
         write_profile_env(
             self.config,
             token="secret",
@@ -37,7 +37,7 @@ class ConfigTests(unittest.TestCase):
         token_file.chmod(0o600)
         self.assertEqual(
             self.config.read_token(),
-            "dedicated-controller-token",
+            "secret",
         )
 
     def test_controller_rejects_token_file_symlink(self) -> None:

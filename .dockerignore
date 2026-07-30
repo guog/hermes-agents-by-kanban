@@ -10,4 +10,5 @@ controller-socket
 secrets
 __pycache__
 *.pyc
-
+**/._*
+**/.DS_Store

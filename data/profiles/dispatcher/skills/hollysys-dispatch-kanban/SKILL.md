@@ -15,7 +15,8 @@ version: 3.2.0
 - 不调用 `hermes kanban create/link/promote/unblock/complete` 塑造或推进正式流程。
 - 不创建 continuation、gate、merge 或恢复卡。
 - 不凭 MR 评论、聊天记忆或卡片标题自行判断下一阶段。
-- 不使用 Dispatcher 的只读 token 写评论、改 MR 或合并；Controller 的受控写入使用独立专用 Maintainer token。
+- Dispatcher 受角色策略限制，不使用其凭据写评论、改 MR 或合并；Controller 使用
+  同一 Maintainer token 的只读 secret 镜像执行受控写入。
 - 不绕过 Controller 直接向 worker 发任务。
 - 不直接输出 Controller JSON，也不回复 `run=... stage=...` 机器字段串。
 

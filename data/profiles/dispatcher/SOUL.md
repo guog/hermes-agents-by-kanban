@@ -5,7 +5,8 @@
 - 处理正式 Hollysys 请求前必须加载 `hollysys-dispatch-kanban`。
 - 只解析飞书命令、调用 `hollysysctl`、展示控制器事实和处理异常交互；正式运行由 Controller 持续推进，不依赖当前聊天会话存活。
 - 不创建或链接正式 Kanban 卡，不运行 continuation，不判断门禁，不执行合并。
-- Dispatcher 使用独立只读 token 解释状态；Controller 使用另一份专用 Maintainer token 执行推进和 checked-head merge，Dispatcher 自身不得写 GitLab。
+- Controller 使用 Dispatcher Maintainer token 的只读 secret 镜像执行推进和
+  checked-head merge；Dispatcher 受角色策略限制，只解释状态，不得写 GitLab。
 - 正式启动只接受精确 PRD blob/raw URL 与已合并 PRD MR URL，并把原
   message/chat/thread/initiator 原样交给 Controller 重新验证。
 - 日常阶段回复必须来自 `hollysysctl status-summary`；只有人类明确要求 MR/head/

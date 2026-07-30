@@ -297,104 +297,7 @@ class ControllerService:
                 response = self.status_summary(run.run_key)
                 self.store.finish_request(key, response)
                 return response
-
-            self._operation(
-                f"{run.run_key}:remote-branch",
-                "remote-branch",
-                {
-                    "run_key": run.run_key,
-                    "branch": run.workspace.branch,
-                    "base_sha": facts.base_sha,
-                },
-                lambda: self.gitlab.create_delivery_branch(run),
-            )
-            self._operation(
-                f"{run.run_key}:workspace",
-                "workspace",
-                {"run_key": run.run_key, "base_sha": facts.base_sha},
-                lambda: (
-                    self.gitlab.ensure_workspace(run, facts.base_sha)
-                    or {"worktree": run.workspace.worktree}
-                ),
-            )
-            accepted_preflight = self.store.deployment_preflight()
-            if (
-                accepted_preflight is not None
-                and accepted_preflight.get("ok")
-                and accepted_preflight.get("deep")
-            ):
-                self._operation(
-                    f"{run.run_key}:offline-caches",
-                    "offline-caches",
-                    {
-                        "run_key": run.run_key,
-                        "worktree": run.workspace.worktree,
-                    },
-                    lambda: self._prepare_offline_caches(run),
-                )
-            self._operation(
-                f"{run.run_key}:board",
-                "board",
-                {
-                    "board": run.workspace.board,
-                    "name": run.project.project_display_name,
-                    "worktree": run.workspace.worktree,
-                },
-                lambda: (
-                    self.kanban.ensure_board(
-                        run.workspace.board,
-                        run.project.project_display_name,
-                        run.workspace.worktree,
-                    )
-                    or {"board": run.workspace.board}
-                ),
-            )
-            root = self.kanban.create_root(run)
-            self._verify_root(root, run)
-            self.store.add_managed_card(
-                board=run.workspace.board,
-                card_id=root.id,
-                run_key=run.run_key,
-                stage="run-init",
-                iteration=0,
-                idempotency_key=f"{run.run_key}:run-init",
-                parent_card_id=None,
-                purpose="root",
-                created_at=root.created_at,
-            )
-            self._operation(
-                f"{run.run_key}:complete-root",
-                "complete-root",
-                {"board": run.workspace.board, "card_id": root.id},
-                lambda: self.kanban.complete_root(run, root.id) or {"card_id": root.id},
-            )
-            first = self._create_work(run, Stage.SPEC_WRITE, root.id)
-            self._enqueue_progress(
-                run,
-                "run-accepted",
-                self._render_notification(
-                    run,
-                    icon="ℹ️",
-                    title="已受理 PRD 自动交付",
-                    fields=[
-                        ("任务 ID", inline_code(run.run_key)),
-                        ("阶段", format_stage(Stage.SPEC_WRITE)),
-                        ("Agent", format_agent(first.assignee)),
-                        ("Card", inline_code(first.id)),
-                    ],
-                ),
-            )
-            self._enqueue_phase_started(run, Phase.SPEC, first)
-            response = {
-                "run_key": run.run_key,
-                "source_key": run.source_key,
-                "run_generation": run.run_generation,
-                "project": run.project.project_path,
-                "stage": Stage.SPEC_WRITE.value,
-                "active_card": first.id,
-                "board": run.workspace.board,
-                "worktree": run.workspace.worktree,
-            }
+            response = self._initialize_run(run, facts.base_sha)
             self.store.finish_request(key, response)
             return response
         except DependencyContractError as exc:
@@ -413,6 +316,112 @@ class ControllerService:
         finally:
             if run_claimed and dependency_run_key is not None:
                 self._finish_reconcile(dependency_run_key)
+
+    def _initialize_run(self, run: RunRecord, base_sha: str) -> dict:
+        """Create the durable external run root after identity is persisted.
+
+        Every mutating preparation step is idempotent so a human-authorized
+        recovery can safely resume a failure that happened before the Kanban
+        root card was registered.
+        """
+        self._operation(
+            f"{run.run_key}:remote-branch",
+            "remote-branch",
+            {
+                "run_key": run.run_key,
+                "branch": run.workspace.branch,
+                "base_sha": base_sha,
+            },
+            lambda: self.gitlab.create_delivery_branch(run),
+        )
+        self._operation(
+            f"{run.run_key}:workspace",
+            "workspace",
+            {"run_key": run.run_key, "base_sha": base_sha},
+            lambda: (
+                self.gitlab.ensure_workspace(run, base_sha)
+                or {"worktree": run.workspace.worktree}
+            ),
+        )
+        accepted_preflight = self.store.deployment_preflight()
+        if (
+            accepted_preflight is not None
+            and accepted_preflight.get("ok")
+            and accepted_preflight.get("deep")
+        ):
+            self._operation(
+                f"{run.run_key}:offline-caches",
+                "offline-caches",
+                {
+                    "run_key": run.run_key,
+                    "worktree": run.workspace.worktree,
+                },
+                lambda: self._prepare_offline_caches(run),
+            )
+        self._operation(
+            f"{run.run_key}:board",
+            "board",
+            {
+                "board": run.workspace.board,
+                "name": run.project.project_display_name,
+                "worktree": run.workspace.worktree,
+            },
+            lambda: (
+                self.kanban.ensure_board(
+                    run.workspace.board,
+                    run.project.project_display_name,
+                    run.workspace.worktree,
+                )
+                or {"board": run.workspace.board}
+            ),
+        )
+        root = self.kanban.create_root(run)
+        self._verify_root(root, run)
+        self.store.add_managed_card(
+            board=run.workspace.board,
+            card_id=root.id,
+            run_key=run.run_key,
+            stage="run-init",
+            iteration=0,
+            idempotency_key=f"{run.run_key}:run-init",
+            parent_card_id=None,
+            purpose="root",
+            created_at=root.created_at,
+        )
+        self._operation(
+            f"{run.run_key}:complete-root",
+            "complete-root",
+            {"board": run.workspace.board, "card_id": root.id},
+            lambda: self.kanban.complete_root(run, root.id)
+            or {"card_id": root.id},
+        )
+        first = self._create_work(run, Stage.SPEC_WRITE, root.id)
+        self._enqueue_progress(
+            run,
+            "run-accepted",
+            self._render_notification(
+                run,
+                icon="ℹ️",
+                title="已受理 PRD 自动交付",
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("阶段", format_stage(Stage.SPEC_WRITE)),
+                    ("Agent", format_agent(first.assignee)),
+                    ("Card", inline_code(first.id)),
+                ],
+            ),
+        )
+        self._enqueue_phase_started(run, Phase.SPEC, first)
+        return {
+            "run_key": run.run_key,
+            "source_key": run.source_key,
+            "run_generation": run.run_generation,
+            "project": run.project.project_path,
+            "stage": Stage.SPEC_WRITE.value,
+            "active_card": first.id,
+            "board": run.workspace.board,
+            "worktree": run.workspace.worktree,
+        }
 
     def _prepare_offline_caches(self, run: RunRecord) -> dict:
         command = self.config.offline_cache_command
@@ -726,6 +735,11 @@ class ControllerService:
 
     def status_summary(self, run_key: str) -> dict:
         """Return the authoritative local workflow snapshot without GitLab I/O."""
+        if (
+            hasattr(self.store, "cards_for_run")
+            and not self.store.cards_for_run(run_key)
+        ):
+            return self._initialization_status_summary(run_key)
         history, run = self._history(run_key)
         active = [item for item in history if item.task.status in ACTIVE_STATUSES]
         current = active[-1] if active else None
@@ -893,6 +907,113 @@ class ControllerService:
             },
         }
 
+    def _initialization_status_summary(self, run_key: str) -> dict:
+        """Describe a persisted Run that has not registered its root card yet."""
+        run = self.store.run_record(run_key)
+        if run is None:
+            raise ValueError(f"unknown run {run_key}")
+        control = self._run_control(run_key)
+        control_state = str(control.get("state") or "active")
+        store_health = self.store.health()
+        operations = []
+        for suffix in (
+            "remote-branch",
+            "workspace",
+            "offline-caches",
+            "board",
+            "complete-root",
+        ):
+            operation = self.store.operation_record(f"{run_key}:{suffix}")
+            if operation is None:
+                continue
+            created_at = int(operation.get("created_at") or 0)
+            updated_at = int(operation.get("updated_at") or created_at)
+            operations.append(
+                {
+                    "kind": operation["kind"],
+                    "status": operation["status"],
+                    "attempts": int(operation.get("attempts") or 0),
+                    "duration_seconds": max(0, updated_at - created_at),
+                    "error": operation.get("error"),
+                }
+            )
+        initialization_error = next(
+            (
+                str(operation["error"]).strip()[:1000]
+                for operation in reversed(operations)
+                if operation["status"] in {"failed", "uncertain", "blocked"}
+                and operation.get("error")
+            ),
+            None,
+        )
+        controller_cursor = int(
+            store_health["event_cursors"].get(run.workspace.board, 0)
+        )
+        return {
+            "run_key": run_key,
+            "source_key": run.source_key,
+            "run_generation": run.run_generation,
+            "started_at": run.started_at.isoformat(),
+            "provenance": run.provenance,
+            "control": control,
+            "transition_pending": control_state == "transition_pending",
+            "human_blocked": control_state == "human_blocked",
+            "retry_wait": control_state == "retry_wait",
+            "notification_level": self.config.notification_level.value,
+            "phase": (
+                "exception"
+                if control_state == "exception"
+                else "initialization"
+            ),
+            "stage": "run-initialization",
+            "active_card": None,
+            "attempts": {},
+            "review_attempts": {},
+            "review_remaining": {},
+            "code_modifications": {
+                "used": 0,
+                "remaining": self.config.code_modification_limit,
+                "limit": self.config.code_modification_limit,
+            },
+            "protocol_failures": {},
+            "blocked": (
+                initialization_error
+                or control.get("last_transition_reason")
+                if control_state == "exception"
+                else None
+            ),
+            "merge_wait": None,
+            "worker_runtime": [],
+            "attempt_timeline": [],
+            "delivery_binding": None,
+            "reconcile": {
+                "pending": False,
+                "queue": [],
+                "current_step": None,
+            },
+            "initialization": {
+                "completed": False,
+                "operations": operations,
+            },
+            "board": run.workspace.board,
+            "worktree": run.workspace.worktree,
+            "repository_base_sha": run.workspace.repository_base_sha,
+            "snapshot": {
+                "authority": "controller-store",
+                "gitlab_audit": "not_requested",
+                "controller_event_cursor": controller_cursor,
+                "kanban_max_event_id": controller_cursor,
+                "event_lag": 0,
+                "event_lag_warning": False,
+                "outbox_pending": store_health["outbox_pending"],
+                "failed_operations": store_health["failed_operations"],
+                "dependency_outages": store_health.get(
+                    "dependency_outages",
+                    [],
+                ),
+            },
+        }
+
     def preflight(self, *, deep: bool = False) -> dict:
         if self.config.controller_mode != "preflight":
             raise ValueError("preflight_requires_controller_preflight_mode")
@@ -910,7 +1031,7 @@ class ControllerService:
             checks["gitlab_token"] = {
                 "ok": True,
                 "source": str(self.config.controller_token_file),
-                "identity": "dedicated-controller",
+                "identity": "dispatcher-controller",
             }
         except Exception as exc:  # noqa: BLE001 - structured preflight result
             checks["gitlab_token"] = {
@@ -1862,7 +1983,17 @@ class ControllerService:
             if not self._begin_reconcile(request.run_key):
                 raise RunPolicyError(f"request_in_progress:{key}")
             run_claimed = True
-            history, run = self._history(request.run_key)
+            try:
+                history, run = self._history(request.run_key)
+                initialization_pending = False
+            except ValueError as exc:
+                if str(exc) != f"unknown run {request.run_key}":
+                    raise
+                run = self.store.run_record(request.run_key)
+                if run is None:
+                    raise
+                history = []
+                initialization_pending = True
             if (
                 request.sender != run.origin.initiator_open_id
                 and request.sender not in self.config.abort_admin_open_ids
@@ -1898,6 +2029,20 @@ class ControllerService:
                 reason=f"human_exception_recovery:{request.reason}",
                 expected_version=int(control["state_version"]),
             )
+            resumed_initialization = None
+            if initialization_pending:
+                try:
+                    resumed_initialization = self._initialize_run(
+                        run,
+                        run.workspace.repository_base_sha,
+                    )
+                except Exception as exc:
+                    self.store.set_run_exception(
+                        request.run_key,
+                        self._error_text(exc),
+                    )
+                    self._enqueue_controller_failure(request.run_key, exc)
+                    raise
             self.store.enqueue(
                 (
                     f"{request.run_key}:exception-recovered:"
@@ -1926,8 +2071,19 @@ class ControllerService:
                 "run_key": request.run_key,
                 "state": recovered["state"],
                 "state_version": recovered["state_version"],
-                "continuation": "pending-reconcile",
+                "continuation": (
+                    "initialization-resumed"
+                    if resumed_initialization is not None
+                    else "pending-reconcile"
+                ),
             }
+            if resumed_initialization is not None:
+                response.update(
+                    {
+                        "stage": resumed_initialization["stage"],
+                        "active_card": resumed_initialization["active_card"],
+                    }
+                )
             self.store.finish_request(key, response)
             return response
         except DependencyContractError as exc:
@@ -6137,15 +6293,25 @@ class ControllerService:
     def _enqueue_controller_failure(self, run_key: str, error: Exception) -> None:
         try:
             root = next(
-                card
-                for card in self.store.cards_for_run(run_key)
-                if card.purpose == "root"
+                (
+                    card
+                    for card in self.store.cards_for_run(run_key)
+                    if card.purpose == "root"
+                ),
+                None,
             )
-            task = self.reader.task(root.board, root.card_id)
-            if task is None:
+            if root is None:
+                run = self.store.run_record(run_key)
+            else:
+                task = self.reader.task(root.board, root.card_id)
+                run = (
+                    parse_run_body(task.body)
+                    if task is not None
+                    else self.store.run_record(run_key)
+                )
+            if run is None:
                 return
-            run = parse_run_body(task.body)
-        except (StopIteration, ValidationError, ValueError, json.JSONDecodeError):
+        except (ValidationError, ValueError, json.JSONDecodeError):
             return
         reason = f"{type(error).__name__}: {self._error_text(error)}"
         suffix = hashlib.sha256(reason.encode()).hexdigest()[:12]

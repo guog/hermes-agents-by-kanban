@@ -22,9 +22,8 @@ class ComposeContractTests(unittest.TestCase):
         self.assertEqual(
             controller["entrypoint"],
             [
-                "/opt/hermes/.venv/bin/python",
-                "-m",
-                "hollysys_controller.daemon",
+                "/bin/sh",
+                "/opt/fleet/container/run-hollysys-controller.sh",
             ],
         )
         self.assertNotIn("secrets", hermes)
@@ -44,6 +43,15 @@ class ComposeContractTests(unittest.TestCase):
             "controller-socket:/run/hollysys-controller",
             hermes["volumes"],
         )
+        self.assertIn(
+            "./controller/config.yaml:/opt/hollysys-controller/config.yaml:ro",
+            hermes["volumes"],
+        )
+        entrypoint = (
+            self.root / "container" / "run-hollysys-controller.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('usermod -u "$target_uid" hermes', entrypoint)
+        self.assertIn('groupmod -o -g "$target_gid" hermes', entrypoint)
 
     def test_container_health_uses_local_liveness_probe(self) -> None:
         healthcheck = self.compose["services"]["hermes"]["healthcheck"]
@@ -64,6 +72,10 @@ class ComposeContractTests(unittest.TestCase):
         self.assertIn("DOTNET_SDK_VERSION=8.0.423", dockerfile)
         self.assertIn("jq", dockerfile)
         self.assertIn("patch-hermes-terminal.py", dockerfile)
+        self.assertIn(
+            "chmod -R a+rX /opt/hollysys-controller-src",
+            dockerfile,
+        )
 
     def test_feishu_adapter_dependencies_are_pinned_and_verified(self) -> None:
         service = self.compose["services"]["hermes"]
@@ -104,6 +116,15 @@ class ComposeContractTests(unittest.TestCase):
         self.assertEqual(
             service["container_name"],
             "${HERMES_CONTAINER_NAME:-hermes}",
+        )
+
+    def test_default_network_avoids_company_172_routes(self) -> None:
+        subnet = self.compose["networks"]["default"]["ipam"]["config"][0][
+            "subnet"
+        ]
+        self.assertEqual(
+            subnet,
+            "${HOLLYSYS_DOCKER_SUBNET:-10.253.252.0/29}",
         )
 
     def test_image_uses_derived_v4_image_for_linux_amd64(self) -> None:
