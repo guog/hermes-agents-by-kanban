@@ -340,10 +340,10 @@ model:
   base_url: https://chatgpt.com/backend-api/codex
 
 agent:
-  reasoning_effort: high
+  reasoning_effort: xhigh
 ```
 
-`agent.reasoning_effort: high` 是 Agent 主模型的全局默认值，也由未显式设置推理强度的委派调用继承。它比 Hermes 未配置时的 `medium` 使用更多推理 token，并可能增加延迟和账户用量。该值不是不可覆盖的策略锁；会话内显式 `/reasoning` 的优先级更高。辅助任务保留各自的推理默认值。
+`agent.reasoning_effort: xhigh` 是 Agent 主模型的全局默认值，也由未显式设置推理强度的委派调用继承。它比 Hermes 未配置时的 `medium` 使用更多推理 token，并可能增加延迟和账户用量。该值不是不可覆盖的策略锁；会话内显式 `/reasoning` 的优先级更高。辅助任务保留各自的推理默认值。
 
 上游依据：[Hermes v2026.7.20 Reasoning Effort 文档](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/website/docs/user-guide/configuration.md#reasoning-effort)。
 
@@ -384,7 +384,7 @@ OPENAI_BASE_URL=https://api.deepseek.com/v1
 OPENAI_API_KEY=<实际 API Key>
 ```
 
-再把全部 12 个 Profile 的 `model` 块统一切换；`agent.reasoning_effort: high` 保持不变：
+再把全部 12 个 Profile 的 `model` 块统一切换；`agent.reasoning_effort: xhigh` 保持不变：
 
 ```yaml
 model:
@@ -393,7 +393,7 @@ model:
   base_url: ${OPENAI_BASE_URL}
 
 agent:
-  reasoning_effort: high
+  reasoning_effort: xhigh
 ```
 
 `deepseek-chat` 只是 OpenAI-compatible 示例，实际部署使用服务商提供的模型 ID。仅设置环境变量不会覆盖 Codex provider；必须统一修改 12 个 Profile，禁止不同 Profile 混用 OAuth 与 API Key。API Key 只写入被忽略的根 `.env`，不要写入 `config.yaml`、`docker-compose.yaml` 或文档。
@@ -404,7 +404,7 @@ agent:
 docker compose up -d --force-recreate hermes
 ```
 
-如果兼容服务不接受 `high`，停止切换并报告兼容性问题，不要静默降低推理强度。
+如果兼容服务不接受 `xhigh`，停止切换并报告兼容性问题，不要静默降低推理强度。
 
 #### 3.4.3 Git identity
 
