@@ -127,6 +127,19 @@ class ComposeContractTests(unittest.TestCase):
             "${HOLLYSYS_DOCKER_SUBNET:-10.253.252.0/29}",
         )
 
+    def test_all_agent_profiles_default_to_xhigh_reasoning(self) -> None:
+        profile_configs = sorted(
+            (self.root / "data" / "profiles").glob("*/config.yaml")
+        )
+        self.assertEqual(len(profile_configs), 12)
+        for config_path in profile_configs:
+            with self.subTest(profile=config_path.parent.name):
+                config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    config["agent"]["reasoning_effort"],
+                    "xhigh",
+                )
+
     def test_image_uses_derived_v4_image_for_linux_amd64(self) -> None:
         service = self.compose["services"]["hermes"]
         self.assertEqual(service["platform"], "linux/amd64")

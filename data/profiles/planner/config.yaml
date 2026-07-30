@@ -4,7 +4,7 @@ model:
   default: gpt-5.6-sol
   base_url: https://chatgpt.com/backend-api/codex
 agent:
-  reasoning_effort: high
+  reasoning_effort: xhigh
 tool_output:
   max_bytes: 12000
   max_lines: 400
