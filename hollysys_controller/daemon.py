@@ -35,7 +35,7 @@ class ControllerDaemon:
                     self.service.start,
                     request.params,
                 )
-            if request.method == "status":
+            if request.method in {"status", "status-summary"}:
                 run_key = str(request.params.get("run_key") or "")
                 if not run_key:
                     raise ValueError("run_key is required")

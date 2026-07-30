@@ -14,6 +14,9 @@ EXPECTED = {
     "agent/conversation_loop.py": (
         "c9111ed90d038299f31848e97de1501ad06915c9459b4437934c79956119231b"
     ),
+    "agent/system_prompt.py": (
+        "261481c471ddee92ced3fe381d63acbbe9136bedb6420f613983225007e2bb9a"
+    ),
 }
 TERMINAL_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
@@ -126,14 +129,44 @@ def patch_loop(text: str) -> str:
     )
 
 
+def patch_system_prompt(text: str) -> str:
+    return replace_once(
+        text,
+        "    else:\n"
+        "        stable_parts.append(\n"
+        "            f\"Active Hermes profile: {active_profile}. This session reads \"\n"
+        "            f\"and writes {get_hermes_home()}/profiles/{active_profile}/. The default \"\n"
+        "            f\"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, \"\n"
+        "            f\"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a \"\n",
+        "    else:\n"
+        "        from hermes_constants import get_default_hermes_root\n"
+        "        profile_root = get_default_hermes_root()\n"
+        "        stable_parts.append(\n"
+        "            f\"Active Hermes profile: {active_profile}. This session reads \"\n"
+        "            f\"and writes {get_hermes_home()}/. The default \"\n"
+        "            f\"profile's data lives at {profile_root}/skills/, {profile_root}/plugins/, \"\n"
+        "            f\"{profile_root}/cron/, {profile_root}/memories/ — those belong to a \"\n",
+        label="active profile path",
+    )
+
+
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: patch-hermes-terminal.py HERMES_SOURCE_ROOT")
-    root = Path(sys.argv[1]).resolve()
+    system_prompt_only = (
+        len(sys.argv) == 3 and sys.argv[1] == "--system-prompt-only"
+    )
+    if len(sys.argv) != 2 and not system_prompt_only:
+        raise SystemExit(
+            "usage: patch-hermes-terminal.py "
+            "[--system-prompt-only] HERMES_SOURCE_ROOT"
+        )
+    root = Path(sys.argv[-1]).resolve()
     patches = {
         "agent/tool_executor.py": patch_executor,
         "agent/conversation_loop.py": patch_loop,
+        "agent/system_prompt.py": patch_system_prompt,
     }
+    if system_prompt_only:
+        patches = {"agent/system_prompt.py": patch_system_prompt}
     for relative, patcher in patches.items():
         path = root / relative
         original = path.read_bytes()

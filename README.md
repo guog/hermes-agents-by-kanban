@@ -32,8 +32,8 @@ Compose 有两个独立 service：
 - `hermes` 运行 Dashboard、Gateway 与业务 Agent。
 - `controller` 独立运行持久 Controller daemon；重启不打断 Hermes service。
 - 两者使用同一派生镜像和只包含 Unix socket 的共享 volume。Controller state 使用
-  独立宿主目录，专属 Maintainer bot token 只作为 Controller service secret 挂载，
-  不进入任何 Agent Profile。
+  独立宿主目录；Dispatcher Maintainer token 的 `0600` 镜像文件只作为 Controller
+  service secret 挂载，不通过容器环境变量扩散。
 - Dashboard 发布到宿主机所有网卡，局域网用户使用同一组固定账号访问。
 - 镜像构建对 Hermes 源文件做 SHA-256 指纹校验；源码漂移时 fail closed，不模糊套补丁。
 - deep preflight 在线准备项目 npm/NuGet 依赖；业务 Profile 只继承离线缓存设置。
@@ -185,9 +185,9 @@ Controller 在每个新 run 的唯一 worktree 建立后、第一张业务卡发
 | `tester` | 对精确 MR head 独立测试 | Reporter | 否 |
 | `code-reviewer` | 对同一 MR head 独立审查代码 | Reporter | 否 |
 
-Controller 不是 Agent Profile。它从仅挂载到 Controller service 的 0400 secret 读取
-专属 Maintainer bot token，并独占 branch/MR 创建、run claim、正式卡创建、GitLab
-门禁复核和 `sha=<checked_head>` 合并。准入要求该 token 与所有 Profile token 均不相同；
+Controller 不是 Agent Profile。它从仅挂载到 Controller service 的 secret 读取
+Dispatcher Maintainer token 的镜像，并独占 branch/MR 创建、run claim、正式卡创建、
+GitLab 门禁复核和 `sha=<checked_head>` 合并。准入要求该 token 与 Dispatcher 完全一致；
 Dispatcher 的 Git transport 仍由角色 wrapper 禁止 push。
 
 每个 Profile 已直接位于 Hermes 官方运行态目录。`SOUL.md`、Memory 和角色 Skill 不需要复制或安装。Memory 与 Skill 写入继续使用：
@@ -295,11 +295,11 @@ Git wrapper 仍拒绝 push。
 
 ### 3.2.1 Controller Maintainer 凭据
 
-Controller 始终复用 `data/profiles/dispatcher/.env` 中的 `GITLAB_TOKEN`，不再维护
-`data/controller/gitlab-token` 第二份凭据。Dispatcher token 必须具有目标群组的
-Maintainer 权限；Controller 启动时复用 Dispatcher Profile 的身份、host、allowed
-groups、文件所有权和 `0600` 权限校验。轮换 Dispatcher token 后必须在 preflight
-模式重新执行 deep preflight，再恢复 active。
+Controller 始终复用 `data/profiles/dispatcher/.env` 中的 `GITLAB_TOKEN`。Compose
+要求把同一值镜像到 `${HOLLYSYS_CONTROLLER_GITLAB_TOKEN_FILE}` 指向的 `0600` 文件，
+并只挂载给 Controller service。Dispatcher token 必须具有目标群组的 Maintainer
+权限；preflight 强制核对两处值一致。轮换 Dispatcher token 后必须同步 secret 镜像，
+切回 preflight 模式重新执行 deep preflight，再恢复 active。
 
 五类 identity 白名单可填写 GitLab numeric
 user id、username 或显示名，用逗号分隔；留空会使对应 gate 必然失败。
@@ -839,8 +839,8 @@ unblock，也不会创建 continuation/恢复 gate；来源不明的 `promoted_m
 - Controller 只认 `managed_cards` 中的 ID，并回读核对 `created_by=hollysys-controller`、
   idempotency、parent、assignee、Skill 和严格 card JSON。
 - completion schema 由 worker 自检、Controller 强制验证；非法 done 卡不能推进。
-- Controller 使用独立 Maintainer bot/token，且必须与 Dispatcher 和全部 Profile token
-  不同；checked-head merge、Draft MR 创建与 ready 切换只由 Controller 流程执行，
+- Controller 使用 Dispatcher Maintainer token 的只读 secret 镜像，preflight 强制
+  两处值一致；checked-head merge、Draft MR 创建与 ready 切换只由 Controller 流程执行，
   Agent Git wrapper 额外拒绝 Dispatcher push。
 - Memory/Skill 修改仍经过 Hermes 官方 write approval。
 - Hermes 补丁保证成功 `kanban_complete`/`kanban_block` 后停止同批后续业务工具和下一次

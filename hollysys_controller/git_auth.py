@@ -655,9 +655,18 @@ def summarize_profile_preflight(
         ).hexdigest()
     except (OSError, ValueError):
         controller_fingerprint = None
-    controller_is_distinct = bool(
+    dispatcher_fingerprint = next(
+        (
+            item.get("token_fingerprint")
+            for item in profiles
+            if item.get("profile") == "dispatcher"
+        ),
+        None,
+    )
+    controller_matches_dispatcher = bool(
         controller_fingerprint
-        and controller_fingerprint not in fingerprints
+        and dispatcher_fingerprint
+        and controller_fingerprint == dispatcher_fingerprint
     )
     auth_executable_fingerprints: list[str] = []
     for path in (
@@ -699,12 +708,12 @@ def summarize_profile_preflight(
     return {
         "ok": all(item["ok"] for item in profiles)
         and not duplicates
-        and controller_is_distinct,
+        and controller_matches_dispatcher,
         "deep": deep,
         "profiles": safe_profiles,
         "unique_profile_tokens": not duplicates,
-        "controller_token_distinct_from_profiles": controller_is_distinct,
-        "controller_token_source": "dedicated-secret-file",
+        "controller_token_matches_dispatcher": controller_matches_dispatcher,
+        "controller_token_source": "dispatcher-secret-mirror",
         # Internal activation binding. ControllerService removes this field
         # before returning or persisting any health/preflight report.
         "_credential_contract_digest": credential_contract_digest,

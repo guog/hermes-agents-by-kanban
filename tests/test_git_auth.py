@@ -426,12 +426,11 @@ class GitAuthenticationTests(unittest.TestCase):
         cfg = config(self.root)
         cfg.gitlab_host = "green-git.hollysys.net"
         cfg.profiles_root = self.root / "profiles"
-        cfg.controller_token_file.write_text(
-            "dedicated-controller-token\n",
-            encoding="utf-8",
-        )
-        cfg.controller_token_file.chmod(0o600)
+        dispatcher_token = ""
         for index, profile in enumerate(sorted(ALL_PROFILES), start=1):
+            profile_token = f"profile-token-{index}"
+            if profile == "dispatcher":
+                dispatcher_token = profile_token
             profile_root = cfg.profiles_root / profile
             (profile_root / "home").mkdir(parents=True)
             env_file = profile_root / ".env"
@@ -441,21 +440,26 @@ class GitAuthenticationTests(unittest.TestCase):
                         f"HERMES_PROFILE={profile}",
                         "GITLAB_HOST=https://green-git.hollysys.net",
                         "GITLAB_ALLOWED_GROUPS=group",
-                        f"GITLAB_TOKEN=profile-token-{index}",
+                        f"GITLAB_TOKEN={profile_token}",
                     ]
                 )
                 + "\n",
                 encoding="utf-8",
             )
             env_file.chmod(0o600)
+        cfg.controller_token_file.write_text(
+            f"{dispatcher_token}\n",
+            encoding="utf-8",
+        )
+        cfg.controller_token_file.chmod(0o600)
 
         result = summarize_profile_preflight(cfg, deep=False)
         self.assertTrue(result["ok"])
         self.assertTrue(result["unique_profile_tokens"])
-        self.assertTrue(result["controller_token_distinct_from_profiles"])
+        self.assertTrue(result["controller_token_matches_dispatcher"])
         self.assertEqual(
             result["controller_token_source"],
-            "dedicated-secret-file",
+            "dispatcher-secret-mirror",
         )
         self.assertNotIn("token_fingerprint", str(result))
 

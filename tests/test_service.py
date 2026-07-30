@@ -1994,6 +1994,77 @@ class ServiceRecoveryTests(unittest.TestCase):
             ],
         )
 
+    def test_pre_root_exception_is_visible_and_human_recoverable(self) -> None:
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / "pre-root-controller.db")
+        service.store.save_run(self.run)
+        service.store.ensure_run_control(self.run.run_key)
+        service.store.operation_result(
+            f"{self.run.run_key}:board",
+            "board",
+            {
+                "board": self.run.workspace.board,
+                "name": self.run.project.project_display_name,
+                "worktree": self.run.workspace.worktree,
+            },
+        )
+        service.store.mark_operation_uncertain(
+            f"{self.run.run_key}:board",
+            "profile override failed: permission denied",
+        )
+        service.store.set_run_exception(
+            self.run.run_key,
+            f"unknown run {self.run.run_key}",
+        )
+
+        summary = service.status_summary(self.run.run_key)
+
+        self.assertEqual(summary["phase"], "exception")
+        self.assertEqual(summary["stage"], "run-initialization")
+        self.assertIsNone(summary["active_card"])
+        self.assertEqual(
+            summary["initialization"]["operations"][0]["status"],
+            "uncertain",
+        )
+        self.assertIn("permission denied", summary["blocked"])
+        self.assertNotIn("unknown run", summary["blocked"])
+
+        service._initialize_run = lambda run, base_sha: {
+            "stage": Stage.SPEC_WRITE.value,
+            "active_card": "t_spec",
+        }
+        recovered = service.recover(
+            {
+                "run_key": self.run.run_key,
+                "message_id": "om_recover_pre_root",
+                "sender": self.run.origin.initiator_open_id,
+                "chat_id": self.run.origin.chat_id,
+                "thread_id": self.run.origin.thread_id,
+                "reason": "container UID and profile access verified",
+            }
+        )
+
+        self.assertEqual(recovered["state"], "active")
+        self.assertEqual(recovered["continuation"], "initialization-resumed")
+        self.assertEqual(recovered["active_card"], "t_spec")
+
+    def test_pre_root_controller_failure_is_not_silently_dropped(self) -> None:
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / "pre-root-notify.db")
+        service.store.save_run(self.run)
+        service.store.ensure_run_control(self.run.run_key)
+
+        service._enqueue_controller_failure(
+            self.run.run_key,
+            PermissionError("profile override failed"),
+        )
+
+        pending = service.store.pending_outbox(limit=10)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["event"], "controller-failure")
+
     def test_watchdog_redispatches_only_after_confirmed_exit_and_identity_checks(
         self,
     ) -> None:

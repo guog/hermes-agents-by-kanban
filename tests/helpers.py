@@ -64,7 +64,7 @@ def write_profile_env(
     if not cfg.controller_token_file.exists():
         cfg.controller_token_file.parent.mkdir(parents=True, exist_ok=True)
         cfg.controller_token_file.write_text(
-            "dedicated-controller-token\n",
+            f"{token if profile == 'dispatcher' else 'controller-token'}\n",
             encoding="utf-8",
         )
         cfg.controller_token_file.chmod(0o600)

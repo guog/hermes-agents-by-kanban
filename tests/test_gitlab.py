@@ -590,7 +590,7 @@ class GitLabGateTests(unittest.TestCase):
 
         self.assertEqual(
             env["GITLAB_TOKEN"],
-            "dedicated-controller-token",
+            "controller-token",
         )
         for key in inherited:
             self.assertNotIn(key, env)

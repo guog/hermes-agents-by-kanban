@@ -9,9 +9,8 @@ services:
     container_name: ${HOLLYSYS_CONTROLLER_CONTAINER_NAME:-hollysys-controller}
     restart: unless-stopped
     entrypoint:
-      - /opt/hermes/.venv/bin/python
-      - -m
-      - hollysys_controller.daemon
+      - /bin/sh
+      - /opt/fleet/container/run-hollysys-controller.sh
     env_file:
       - .env
     environment:
@@ -74,6 +73,7 @@ services:
       HERMES_SCRATCH_DIR: /opt/data/scratch
       HERMES_WRITE_SAFE_ROOT: /opt/data:/workspace/projects
       HOLLYSYS_CONTROLLER_SOCKET: /run/hollysys-controller/controller.sock
+      HOLLYSYS_CONTROLLER_CONFIG: /opt/hollysys-controller/config.yaml
       PATH: /run/hollysys/bin:/opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       PIP_CONFIG_FILE: /etc/pip.conf
       NPM_CONFIG_USERCONFIG: /opt/fleet/container/mirrors/npmrc
@@ -83,6 +83,9 @@ services:
       - ${HERMES_DATA_DIR:-./data}:/opt/data
       - ${PROJECTS_DIR:-./projects}:/workspace/projects
       - controller-socket:/run/hollysys-controller
+      - ./cli:/opt/cli:ro
+      - ./skills:/opt/skills:ro
+      - ./controller/config.yaml:/opt/hollysys-controller/config.yaml:ro
       - ./container:/opt/fleet/container:ro
       - ./templates:/opt/fleet/templates:ro
       - ./schemas:/opt/fleet/schemas:ro
@@ -106,3 +109,9 @@ secrets:
 
 volumes:
   controller-socket:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${HOLLYSYS_DOCKER_SUBNET:-10.253.252.0/29}

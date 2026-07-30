@@ -12,7 +12,6 @@ from .config import ControllerConfig
 from .models import RpcRequest
 from .rpc import rpc_call
 from .service import ControllerService
-from .store import ControllerStore
 
 
 def controller_snapshot_config(config: ControllerConfig) -> ControllerConfig:
@@ -154,17 +153,6 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
 
 async def _run(args: argparse.Namespace) -> int:
     method, params = params_for(args)
-    if method == "status-summary":
-        config = controller_snapshot_config(ControllerConfig.load())
-        store = ControllerStore(
-            config.state_dir / "controller.db",
-            read_only=True,
-        )
-        result = ControllerService(config, store=store).status_summary(
-            str(params["run_key"])
-        )
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
     if method == "preflight":
         config = controller_snapshot_config(ControllerConfig.load())
         result = ControllerService(config).preflight(

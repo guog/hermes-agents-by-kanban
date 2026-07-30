@@ -15,6 +15,7 @@ RUN test "${TARGETARCH:-amd64}" = "amd64" \
         ca-certificates \
         curl \
         jq \
+        libicu76 \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,7 +25,7 @@ RUN set -eux; \
     echo "${NODE_SHA256}  ${node_archive}" | sha256sum -c -; \
     tar -xJf "${node_archive}" -C /usr/local --strip-components=1; \
     rm -f "${node_archive}"; \
-    node_major="$(node --version | sed -E 's/^v([0-9]+).*/\\1/')"; \
+    node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"; \
     npm_major="$(npm --version | cut -d. -f1)"; \
     test "${node_major}" -ge 22; \
     test "${npm_major}" -ge 10
@@ -41,9 +42,9 @@ RUN set -eux; \
     dotnet --list-sdks | grep -Fx "${DOTNET_SDK_VERSION} [/usr/share/dotnet/sdk]"
 
 COPY requirements-controller.txt /opt/hollysys-controller-src/
-RUN /opt/hermes/.venv/bin/pip install \
-        --disable-pip-version-check \
-        --no-cache-dir \
+RUN /usr/local/bin/uv pip install \
+        --python /opt/hermes/.venv/bin/python \
+        --no-cache \
         -r /opt/hollysys-controller-src/requirements-controller.txt
 
 COPY container/patch-hermes-terminal.py /opt/hollysys-build/
@@ -56,7 +57,8 @@ COPY hollysysctl /usr/local/bin/hollysysctl
 COPY cli /opt/cli
 COPY container/git /opt/fleet/container/git
 COPY container/install-git-wrapper.sh /opt/fleet/container/install-git-wrapper.sh
-RUN chmod 0555 /usr/local/bin/hollysysctl \
+RUN chmod -R a+rX /opt/hollysys-controller-src \
+    && chmod 0555 /usr/local/bin/hollysysctl \
     && sh /opt/fleet/container/install-git-wrapper.sh \
     && /opt/hermes/.venv/bin/python -m py_compile \
         /opt/hollysys-controller-src/hollysys_controller/*.py \

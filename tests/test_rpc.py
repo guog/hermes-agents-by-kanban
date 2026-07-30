@@ -69,7 +69,7 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
             ControllerFatalError,
         )
 
-    def test_status_summary_is_a_local_cli_command(self) -> None:
+    def test_status_summary_is_an_rpc_command(self) -> None:
         args = build_parser().parse_args(
             [
                 "status-summary",
@@ -84,6 +84,27 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
                 "status-summary",
                 {"run_key": "hollysys-abcdefghijklmnopqrst"},
             ),
+        )
+
+    async def test_daemon_routes_status_summary_to_service(self) -> None:
+        daemon = ControllerDaemon.__new__(ControllerDaemon)
+        daemon.service = SimpleNamespace(
+            status_summary=lambda run_key: {"run_key": run_key},
+        )
+        daemon.fatal_event = asyncio.Event()
+        daemon.rpc_fatal_error = None
+
+        result = await daemon.handle_rpc(
+            RpcRequest(
+                id="summary-1",
+                method="status-summary",
+                params={"run_key": "hollysys-abcdefghijklmnopqrst"},
+            )
+        )
+
+        self.assertEqual(
+            result,
+            {"run_key": "hollysys-abcdefghijklmnopqrst"},
         )
 
     def test_status_summary_ignores_the_agent_profile_home(self) -> None:

@@ -722,6 +722,7 @@ class RpcRequest(StrictModel):
     method: Literal[
         "start",
         "status",
+        "status-summary",
         "resolve",
         "recover",
         "health",

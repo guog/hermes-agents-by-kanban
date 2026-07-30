@@ -45,6 +45,7 @@ projects/*
 __pycache__/
 *.pyc
 .DS_Store
+._*
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
