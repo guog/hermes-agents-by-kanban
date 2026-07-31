@@ -1,6 +1,6 @@
 services:
   controller:
-    image: ${HOLLYSYS_IMAGE:-hollysys/hermes-agent:v4}
+    image: ${HOLLYSYS_IMAGE:-hollysys-hermes-agents:latest}
     build:
       context: .
       args:
@@ -53,7 +53,7 @@ services:
       start_period: 30s
 
   hermes:
-    image: ${HOLLYSYS_IMAGE:-hollysys/hermes-agent:v4}
+    image: ${HOLLYSYS_IMAGE:-hollysys-hermes-agents:latest}
     build:
       context: .
       args:
