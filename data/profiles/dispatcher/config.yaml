@@ -60,6 +60,7 @@ skills:
     - blogwatcher
     - claude-design
     - evaluating-llms-harness
+    - gif-search
     - github-auth
     - github-code-review
     - github-issues
@@ -92,6 +93,7 @@ skills:
     - teams-meeting-pipeline
     - touchdesigner-mcp
     - weights-and-biases
+    - xurl
     - youtube-content
     - yuanbao
   external_dirs:
