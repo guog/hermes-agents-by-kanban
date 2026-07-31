@@ -27,14 +27,12 @@ class ControllerDaemon:
         self.stop_event = asyncio.Event()
         self.fatal_event = asyncio.Event()
         self.rpc_fatal_error: ControllerFatalError | None = None
+        self.background_requests: set[asyncio.Task[dict]] = set()
 
     async def handle_rpc(self, request: RpcRequest) -> dict:
         try:
             if request.method == "start":
-                return await asyncio.to_thread(
-                    self.service.start,
-                    request.params,
-                )
+                return await self._handle_start(request.params)
             if request.method in {"status", "status-summary"}:
                 run_key = str(request.params.get("run_key") or "")
                 if not run_key:
@@ -102,6 +100,39 @@ class ControllerDaemon:
             self.fatal_event.set()
             raise
 
+    async def _handle_start(self, params: dict) -> dict:
+        """Accept long cold-start work without holding the RPC client open."""
+        task = asyncio.create_task(
+            asyncio.to_thread(self.service.start, params),
+            name="start-request",
+        )
+        self.background_requests.add(task)
+        task.add_done_callback(self._background_request_done)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self.config.start_request_sync_timeout_seconds,
+            )
+        except TimeoutError:
+            return await asyncio.to_thread(
+                self.service.start_request_status,
+                params,
+            )
+
+    def _background_request_done(self, task: asyncio.Task[dict]) -> None:
+        self.background_requests.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            LOG.error(
+                "accepted background start request failed: %s",
+                error,
+            )
+            if isinstance(error, ControllerFatalError):
+                self.rpc_fatal_error = error
+                self.fatal_event.set()
+
     async def run(self) -> None:
         await self.rpc.start()
         stop_task = asyncio.create_task(self.stop_event.wait(), name="shutdown")
@@ -161,12 +192,14 @@ class ControllerDaemon:
             exit_reason = f"unclassified_fatal:{type(exc).__name__}:{exc}"
             raise ControllerFatalError(exit_reason) from exc
         finally:
-            for task in (stop_task, fatal_task, *background):
+            request_tasks = tuple(self.background_requests)
+            for task in (stop_task, fatal_task, *background, *request_tasks):
                 task.cancel()
             await asyncio.gather(
                 stop_task,
                 fatal_task,
                 *background,
+                *request_tasks,
                 return_exceptions=True,
             )
             await self.rpc.close()

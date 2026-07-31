@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the Hollysys terminal Kanban patch to one pinned Hermes source tree."""
+"""Apply Hollysys Kanban runtime patches to one pinned Hermes source tree."""
 
 from __future__ import annotations
 
@@ -16,6 +16,24 @@ EXPECTED = {
     ),
     "agent/system_prompt.py": (
         "261481c471ddee92ced3fe381d63acbbe9136bedb6420f613983225007e2bb9a"
+    ),
+    "agent/turn_finalizer.py": (
+        "b23acd0d2e896c8e47f227751e257733ccd7bead026f04c3bb691bf6db3bd162"
+    ),
+    "cli.py": (
+        "cbcf1780174a03b225508244575915225a36502f54ad4cddf1da644d9174fec4"
+    ),
+    "gateway/run.py": (
+        "c6e0f443772e4a8a7eac0d9ccf9a4f659de5fc5493c572a69a46e4c61a8aa966"
+    ),
+    "hermes_cli/kanban_db.py": (
+        "6adf52e2e8445afe51ce1d3bbf1676ca550d525c9c17035bde026587d46e9c3b"
+    ),
+    "tools/delegate_tool.py": (
+        "df54e9d8797c471947d43807a6530410843a7002c0a271739c7bbbfca9efaf6f"
+    ),
+    "tools/kanban_tools.py": (
+        "d8aebd3e0e3dec2fe2573c1e0fe4222ca0d1e96540cf3c53b20c6fc916069835"
     ),
 }
 TERMINAL_TOOLS = frozenset({"kanban_complete", "kanban_block"})
@@ -105,6 +123,23 @@ def patch_executor(text: str) -> str:
         "        # ── Per-tool /steer drain ───────────────────────────────────\n",
         label="sequential terminal stop",
     )
+    text = replace_once(
+        text,
+        '        elif function_name == "todo":\n',
+        "        elif (\n"
+        "            function_name in _HOLLYSYS_TERMINAL_TOOLS\n"
+        "            and getattr(agent, \"_parent_session_id\", None)\n"
+        "        ):\n"
+        "            function_result = json.dumps({\n"
+        "                \"error\": (\n"
+        "                    \"delegated subagents cannot complete or block the \"\n"
+        "                    \"parent Kanban task; return findings to the parent\"\n"
+        "                )\n"
+        "            }, ensure_ascii=False)\n"
+        "            tool_duration = time.time() - tool_start_time\n"
+        '        elif function_name == "todo":\n',
+        label="delegated terminal runtime guard",
+    )
     return text
 
 
@@ -126,6 +161,321 @@ def patch_loop(text: str) -> str:
         "                    break\n\n"
         "                if agent._tool_guardrail_halt_decision is not None:\n",
         label="conversation terminal exit",
+    )
+
+
+def patch_turn_finalizer(text: str) -> str:
+    text = replace_once(
+        text,
+        '    if _last_msg_role == "tool" and not interrupted:\n'
+        '        # Agent was mid-work — this is the "just stops" case.\n'
+        "        logger.warning(\n"
+        '            "Turn ended with pending tool result (agent may appear stuck). "\n'
+        '            + _diag_msg + " last_tool=%s",\n'
+        "            *_diag_args, _last_tool_name,\n"
+        "        )\n"
+        "    else:\n"
+        "        logger.info(_diag_msg, *_diag_args)\n",
+        '    if (\n'
+        '        _last_msg_role == "tool"\n'
+        "        and not interrupted\n"
+        '        and _turn_exit_reason != "hollysys_terminal_tool"\n'
+        "    ):\n"
+        '        # Agent was mid-work — this is the "just stops" case.\n'
+        "        logger.warning(\n"
+        '            "Turn ended with pending tool result (agent may appear stuck). "\n'
+        '            + _diag_msg + " last_tool=%s",\n'
+        "            *_diag_args, _last_tool_name,\n"
+        "        )\n"
+        "    else:\n"
+        "        logger.info(_diag_msg, *_diag_args)\n",
+        label="successful terminal tool exit diagnostic",
+    )
+    return replace_once(
+        text,
+        '        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")\n'
+        "        if _kanban_task:\n"
+        "            try:\n"
+        "                from hermes_cli import kanban_db as _kb\n"
+        "                _conn = _kb.connect()\n"
+        "                try:\n"
+        "                    _kb._record_task_failure(\n"
+        "                        _conn,\n"
+        "                        _kanban_task,\n"
+        "                        error=(\n"
+        '                            f"Iteration budget exhausted "\n'
+        '                            f"({api_call_count}/{agent.max_iterations}) — "\n'
+        '                            "task could not complete within the allowed "\n'
+        '                            "iterations"\n'
+        "                        ),\n"
+        '                        outcome="timed_out",\n'
+        "                        release_claim=True,\n"
+        "                        end_run=True,\n"
+        "                        event_payload_extra={\n"
+        '                            "budget_used": api_call_count,\n'
+        '                            "budget_max": agent.max_iterations,\n'
+        "                        },\n"
+        "                    )\n"
+        "                    logger.info(\n"
+        '                        "recorded budget-exhausted failure for task %s (%d/%d)",\n'
+        "                        _kanban_task, api_call_count, agent.max_iterations,\n"
+        "                    )\n"
+        "                finally:\n"
+        "                    try:\n"
+        "                        _conn.close()\n"
+        "                    except Exception:\n"
+        "                        pass\n"
+        "            except Exception:\n"
+        "                logger.warning(\n"
+        '                    "Failed to record budget-exhausted failure for task %s",\n'
+        "                    _kanban_task,\n"
+        "                    exc_info=True,\n"
+        "                )\n",
+        '        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")\n'
+        '        _kanban_run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()\n'
+        "        try:\n"
+        "            _kanban_run_id = int(_kanban_run_raw)\n"
+        "        except (TypeError, ValueError):\n"
+        "            _kanban_run_id = None\n"
+        '        if _kanban_task and getattr(agent, "_parent_session_id", None):\n'
+        "            logger.info(\n"
+        '                "skipped delegated child budget failure for parent task %s",\n'
+        "                _kanban_task,\n"
+        "            )\n"
+        "        elif _kanban_task and _kanban_run_id is None:\n"
+        "            # Fail closed: without stable attempt provenance this process\n"
+        "            # must not be allowed to close whichever retry is current now.\n"
+        "            logger.warning(\n"
+        '                "skipped budget failure for task %s: missing valid run id",\n'
+        "                _kanban_task,\n"
+        "            )\n"
+        "        elif _kanban_task:\n"
+        "            try:\n"
+        "                from hermes_cli import kanban_db as _kb\n"
+        "                _conn = _kb.connect()\n"
+        "                try:\n"
+        "                    _recorded = _kb._record_task_failure(\n"
+        "                        _conn,\n"
+        "                        _kanban_task,\n"
+        "                        error=(\n"
+        '                            f"Iteration budget exhausted "\n'
+        '                            f"({api_call_count}/{agent.max_iterations}) — "\n'
+        '                            "task could not complete within the allowed "\n'
+        '                            "iterations"\n'
+        "                        ),\n"
+        '                        outcome="timed_out",\n'
+        "                        release_claim=True,\n"
+        "                        end_run=True,\n"
+        "                        expected_run_id=_kanban_run_id,\n"
+        "                        event_payload_extra={\n"
+        '                            "budget_used": api_call_count,\n'
+        '                            "budget_max": agent.max_iterations,\n'
+        "                        },\n"
+        "                    )\n"
+        "                    if _recorded is None:\n"
+        "                        logger.warning(\n"
+        '                            "skipped stale budget failure for task %s run %s",\n'
+        "                            _kanban_task, _kanban_run_id,\n"
+        "                        )\n"
+        "                    else:\n"
+        "                        logger.info(\n"
+        '                            "recorded budget-exhausted failure for task %s "\n'
+        '                            "run %s (%d/%d)",\n'
+        "                            _kanban_task, _kanban_run_id,\n"
+        "                            api_call_count, agent.max_iterations,\n"
+        "                        )\n"
+        "                finally:\n"
+        "                    try:\n"
+        "                        _conn.close()\n"
+        "                    except Exception:\n"
+        "                        pass\n"
+        "            except Exception:\n"
+        "                logger.warning(\n"
+        '                    "Failed to record budget-exhausted failure for task %s",\n'
+        "                    _kanban_task,\n"
+        "                    exc_info=True,\n"
+        "                )\n",
+        label="attempt-bound budget failure",
+    )
+
+
+def patch_cli(text: str) -> str:
+    return replace_once(
+        text,
+        '                            ) in ("rate_limit", "billing"):\n',
+        "                            ) in (\n"
+        '                                "billing",\n'
+        '                                "overloaded",\n'
+        '                                "rate_limit",\n'
+        '                                "server_error",\n'
+        '                                "timeout",\n'
+        '                                "unknown",\n'
+        '                                "upstream_rate_limit",\n'
+        "                            ):\n",
+        label="kanban dependency tempfail exit",
+    )
+
+
+def patch_kanban(text: str) -> str:
+    text = replace_once(
+        text,
+        "    if task.goal_mode:\n"
+        "        # Goal-mode workers must take the fully-quiet single-query path:\n"
+        "        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in\n"
+        "        # cli.py's quiet branch. Without -Q the worker gets exactly one\n"
+        "        # turn, prints text, exits rc=0, and the dispatcher records a\n"
+        "        # protocol violation (incident 2026-06-09 t_d9cbe312).\n"
+        '        cmd.append("-Q")\n',
+        "    # Every Kanban worker must use the fully-quiet single-query path.\n"
+        "    # The human-facing -q branch prints a failed API result and then\n"
+        "    # returns rc=0, which is indistinguishable from a clean protocol\n"
+        "    # violation to the dispatcher.  -Q preserves the structured result\n"
+        "    # through cli.py so real failures get a non-zero or EX_TEMPFAIL exit.\n"
+        '    cmd.append("-Q")\n',
+        label="all kanban workers use quiet exit contract",
+    )
+    text = replace_once(
+        text,
+        "    event_payload_extra: Optional[dict] = None,\n"
+        ") -> bool:\n",
+        "    event_payload_extra: Optional[dict] = None,\n"
+        "    expected_run_id: Optional[int] = None,\n"
+        ") -> Optional[bool]:\n",
+        label="failure attempt guard signature",
+    )
+    text = replace_once(
+        text,
+        "    Returns True when the task was auto-blocked (counter reached\n"
+        "    ``failure_limit``), False when it was just updated in place.\n",
+        "    Returns True when the task was auto-blocked (counter reached\n"
+        "    ``failure_limit``), False when it was just updated in place, and\n"
+        "    None when ``expected_run_id`` no longer owns the task.  The stale\n"
+        "    case is a no-op so an old worker cannot close a newer retry.\n",
+        label="failure attempt guard contract",
+    )
+    return replace_once(
+        text,
+        '            "SELECT consecutive_failures, status, max_retries "\n'
+        '            "FROM tasks WHERE id = ?", (task_id,),\n'
+        "        ).fetchone()\n"
+        "        if row is None:\n"
+        "            return False\n"
+        '        failures = int(row["consecutive_failures"]) + 1\n',
+        '            "SELECT consecutive_failures, status, max_retries, "\n'
+        '            "current_run_id FROM tasks WHERE id = ?", (task_id,),\n'
+        "        ).fetchone()\n"
+        "        if row is None:\n"
+        "            return False\n"
+        "        if expected_run_id is not None and (\n"
+        '            row["current_run_id"] is None\n'
+        '            or int(row["current_run_id"]) != int(expected_run_id)\n'
+        "        ):\n"
+        "            return None\n"
+        '        failures = int(row["consecutive_failures"]) + 1\n',
+        label="failure attempt guard transaction",
+    )
+
+
+def patch_delegate(text: str) -> str:
+    text = replace_once(
+        text,
+        '        "cronjob",  # no scheduling more work in the parent\'s name\n',
+        '        "cronjob",  # no scheduling more work in the parent\'s name\n'
+        '        "kanban_complete",  # only the parent worker may close its task\n'
+        '        "kanban_block",  # only the parent worker may block its task\n'
+        '        "kanban_heartbeat",  # child liveness is owned by the parent\n'
+        '        "kanban_comment",  # no child-authored parent task mutations\n'
+        '        "kanban_create",  # no formal graph mutation from children\n'
+        '        "kanban_link",  # no formal graph mutation from children\n'
+        '        "kanban_unblock",  # no formal lifecycle mutation from children\n'
+        '        "kanban_attach",  # no parent task attachment mutation\n'
+        '        "kanban_attach_url",  # no parent task attachment mutation\n',
+        label="delegated kanban mutation blocklist",
+    )
+    text = replace_once(
+        text,
+        '        "\\nComplete this task using the tools available to you. "\n',
+        '        "\\nKanban lifecycle boundary: you are a delegated child, not "\n'
+        '        "the parent worker. Never call mutating kanban_* tools or the "\n'
+        '        "`hermes kanban` CLI to complete, block, comment on, attach to, "\n'
+        '        "create, link, heartbeat, or unblock tasks. Return findings to "\n'
+        '        "the parent only.\\n"\n'
+        '        "\\nComplete this task using the tools available to you. "\n',
+        label="delegated kanban mutation prompt",
+    )
+    return text
+
+
+def patch_kanban_tools(text: str) -> str:
+    text = replace_once(
+        text,
+        "def _stamp_worker_session_metadata(\n"
+        "    task_id: str, metadata: Optional[dict]\n"
+        ") -> Optional[dict]:\n"
+        '    """Add trusted worker session id metadata for this worker\'s own task."""\n'
+        '    if os.environ.get("HERMES_KANBAN_TASK") != task_id:\n'
+        "        return metadata\n"
+        '    session_id = os.environ.get("HERMES_SESSION_ID")\n'
+        "    if not session_id:\n"
+        "        return metadata\n"
+        "    stamped = dict(metadata or {})\n"
+        '    stamped["worker_session_id"] = session_id\n'
+        "    return stamped\n",
+        "def _stamp_worker_session_metadata(\n"
+        "    task_id: str,\n"
+        "    metadata: Optional[dict],\n"
+        "    *,\n"
+        "    session_id: Optional[str] = None,\n"
+        ") -> Optional[dict]:\n"
+        '    """Add stable attempt provenance for this worker\'s own task."""\n'
+        '    if os.environ.get("HERMES_KANBAN_TASK") != task_id:\n'
+        "        return metadata\n"
+        "    # Controller observes an attempt before Hermes creates its AIAgent,\n"
+        "    # so the durable identity is the dispatcher run id.  Do not use the\n"
+        "    # process-global HERMES_SESSION_ID first: delegate_task children\n"
+        "    # share this process and overwrite that environment mirror.\n"
+        "    run_id = str(\n"
+        '        os.environ.get("HERMES_KANBAN_RUN_ID") or ""\n'
+        "    ).strip()\n"
+        '    trusted_session_id = f"kanban-run:{run_id}" if run_id else ""\n'
+        "    if not trusted_session_id:\n"
+        "        # Compatibility for non-dispatcher callers and old boards.\n"
+        "        trusted_session_id = str(session_id or \"\").strip()\n"
+        "    if not trusted_session_id:\n"
+        "        trusted_session_id = str(\n"
+        '            os.environ.get("HERMES_SESSION_ID") or ""\n'
+        "        ).strip()\n"
+        "    if not trusted_session_id:\n"
+        "        return metadata\n"
+        "    stamped = dict(metadata or {})\n"
+        '    stamped["worker_session_id"] = trusted_session_id\n'
+        "    return stamped\n",
+        label="invoking agent completion provenance",
+    )
+    text = replace_once(
+        text,
+        "    metadata = _stamp_worker_session_metadata(tid, metadata)\n",
+        "    metadata = _stamp_worker_session_metadata(\n"
+        '        tid, metadata, session_id=kw.get("session_id")\n'
+        "    )\n",
+        label="completion provenance callsite",
+    )
+    return text
+
+
+def patch_gateway(text: str) -> str:
+    return replace_once(
+        text,
+        "        # Build session context\n"
+        "        context = build_session_context(source, self.config, session_entry)\n",
+        "        # MessageEvent carries the triggering id separately from its\n"
+        "        # SessionSource.  Bind it before creating SessionContext so\n"
+        "        # HERMES_SESSION_MESSAGE_ID reaches terminal subprocesses.\n"
+        "        source.message_id = str(event.message_id) if event.message_id else None\n"
+        "\n"
+        "        # Build session context\n"
+        "        context = build_session_context(source, self.config, session_entry)\n",
+        label="gateway triggering message context",
     )
 
 
@@ -164,6 +514,12 @@ def main() -> None:
         "agent/tool_executor.py": patch_executor,
         "agent/conversation_loop.py": patch_loop,
         "agent/system_prompt.py": patch_system_prompt,
+        "agent/turn_finalizer.py": patch_turn_finalizer,
+        "cli.py": patch_cli,
+        "gateway/run.py": patch_gateway,
+        "hermes_cli/kanban_db.py": patch_kanban,
+        "tools/delegate_tool.py": patch_delegate,
+        "tools/kanban_tools.py": patch_kanban_tools,
     }
     if system_prompt_only:
         patches = {"agent/system_prompt.py": patch_system_prompt}

@@ -6,6 +6,7 @@ import os
 import subprocess
 
 from .config import ControllerConfig
+from .errors import DependencyContractError, ErrorContext
 from .kanban import CommandError
 from .messages import MessageFormat
 from .models import FeishuOrigin
@@ -62,6 +63,25 @@ class LarkNotifier:
             check=False,
         )
         if result.returncode != 0:
+            try:
+                failure = json.loads(result.stderr)
+            except (json.JSONDecodeError, TypeError):
+                failure = None
+            error = (
+                failure.get("error")
+                if isinstance(failure, dict)
+                else None
+            )
+            if isinstance(error, dict) and error.get("code") == 230002:
+                raise DependencyContractError(
+                    "feishu_bot_not_in_origin_chat",
+                    context=ErrorContext(
+                        dependency="feishu",
+                        endpoint="messages-reply",
+                        status_code=400,
+                        error_code="bot_not_in_chat",
+                    ),
+                )
             raise CommandError(command, result.returncode, result.stderr)
         try:
             payload = json.loads(result.stdout)

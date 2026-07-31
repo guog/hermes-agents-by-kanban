@@ -26,7 +26,9 @@ version: 4.0.0
 4. 约定式 commit 后 push 当前唯一分支，并核对本地 `HEAD` 与远端 branch head 完全
    相同。首次有效 SPEC push 后，把 MR 描述写入本 card 的 `scratch_dir`，执行
    `hollysysctl publish-delivery --card-id "$HERMES_KANBAN_TASK" --head-sha "$(git rev-parse HEAD)" --description-file <描述文件>`。
-   只有 Controller 能创建并绑定 Draft MR；命令失败时不得发现或接管其他 MR。
+   只有 Controller 能创建并绑定 Draft MR；仅 `iteration=1` 且 card-context 的
+   `delivery=null` 时调用一次。后续 repair/redispatch 已有 Delivery，绝不再次调用；
+   命令失败时不得发现或接管其他 MR。
 5. 执行 `hollysysctl validate-artifact --card-id "$HERMES_KANBAN_TASK"`。结果不是
    `ok=true`（包括 `tool_unavailable`）时不得声称通过。
 6. 执行 `hollysysctl completion-template --card-id "$HERMES_KANBAN_TASK" --outcome pass`

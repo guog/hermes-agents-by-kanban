@@ -943,11 +943,18 @@ class GitLabClient:
             ["rev-parse", "HEAD"],
             tolerate=True,
         )
+        status = self._git(
+            worktree,
+            ["status", "--porcelain"],
+            tolerate=True,
+        )
         branch_name = branch.stdout.strip()
         head_sha = head.stdout.strip()
+        clean = status.returncode == 0 and not status.stdout.strip()
         ok = (
             branch.returncode == 0
             and head.returncode == 0
+            and status.returncode == 0
             and branch_name == run.workspace.branch
             and bool(re.fullmatch(r"[0-9a-f]{40}", head_sha))
         )
@@ -956,6 +963,7 @@ class GitLabClient:
             "worktree": str(worktree),
             "branch": branch_name or None,
             "head_sha": head_sha or None,
+            "clean": clean,
             "error_code": None if ok else "workspace_identity_mismatch",
         }
 

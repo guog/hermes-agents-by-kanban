@@ -32,6 +32,12 @@ READ_ONLY_PROFILES = frozenset(
     }
 )
 ALL_PROFILES = WRITER_PROFILES | READ_ONLY_PROFILES
+GATEWAY_PROFILES = frozenset({"dispatcher", "fde", "prd-writer"})
+GATEWAY_PROFILE_SKILLS = {
+    "dispatcher": "hollysys-dispatch-kanban",
+    "fde": "hollysys-triage-field-input",
+    "prd-writer": "hollysys-write-prd",
+}
 
 
 @dataclass(frozen=True)
@@ -66,6 +72,205 @@ def read_profile_env(path: Path) -> dict[str, str]:
         if key:
             values[key] = _dotenv_value(raw_value)
     return values
+
+
+def lark_profile_preflight(
+    config: ControllerConfig,
+    profile: str,
+) -> dict:
+    if profile not in GATEWAY_PROFILES:
+        raise ValueError(f"unknown_gateway_profile:{profile}")
+    profile_root = config.profiles_root / profile
+    env_path = profile_root / ".env"
+    config_path = (
+        profile_root
+        / ".lark-cli"
+        / "config"
+        / "hermes"
+        / "config.json"
+    )
+    result: dict = {
+        "profile": profile,
+        "config_path": str(config_path),
+        "ok": False,
+    }
+    try:
+        values = read_profile_env(env_path)
+        app_id = values.get("FEISHU_APP_ID", "")
+        app_secret = values.get("FEISHU_APP_SECRET", "")
+        if (
+            not app_id
+            or not app_secret
+            or app_id == "REPLACE_WITH_FEISHU_APP_ID"
+            or app_secret == "REPLACE_WITH_FEISHU_APP_SECRET"
+        ):
+            result["error_code"] = "missing_feishu_credentials"
+            return result
+        if config_path.is_symlink() or not config_path.is_file():
+            result["error_code"] = "missing_lark_config"
+            return result
+        info = config_path.stat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_mode & 0o077
+            or info.st_uid not in trusted_runtime_uids()
+        ):
+            result["error_code"] = "lark_config_permissions"
+            return result
+        decoded = json.loads(config_path.read_text(encoding="utf-8"))
+        apps = decoded.get("apps") if isinstance(decoded, dict) else None
+        if not isinstance(apps, list) or len(apps) != 1:
+            result["error_code"] = "lark_config_invalid"
+            return result
+        app = apps[0]
+        if not isinstance(app, dict):
+            result["error_code"] = "lark_config_invalid"
+            return result
+        if app.get("appId") != app_id or app.get("appSecret") != app_secret:
+            result["error_code"] = "lark_credentials_mismatch"
+            return result
+        if (
+            app.get("name") != profile
+            or app.get("brand") != "feishu"
+            or app.get("defaultAs") != "bot"
+            or app.get("strictMode") != "bot"
+            or app.get("users") != []
+        ):
+            result["error_code"] = "lark_bot_contract_invalid"
+            return result
+    except (OSError, ValueError, json.JSONDecodeError):
+        result["error_code"] = "lark_config_unreadable"
+        return result
+    result.update(
+        {
+            "ok": True,
+            "identity": "bot",
+            "_credential_scope": hashlib.sha256(
+                f"{profile}\0{app_id}\0{app_secret}".encode()
+            ).hexdigest(),
+        }
+    )
+    return result
+
+
+def required_profile_skills(
+    config: ControllerConfig,
+    profile: str,
+) -> tuple[str, ...]:
+    if profile not in ALL_PROFILES:
+        raise ValueError(f"unknown_profile:{profile}")
+    required = {
+        skill
+        for stage, assignee in config.stage_assignees.items()
+        if assignee == profile
+        for skill in config.stage_skills[stage]
+    }
+    gateway_skill = GATEWAY_PROFILE_SKILLS.get(profile)
+    if gateway_skill:
+        required.add(gateway_skill)
+    return tuple(sorted(required))
+
+
+def _trusted_skill_file(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    try:
+        if current.is_symlink() or not current.is_dir():
+            return False
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                return False
+        info = path.stat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid in trusted_runtime_uids()
+        and info.st_mode & 0o022 == 0
+        and os.access(path, os.R_OK)
+    )
+
+
+def profile_skill_preflight(
+    config: ControllerConfig,
+    profile: str,
+) -> dict:
+    try:
+        required = required_profile_skills(config, profile)
+    except ValueError as exc:
+        return {
+            "profile": profile,
+            "ok": False,
+            "error_code": str(exc).split(":", 1)[0],
+        }
+    if not required:
+        return {
+            "profile": profile,
+            "ok": False,
+            "required_skills": [],
+            "error_code": "missing_profile_skill_contract",
+        }
+
+    resolved: list[dict[str, str]] = []
+    contract_parts: list[str] = []
+    for skill in required:
+        profile_path = (
+            config.profiles_root
+            / profile
+            / "skills"
+            / skill
+            / "SKILL.md"
+        )
+        candidates = [
+            (profile_path, config.profiles_root, "profile"),
+        ]
+        if not skill.startswith("hollysys-"):
+            direct = config.skills_root / skill / "SKILL.md"
+            namespaced = sorted(
+                config.skills_root.glob(f"*/{skill}/SKILL.md")
+            )
+            candidates.extend(
+                (path, config.skills_root, "shared")
+                for path in (direct, *namespaced)
+            )
+        matched: list[tuple[Path, str]] = []
+        for path, root, scope in candidates:
+            if _trusted_skill_file(path, root):
+                matched.append((path, scope))
+        if not matched:
+            return {
+                "profile": profile,
+                "ok": False,
+                "required_skills": list(required),
+                "missing_skill": skill,
+                "error_code": "missing_profile_skill",
+            }
+        if len(matched) != 1:
+            return {
+                "profile": profile,
+                "ok": False,
+                "required_skills": list(required),
+                "ambiguous_skill": skill,
+                "error_code": "ambiguous_profile_skill",
+            }
+        path, scope = matched[0]
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        resolved.append({"name": skill, "scope": scope})
+        contract_parts.append(f"{skill}:{scope}:{digest}")
+
+    return {
+        "profile": profile,
+        "ok": True,
+        "required_skills": list(required),
+        "resolved_skills": resolved,
+        "_skill_contract_digest": hashlib.sha256(
+            "\n".join(contract_parts).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def profile_credential(config: ControllerConfig, profile: str) -> ProfileCredential:
@@ -642,6 +847,10 @@ def summarize_profile_preflight(
         profile_preflight(config, profile, deep=deep)
         for profile in sorted(ALL_PROFILES)
     ]
+    profile_skills = [
+        profile_skill_preflight(config, profile)
+        for profile in sorted(ALL_PROFILES)
+    ]
     fingerprints = [
         item.get("token_fingerprint")
         for item in profiles
@@ -668,6 +877,10 @@ def summarize_profile_preflight(
         and dispatcher_fingerprint
         and controller_fingerprint == dispatcher_fingerprint
     )
+    lark_profiles = [
+        lark_profile_preflight(config, profile)
+        for profile in sorted(GATEWAY_PROFILES)
+    ]
     auth_executable_fingerprints: list[str] = []
     for path in (
         Path(config.agent_git_command),
@@ -692,25 +905,68 @@ def summarize_profile_preflight(
             f"{item.get('_credential_scope') or 'invalid-scope'}"
             for item in sorted(profiles, key=lambda item: str(item["profile"]))
         ],
+        *[
+            f"lark={item.get('profile')}:"
+            f"{item.get('_credential_scope') or item.get('error_code') or 'missing'}"
+            for item in lark_profiles
+        ],
+        *[
+            f"skills={item.get('profile')}:"
+            f"{item.get('_skill_contract_digest') or item.get('error_code') or 'missing'}"
+            for item in profile_skills
+        ],
         f"controller={controller_fingerprint or 'missing'}",
     ]
     credential_contract_digest = hashlib.sha256(
         "\n".join(contract_parts).encode("utf-8")
     ).hexdigest()
-    safe_profiles = [
-        {
+    skill_by_profile = {
+        str(item["profile"]): item for item in profile_skills
+    }
+    safe_profiles = []
+    for item in profiles:
+        safe_item = {
             key: value
             for key, value in item.items()
             if key not in {"token_fingerprint", "_credential_scope"}
         }
-        for item in profiles
+        skill_result = skill_by_profile[str(item["profile"])]
+        safe_item["skills_ok"] = bool(skill_result["ok"])
+        safe_item["required_skills"] = skill_result.get(
+            "required_skills",
+            [],
+        )
+        safe_item["resolved_skills"] = skill_result.get(
+            "resolved_skills",
+            [],
+        )
+        if not skill_result["ok"]:
+            safe_item["skill_error_code"] = skill_result.get("error_code")
+            safe_item["missing_skill"] = skill_result.get("missing_skill")
+        safe_item["ok"] = bool(safe_item.get("ok")) and bool(
+            skill_result["ok"]
+        )
+        safe_profiles.append(safe_item)
+    safe_lark_profiles = [
+        {
+            key: value
+            for key, value in item.items()
+            if key != "_credential_scope"
+        }
+        for item in lark_profiles
     ]
     return {
         "ok": all(item["ok"] for item in profiles)
+        and all(item["ok"] for item in profile_skills)
         and not duplicates
-        and controller_matches_dispatcher,
+        and controller_matches_dispatcher
+        and all(item["ok"] for item in lark_profiles),
         "deep": deep,
         "profiles": safe_profiles,
+        "lark_credentials": {
+            "ok": all(item["ok"] for item in lark_profiles),
+            "profiles": safe_lark_profiles,
+        },
         "unique_profile_tokens": not duplicates,
         "controller_token_matches_dispatcher": controller_matches_dispatcher,
         "controller_token_source": "dispatcher-secret-mirror",

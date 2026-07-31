@@ -23,4 +23,24 @@ if [ "$(id -g hermes)" != "$target_gid" ]; then
   groupmod -o -g "$target_gid" hermes
 fi
 
-exec /opt/hermes/.venv/bin/python -m hollysys_controller.daemon
+if ! command -v setpriv >/dev/null 2>&1; then
+  echo "controller-entrypoint: setpriv is required" >&2
+  exit 69
+fi
+
+controller_home=/opt/data/controller-home
+install -d -o "$target_uid" -g "$target_gid" -m 0750 \
+  "$controller_home" \
+  /opt/data/scratch \
+  /run/hollysys-controller \
+  /var/lib/hollysys-controller \
+  /workspace/projects
+
+export HOME="$controller_home"
+
+setpriv --reuid=hermes --regid=hermes --init-groups \
+  /opt/hermes/.venv/bin/python \
+  /opt/fleet/container/sync-lark-config.py
+
+exec setpriv --reuid=hermes --regid=hermes --init-groups \
+  /opt/hermes/.venv/bin/python -m hollysys_controller.daemon

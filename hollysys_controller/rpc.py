@@ -57,20 +57,31 @@ class RpcServer:
                 response.model_dump_json(exclude_none=True).encode("utf-8") + b"\n"
             )
             await writer.drain()
+        except ConnectionError:
+            # The client may time out or be interrupted while Controller keeps
+            # an idempotent request running. This is not a server failure and
+            # must not trigger a second write to an already closed stream.
+            return
         except Exception as exc:  # noqa: BLE001 - malformed client boundary
-            writer.write(
-                (
-                    json.dumps(
-                        {"id": "invalid", "ok": False, "error": str(exc)},
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                ).encode("utf-8")
-            )
-            await writer.drain()
+            try:
+                writer.write(
+                    (
+                        json.dumps(
+                            {"id": "invalid", "ok": False, "error": str(exc)},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                await writer.drain()
+            except ConnectionError:
+                return
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
 
 
 async def rpc_call(
@@ -86,4 +97,7 @@ async def rpc_call(
         return RpcResponse.model_validate_json(raw)
     finally:
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except ConnectionError:
+            pass

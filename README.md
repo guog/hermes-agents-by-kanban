@@ -99,7 +99,8 @@ Compose 有两个独立 service：
 | `./schemas` | `/opt/fleet/schemas` | 只读 |
 
 `HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace/projects` 保持不变；
-`HERMES_SCRATCH_DIR=/opt/data/scratch` 为每个 attempt 提供独立安全子目录。两者将写入限制在
+`HERMES_SCRATCH_DIR=/opt/data/scratch` 为每个 attempt 提供独立安全子目录；Controller
+会在发布工作卡前创建该目录并拒绝符号链接组件。两者将写入限制在
 Hermes 运行数据与 Controller 管理的 checkout/worktree。Hermes 自带的凭据、会话状态
 和项目 `.env` denylist 仍然生效；不要把该变量缩回 `/opt/data`，否则 producer 无法
 修改工作树，也不要取消变量而放开整个容器文件系统。
@@ -233,6 +234,10 @@ chmod 600 .env
 根 `.env` 既提供 Compose 插值，也通过 `env_file` 传入容器。为避免
 `docker-compose.yaml` 堆积大量条目，Dashboard、Controller、模型服务和软件镜像等可配置
 环境变量均集中在该文件；固定的容器内部路径仍保留在 Compose。
+Controller entrypoint 只以 root 完成 UID/GID 对齐和挂载目录初始化，随后使用
+`setpriv` 降权为 `hermes` 用户运行配置同步和 daemon。由 Controller 创建的 checkout、
+worktree、scratch、socket 与状态文件因此都归属于 `PUID:PGID`；preflight 会拒绝当前
+Controller 用户不可写的 `PROJECTS_DIR`。
 
 Dashboard 通过宿主机所有网卡的 `${HERMES_DASHBOARD_HOST_PORT:-9119}` 端口发布。本部署假设运行
 在可信内部网络，局域网用户共用以下明文账号，`.env.example` 和实际 `.env` 保持一致：
@@ -311,18 +316,19 @@ blocked 和完成通知均由 Controller 的持久 outbox 使用 Dispatcher 凭�
 新通知通过 `+messages-reply --markdown` 转为飞书 post 富文本，使用中文标题、分行字段、
 短列表和可点击链接。历史 outbox 中的 `text` payload 仍按纯文本重放，不改变旧消息。
 `message_id`、原话题、Bot 身份、幂等键和现有 @发起人条件保持不变。不再为正式卡建立
-Hermes Kanban notifier 订阅，也不启动第二个入站消费者。分别复制：
+Hermes Kanban notifier 订阅，也不启动第二个入站消费者。Controller 容器启动时会以
+三个 Profile `.env` 为权威源，原子生成：
 
 ```bash
-cp \
-  data/profiles/dispatcher/.lark-cli/config/hermes/config.json.example \
-  data/profiles/dispatcher/.lark-cli/config/hermes/config.json
-chmod 600 data/profiles/dispatcher/.lark-cli/config/hermes/config.json
+data/profiles/dispatcher/.lark-cli/config/hermes/config.json
+data/profiles/fde/.lark-cli/config/hermes/config.json
+data/profiles/prd-writer/.lark-cli/config/hermes/config.json
 ```
 
-将其中的 `appId`、`appSecret` 替换为该 Profile `.env` 中同一组 Feishu 凭据。配置固定 `defaultAs=bot`、`strictMode=bot`，不允许使用用户身份冒充人类。
-
-`prd-writer` 和 `fde` 做同样处理。实际 `config.json` 已被 Git 忽略。
+生成文件固定为 `0600`、`defaultAs=bot`、`strictMode=bot`，不允许使用用户身份冒充
+人类。static/deep preflight 会逐 Profile 核对 lark-cli 配置与 `.env` 完全一致，并把
+该身份合同绑定到 active 模式；不得复制旧部署的实际 `config.json`。实际
+`config.json` 已被 Git 忽略。
 
 官方镜像的 Hermes 0.19.0 将 Feishu adapter 声明为可选 extra。容器初始化固定校验并安装
 `lark-oapi==1.6.8`、`qrcode==7.4.2` 和 `requests-toolbelt==1.0.0`，下载缓存放在
@@ -443,6 +449,12 @@ docker compose config >/dev/null
 docker compose up -d
 docker compose exec hermes hollysysctl health
 ```
+
+全新部署复制 `data/profiles/` 时必须保留受 Git 跟踪的
+`dispatcher`、`fde`、`prd-writer` 三份 `gateway_state.json`。它们声明
+`desired_state=running`；缺失时 s6 只会创建监督目录，不会启动飞书 Gateway。
+同时必须保留每个 `data/profiles/<profile>/skills/hollysys-*/SKILL.md`；
+排除根目录生成态 `skills/` 时不得使用会递归命中 Profile Skill 的规则。
 
 常用原生命令：
 
@@ -719,7 +731,9 @@ review pass 必须带 approved `implementation_completion`，且 reviewer 与 Gi
 Controller 以 Hermes `task_events.run_id` 为 attempt 权威键，逐次持久化 Profile、
 dispatch key、session/PID、started/blocked/completion/exited、恢复来源、
 heartbeat/progress/deadline、worktree/branch/MR/head 和完成接受状态。heartbeat
-只更新 liveness，不续 progress lease。Hermes 卡使用
+只更新 liveness，不续 progress lease。未带 `worker_session_id` 的 Hermes lifecycle
+事件以 `task_events.run_id` 合成稳定 attempt identity，避免多个重试在健康页中坍缩为
+一个永不退出的 worker。Hermes 卡使用
 `HOLLYSYS_WORKER_REDISPATCH_LIMIT=2`；每次证据闭合后实际发出的 reclaim 立即计入预算，
 新 session 只增加 attempt，旧 session 晚到事件不会覆盖当前 attempt。超过进展租约后，
 Controller 依次核对 Kanban 状态、session/PID、
@@ -727,6 +741,12 @@ Profile、worktree/branch 以及已存在时的 MR/head：进程仍在运行时�
 幂等告警；仅在 PID 已退出且其余身份事实一致时调用 Hermes `reclaim` 请求有限重派。
 重派达到 2 次或 Hermes 明确 `gave_up/spawn_auto_blocked` 后归档旧工作卡并进入持久异常。
 它不会仅按总运行时长杀死仍可能有真实进展的 Agent。
+
+所有 Kanban worker 强制使用 Hermes `-Q` 机器退出合同，不能走会在 API 失败后仍返回
+`rc=0` 的人类展示 `-q` 分支。模型限流、billing、transport timeout、provider overload、
+上游 5xx 和无状态码临时故障在内建重试耗尽后返回 `EX_TEMPFAIL`；Hermes 将该 attempt
+记录为 `rate_limited`，默认冷却 5 分钟后再探测，且不消耗工作卡 redispatch/failure
+预算。认证、配置、工件合同、终端工具遗漏等确定性失败仍按原有限预算熔断。
 
 event poll 只持久化 lifecycle/cursor 和 reconcile intent；独立 worker 通过持久租约
 消费并合并同一 run 的重复 intent，崩溃后可重新领取。
@@ -819,7 +839,10 @@ Dispatcher 不能直接恢复。它把真实 sender/chat/thread/message/answer �
 `[human-block:v1]` 评论，以 `block_id + message_id` 幂等创建一张同阶段新 attempt；
 actor 固定为 `hollysys-controller`。新卡创建完成后，旧 blocked 尝试以 completion v8
 `outcome=cancelled` 结束，新卡取得新的 Hermes `run_id`/attempt。不会对同一卡盲目
-unblock，也不会创建 continuation/恢复 gate；来源不明的 `promoted_manual` 进入异常。
+unblock，也不会创建 continuation/恢复 gate。Hermes 会把 Controller 正常发布初始
+blocked 卡的 `promote` 同样记录为 `promoted_manual`；Controller 只在存在匹配且处于
+执行中或已完成的 durable `release` operation 时认可这一次发布。额外 promotion 仍必须有匹配的人类
+`[human-resolution:v1]`，否则进入异常。
 
 部署后必须用真实飞书和 Kanban 做一次受控验收，不能用静态检查代替：
 
@@ -844,7 +867,16 @@ unblock，也不会创建 continuation/恢复 gate；来源不明的 `promoted_m
   Agent Git wrapper 额外拒绝 Dispatcher push。
 - Memory/Skill 修改仍经过 Hermes 官方 write approval。
 - Hermes 补丁保证成功 `kanban_complete`/`kanban_block` 后停止同批后续业务工具和下一次
-  模型调用，并产生 `worker_exited` lifecycle 事件；补丁无法应用时镜像构建直接失败。
+  模型调用，并产生 `worker_exited` lifecycle 事件；还强制 Kanban worker 使用 `-Q`
+  退出合同，将明确的临时 provider 失败映射为 `EX_TEMPFAIL` 冷却重试。Gateway 会把
+  当前 `MessageEvent.message_id` 绑定到 session context，避免 Dispatcher 首次启动时拿到
+  空消息 ID。`delegate_task` 子会话只返回盘点结果：其 Kanban 变更工具从 schema 中移除，
+  executor 还会拒绝子会话的 terminal lifecycle 调用；父 worker 的 completion provenance
+  使用 Dispatcher `run_id` 派生的稳定 attempt identity，而不是会被子会话覆盖的进程级
+  session 环境变量。任一补丁源文件指纹不匹配时镜像构建直接失败。
+- 固定版本的 Feishu Python runtime 直接烘焙进派生镜像；容器 init 仍逐版本校验并保留
+  缺包兜底，但正常全新启动不再等待 PyPI，也不会在 Gateway 尚未启动时把 Controller
+  liveness 误当成完整飞书就绪。
 
 仍需客观看待的边界：
 
@@ -876,7 +908,8 @@ API identity/membership、HTTPS `ls-remote`、root-owned askpass、无落盘 tok
 token-free origin、120 秒内完成的 shallow/blobless/no-checkout clone、Writer
 通过 `mktree + commit-tree` 验证的本地空提交身份与
 `push --dry-run`，以及
-Reviewer 本地拒绝。只有报告全部通过后才将
+Reviewer 本地拒绝；同时核对三个 lark-cli bot 配置与各自 Profile `.env` 一致，以及
+Controller 对 `PROJECTS_DIR` 可写。只有报告全部通过后才将
 模式改为 `active` 并全新重建容器。deep preflight 的成功结果和当前 Controller/Profile
 凭据契约以不可逆摘要绑定在同一份全新 Controller DB 中；active daemon 启动时强制核验，
 缺少 deep 结果、最后一次只做过 static preflight、凭据/allowed group/测试项目发生变化，
@@ -884,10 +917,20 @@ Reviewer 本地拒绝。只有报告全部通过后才将
 `preflight`、重新执行 `hollysysctl preflight --deep`，再恢复 `active`。摘要不出现在
 health、日志或准入报告中。运行时：
 
+`hollysysctl preflight` 必须连接 Controller RPC，由已降权的 daemon 执行；不要在
+Controller 容器内另起本地 `ControllerService`，否则 Profile HOME 中由准入工具创建的
+文件会继承 `docker compose exec` 的 root 身份，导致 active 凭据合同漂移。
+
 - 容器 healthcheck 调用 `health --probe liveness`，只验证本地 Controller/store/RPC，
   不因 GitLab/Kanban 短时故障重启整个容器；
+- `start` 的 GitLab/workspace/offline-cache 初始化超过同步窗口时，RPC 返回
+  `request_status=running` 的只读初始化快照，后台继续同一个幂等请求；客户端不会因
+  120 秒终端超时重复创建任务；
 - 运维与 Dispatcher 调用 `health --probe readiness`，查看最近对账、Kanban/GitLab、
   outbox、merge wait、stale worker、逐 Profile 准入结果和持久 dependency outage；
+- 静态和深度预检逐 Profile 校验阶段必需的 `hollysys-*` Skill 以及共享 `glab`
+  Skill，并将文件摘要绑定到 active 启动契约；缺失、符号链接或预检后变更都会
+  fail closed；
 - 当前版本只支持单机、单 Controller 和固定完整流程；active-active、外部工作流 API
   与跨项目事务不在范围内。
 

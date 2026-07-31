@@ -1,4 +1,7 @@
-# The official Hermes v2026.7.20 image already contains these exact versions.
-# This file exists for local controller tests and image-upgrade compatibility CI.
+# Controller runtime plus Feishu adapter dependencies baked into the derived image.
+# Keep these versions aligned with runtime verification and upgrade compatibility CI.
 pydantic==2.13.4
 PyYAML==6.0.3
+lark-oapi==1.6.8
+qrcode==7.4.2
+requests-toolbelt==1.0.0

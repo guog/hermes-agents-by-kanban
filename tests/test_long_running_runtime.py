@@ -241,6 +241,113 @@ class LongRunningStoreTests(unittest.TestCase):
         self.assertEqual(runtime["redispatch_count"], 1)
         self.assertEqual(runtime["attempt_status"], "running")
 
+    def test_dependency_tempfail_attempt_does_not_consume_redispatch_budget(
+        self,
+    ) -> None:
+        self.store.register_card_attempt(
+            board="gitlab-p12",
+            card_id="t_tempfail",
+            profile="spec-reviewer",
+            dispatch_key="dispatch-tempfail",
+            worktree="/workspace/run",
+            branch="feature/run",
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_tempfail",
+            kind="claimed",
+            created_at=100,
+            worker_session_id="kanban-run:1",
+            worker_pid=101,
+            lease_seconds=300,
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_tempfail",
+            kind="rate_limited",
+            created_at=160,
+            worker_session_id="kanban-run:1",
+            worker_pid=101,
+            lease_seconds=300,
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_tempfail",
+            kind="claimed",
+            created_at=460,
+            worker_session_id="kanban-run:2",
+            worker_pid=202,
+            lease_seconds=300,
+        )
+
+        runtime = self.store.card_runtime("gitlab-p12", "t_tempfail")
+        assert runtime is not None
+        self.assertEqual(runtime["attempt"], 2)
+        self.assertEqual(runtime["redispatch_count"], 0)
+        self.assertEqual(runtime["worker_session_id"], "kanban-run:2")
+
+    def test_formal_failure_is_terminal_in_attempt_and_health_projection(
+        self,
+    ) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.save_run(run_record(self.root))
+        for index, kind in enumerate(("timed_out", "gave_up"), start=1):
+            card_id = f"t_terminal_{index}"
+            run_id = str(9 + index)
+            self.store.add_managed_card(
+                board="gitlab-p12",
+                card_id=card_id,
+                run_key=run_key,
+                stage="plan-review",
+                iteration=1,
+                idempotency_key=f"dispatch-{index}",
+                parent_card_id=None,
+            )
+            self.store.record_card_runtime_event(
+                board="gitlab-p12",
+                card_id=card_id,
+                kind="claimed",
+                created_at=100,
+                worker_session_id=f"kanban-run:{run_id}",
+                worker_pid=100 + index,
+                lease_seconds=30,
+                run_id=run_id,
+            )
+            self.store.record_card_runtime_event(
+                board="gitlab-p12",
+                card_id=card_id,
+                kind=kind,
+                created_at=200,
+                worker_session_id=f"kanban-run:{run_id}",
+                worker_pid=100 + index,
+                lease_seconds=30,
+                run_id=run_id,
+            )
+
+        attempts = {
+            item["card_id"]: item
+            for item in self.store.attempts_for_run(run_key)
+        }
+        self.assertEqual(attempts["t_terminal_1"]["status"], "timed_out")
+        self.assertEqual(
+            attempts["t_terminal_1"]["terminal_reason"],
+            "timed_out",
+        )
+        self.assertEqual(attempts["t_terminal_2"]["status"], "gave_up")
+        self.assertEqual(
+            attempts["t_terminal_2"]["terminal_reason"],
+            "gave_up",
+        )
+        health = self.store.health()
+        self.assertEqual(health["stale_workers"], [])
+        timeline = {
+            item["card_id"]: item for item in health["attempt_timeline"]
+        }
+        self.assertEqual(
+            timeline["t_terminal_2"]["terminal_reason"],
+            "gave_up",
+        )
+
     def test_abort_can_take_over_exception_and_is_restart_idempotent(self) -> None:
         run_key = "hollysys-abcdefghijklmnopqrst"
         self.store.ensure_run_control(run_key)
@@ -553,7 +660,7 @@ class LongRunningServiceTests(unittest.TestCase):
             },
         ), self.assertRaisesRegex(
             ControllerFatalError,
-            "credentials_changed_after_deep_preflight",
+            "profile_contract_changed_after_deep_preflight",
         ):
             service.assert_activation_preflight()
 
