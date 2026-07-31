@@ -12,6 +12,8 @@ from hollysys_controller.messages import (
     format_duration,
     format_outcome,
     format_stage,
+    gitlab_link_label,
+    human_summary,
     inline_code,
     markdown_link,
     markdown_payload,
@@ -87,6 +89,36 @@ class MessageFormattingTests(unittest.TestCase):
             "[MR !12](https://gitlab.example.com/mr/12)",
         )
         self.assertEqual(markdown_link("危险链接", "javascript:alert(1)"), "危险链接")
+
+    def test_gitlab_links_have_human_meaning(self) -> None:
+        self.assertEqual(
+            gitlab_link_label(
+                "https://gitlab.example.com/group/project/"
+                "-/merge_requests/58"
+            ),
+            "查看 MR !58",
+        )
+        self.assertEqual(
+            gitlab_link_label(
+                "https://gitlab.example.com/group/project/"
+                "-/merge_requests/58#note_2643"
+            ),
+            "查看 MR !58 审查记录",
+        )
+        self.assertEqual(
+            gitlab_link_label(
+                "https://gitlab.example.com/group/project/-/pipelines/42"
+            ),
+            "查看流水线 #42",
+        )
+
+    def test_long_human_summary_ends_at_a_readable_boundary(self) -> None:
+        summary = human_summary(
+            "第一项结论已经足够完整。第二项说明非常长而且不应被硬切断在半个字段名中。",
+            limit=18,
+        )
+        self.assertEqual(summary, "第一项结论已经足够完整…")
+        self.assertNotIn("第二项", summary)
 
     def test_markdown_payload_has_explicit_format(self) -> None:
         payload = markdown_payload(origin(), "**完成**")

@@ -27,6 +27,8 @@ version: 4.0.0
 5. 一旦 artifact 结论稳定，停止搜索并预留预算完成协议。用 `completion-template`
    生成当前 outcome 的 completion v8 文件，不读取完整 schema，只补充真实
    `repository_evidence`、
-   验证、决策和风险，不改受信上下文与确定性 checks。`validate-completion` 返回
+   验证、决策和风险，不改受信上下文与确定性 checks。人类可见的 `key_decisions`、
+   `issues`、`residual_risk` 必须使用简短中文，单项不超过 120 个字符；文件路径、
+   行号、需求 ID、表名和协议标识保持原样，不写执行过程复述。`validate-completion` 返回
    `ok=true` 后直接调用 `kanban_complete`，不得用 `execute_code` 包裹这些命令；
    成功后立即结束。

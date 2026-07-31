@@ -21,5 +21,7 @@ version: 4.0.0
    自依赖、环、非法动作或冻结文件修改按稳定 error code 修复。不是 `ok=true` 或
    validator 不可用时不得 pass。
 5. 用 `completion-template` 生成 completion v8，保留 Controller 生成的 validator
-   version、input/result digest 和 result，只补充真实 `repository_evidence` 与验证。通过
+   version、input/result digest 和 result，只补充真实 `repository_evidence` 与验证。
+   人类可见的 `key_decisions`、`issues`、`residual_risk` 必须使用简短中文，单项不超过
+   120 个字符；文件路径、行号、需求 ID、表名和协议标识保持原样，不写执行过程复述。通过
    `validate-completion` 后完成卡片并立即结束。

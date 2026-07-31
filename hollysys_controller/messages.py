@@ -66,6 +66,10 @@ EVENT_LABELS = {
 }
 
 _WHITESPACE = re.compile(r"\s+")
+_GITLAB_MR_PATH = re.compile(r"/-/merge_requests/([1-9][0-9]*)(?:/|$)")
+_GITLAB_PIPELINE_PATH = re.compile(r"/-/pipelines/([1-9][0-9]*)(?:/|$)")
+_GITLAB_JOB_PATH = re.compile(r"/-/jobs/([1-9][0-9]*)(?:/|$)")
+_GITLAB_COMMIT_PATH = re.compile(r"/-/commits?/([0-9a-fA-F]{7,40})(?:/|$)")
 
 
 def escape_markdown(value: object, *, limit: int | None = None) -> str:
@@ -78,6 +82,28 @@ def escape_markdown(value: object, *, limit: int | None = None) -> str:
     for token in ("`", "*", "_", "[", "]"):
         escaped = escaped.replace(token, f"\\{token}")
     return escaped or "无"
+
+
+def human_summary(value: object, *, limit: int = 180) -> str:
+    """Render one concise, safe human-facing summary with a visible ellipsis."""
+    normalized = _WHITESPACE.sub(" ", str(value)).strip()
+    if len(normalized) <= limit:
+        return escape_markdown(normalized)
+    if limit < 2:
+        return "…"
+    candidate = normalized[: limit - 1].rstrip()
+    lower_bound = max(1, limit // 2)
+    boundary = max(
+        (
+            candidate.rfind(token, lower_bound)
+            for token in ("。", "；", ";", "，", ",", " ")
+        ),
+        default=-1,
+    )
+    if boundary >= lower_bound:
+        candidate = candidate[:boundary].rstrip()
+    candidate = candidate.rstrip("。；;，,:：")
+    return escape_markdown(f"{candidate}…")
 
 
 def inline_code(value: object) -> str:
@@ -93,6 +119,33 @@ def markdown_link(label: object, url: object) -> str:
         return escape_markdown(label)
     safe_url = raw_url.replace(" ", "%20").replace(")", "%29")
     return f"[{escape_markdown(label)}]({safe_url})"
+
+
+def gitlab_link_label(
+    url: object,
+    *,
+    default: str = "查看 GitLab 证据",
+) -> str:
+    """Give a GitLab URL a stable label that tells a human what it opens."""
+    parsed = urlsplit(str(url).strip())
+    mr_match = _GITLAB_MR_PATH.search(parsed.path)
+    if mr_match:
+        mr_label = f"MR !{mr_match.group(1)}"
+        if parsed.fragment.startswith("note_"):
+            return f"查看 {mr_label} 审查记录"
+        if parsed.path.rstrip("/").endswith("/diffs"):
+            return f"查看 {mr_label} 代码变更"
+        return f"查看 {mr_label}"
+    pipeline_match = _GITLAB_PIPELINE_PATH.search(parsed.path)
+    if pipeline_match:
+        return f"查看流水线 #{pipeline_match.group(1)}"
+    job_match = _GITLAB_JOB_PATH.search(parsed.path)
+    if job_match:
+        return f"查看 Job #{job_match.group(1)}"
+    commit_match = _GITLAB_COMMIT_PATH.search(parsed.path)
+    if commit_match:
+        return f"查看提交 {commit_match.group(1)[:12]}"
+    return default
 
 
 def format_stage(stage: object) -> str:

@@ -778,9 +778,11 @@ GitLab reconcile 返回。
 终态及必须由人类处理的通知。
 
 人类消息使用固定 Markdown 模板：第一行先给结论，协议值保留原值并追加中文解释，
-run/Card/SHA 使用行内代码，MR/Gate/证据使用链接。Agent 生命周期的“轮次”是当前
-Hermes attempt / `1 + HOLLYSYS_WORKER_REDISPATCH_LIMIT`；文档审查 `n/3` 和 CODE
-修改 `n/5` 分别显示，不与 attempt 混用。完整示例位于
+run/Card/SHA 使用行内代码；MR、审查记录、流水线、Job 和提交使用说明目标的链接文字，
+禁止使用“链接 1”“证据 2”。SPEC、PLAN、TASKS 的“阶段轮次”按 write→review 配对
+计算，依次显示 `1/3`、`2/3`、`3/3`，分子为已使用次数；Hermes 重派 attempt 不增加
+阶段轮次，非文档阶段如需展示则明确写“执行尝试”。CODE 修改仍单独显示 `n/5`。
+findings、决策和风险只发送简短中文摘要，超长原文以省略号收敛。完整示例位于
 `templates/feishu-messages.md`。
 
 #### 人类随时废止

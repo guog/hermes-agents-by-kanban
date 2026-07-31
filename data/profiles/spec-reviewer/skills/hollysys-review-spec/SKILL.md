@@ -28,6 +28,8 @@ version: 4.0.0
    `requirement_ids` 必须保持模板中的 null/空值，评论 URL 只放入 `gitlab_urls`。
 5. 用 `hollysysctl completion-template ... --outcome pass|fail` 生成 completion v8，
    只填写审查结论、评论 URL、决策和风险，不加入 authoring-only repository evidence，
+   人类可见的 `issues`、`key_decisions`、`residual_risk` 必须使用简短中文，单项不超过
+   120 个字符；文件路径、行号、需求 ID、表名和协议标识保持原样，不写审查过程复述。
    不读取完整 schema，不修改 Controller 生成的确定性字段。直接运行
    `validate-completion`，不得用 `execute_code` 包裹；成功后直接调用
    `kanban_complete` 并立即结束。

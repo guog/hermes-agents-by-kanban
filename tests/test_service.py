@@ -943,6 +943,12 @@ class ServiceRecoveryTests(unittest.TestCase):
             Stage.SPEC_REVIEW,
             outcome="fail",
             issues=["acceptance rule is not testable"],
+            gitlab_urls=[
+                (
+                    "https://gitlab.example.com/group/project/"
+                    "-/merge_requests/2#note_31"
+                )
+            ],
             artifact_paths=["docs/specs/feature/spec.md"],
             artifact_digest="b" * 64,
             artifact_commit_sha="c" * 40,
@@ -961,10 +967,16 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(payload["format"], "markdown")
         self.assertIn("**下一位 Agent：** SPEC Writer", payload["content"])
         self.assertIn("**审查轮次：** 3/3", payload["content"])
-        self.assertIn("finalization", payload["content"])
+        self.assertIn("第 3/3 轮审查未通过", payload["content"])
+        self.assertIn("强制收敛", payload["content"])
+        self.assertIn(
+            "[查看 MR !2 审查记录]",
+            payload["content"],
+        )
+        self.assertNotIn("证据 1", payload["content"])
         self.assertIn(self.run.origin.initiator_open_id, payload["content"])
 
-    def test_agent_completion_uses_friendly_markdown_and_runtime_attempt(
+    def test_agent_completion_uses_document_write_review_round(
         self,
     ) -> None:
         service = object.__new__(ControllerService)
@@ -982,8 +994,8 @@ class ServiceRecoveryTests(unittest.TestCase):
             card_id=task.id,
             run_key=self.run.run_key,
             stage=Stage.TASKS_WRITE.value,
-            iteration=3,
-            idempotency_key="tasks-write-3",
+            iteration=2,
+            idempotency_key="tasks-write-2",
             parent_card_id="t_parent",
             purpose="work",
             created_at=1,
@@ -992,6 +1004,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             self.root,
             Stage.TASKS_WRITE,
             outcome="pass",
+            iteration=2,
         )
 
         service._enqueue_agent_completed(
@@ -1011,12 +1024,122 @@ class ServiceRecoveryTests(unittest.TestCase):
             content,
         )
         self.assertIn("**阶段：** tasks-write（拆分 TASKS）", content)
-        self.assertIn("**轮次：** 1/3", content)
+        self.assertIn("**阶段轮次：** 2/3", content)
+        self.assertNotIn("**执行尝试：**", content)
         self.assertIn("**Agent：** Tasker", content)
         self.assertNotIn("**Agent：** Tester", content)
         self.assertIn("**Card：** `t_61010b84`", content)
         self.assertIn("**结论：** pass（通过）", content)
         self.assertIn("**耗时：** 8分54秒", content)
+
+    def test_document_round_counts_each_write_review_pair_once(self) -> None:
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+
+        def reviewed(iteration: int, outcome: str) -> HistoryItem:
+            metadata = completion(
+                self.root,
+                Stage.PLAN_REVIEW,
+                iteration=iteration,
+                outcome=outcome,
+                issues=(["需要修订"] if outcome == "fail" else []),
+                artifact_paths=["docs/plans/feature/plan.md"],
+                artifact_digest="b" * 64,
+                artifact_commit_sha="c" * 40,
+                baseline_disposition=(
+                    "reviewed" if outcome == "pass" else None
+                ),
+            )
+            task = task_record(
+                task_id=f"t_plan_review_{iteration}",
+                body="review",
+                status="done",
+                assignee="plan-reviewer",
+                latest_metadata=metadata.model_dump(mode="json"),
+            )
+            managed = ManagedCard(
+                board=self.run.workspace.board,
+                card_id=task.id,
+                run_key=self.run.run_key,
+                stage=Stage.PLAN_REVIEW.value,
+                iteration=iteration,
+                idempotency_key=f"plan-review-{iteration}",
+                parent_card_id="t_parent",
+                purpose="work",
+                created_at=iteration,
+            )
+            return HistoryItem(managed, task)
+
+        first_pair = [reviewed(1, "fail")]
+        self.assertEqual(
+            service._document_round(
+                first_pair,
+                Stage.PLAN_WRITE,
+                accepted_completion=False,
+            ),
+            2,
+        )
+        self.assertEqual(
+            service._document_round(
+                first_pair,
+                Stage.PLAN_REVIEW,
+                accepted_completion=False,
+            ),
+            2,
+        )
+
+        second_pair = [*first_pair, reviewed(2, "pass")]
+        self.assertEqual(
+            service._document_round(
+                second_pair,
+                Stage.PLAN_REVIEW,
+                accepted_completion=True,
+            ),
+            2,
+        )
+
+    def test_phase_frozen_is_concise_and_uses_meaningful_links(self) -> None:
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "controller.db")
+        service.config = config(self.root)
+        metadata = completion(
+            self.root,
+            Stage.PLAN_REVIEW,
+            iteration=2,
+            outcome="pass",
+            artifact_paths=["docs/plans/feature/plan.md"],
+            artifact_digest="b" * 64,
+            artifact_commit_sha="c" * 40,
+            baseline_disposition="reviewed",
+            gitlab_urls=[
+                (
+                    "https://gitlab.example.com/group/project/"
+                    "-/merge_requests/2#note_32"
+                )
+            ],
+            key_decisions=[
+                "沿用现有 APS 能力并做局部扩展；这是一段故意拉长的说明，"
+                "用于确认飞书摘要不会把长段审查过程完整倾倒给人类。" * 4
+            ],
+            residual_risk=["目标环境仍需回读权限动作配置。"],
+        )
+
+        service._enqueue_phase_frozen(
+            self.run,
+            Phase.PLAN,
+            metadata,
+            2,
+        )
+
+        pending = service.store.pending_outbox()
+        self.assertEqual(len(pending), 1)
+        content = json.loads(pending[0]["payload"])["content"]
+        self.assertIn("PLAN 第 2/3 轮审查通过，工件已冻结", content)
+        self.assertIn("**审查轮次：** 2/3", content)
+        self.assertIn("[查看 MR !2]", content)
+        self.assertIn("[查看 MR !2 审查记录]", content)
+        self.assertIn("…", content)
+        self.assertNotIn("证据 1", content)
 
     def test_code_gate_notification_aggregates_both_roles_and_modification(self) -> None:
         service = object.__new__(ControllerService)

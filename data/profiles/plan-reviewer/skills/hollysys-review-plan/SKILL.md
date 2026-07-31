@@ -24,6 +24,8 @@ version: 4.0.0
    `requirement_ids` 必须保持模板中的 null/空值，评论 URL 只放入 `gitlab_urls`。
 5. 一旦 outcome 和 findings 稳定，停止搜索并预留预算完成协议。直接运行
    `completion-template` 生成 pass/fail completion v8 文件，不读取完整 schema，
-   只填写审查证据，不加入 authoring-only repository evidence。直接运行
+   只填写审查证据，不加入 authoring-only repository evidence。人类可见的
+   `issues`、`key_decisions`、`residual_risk` 必须使用简短中文，单项不超过 120 个
+   字符；文件路径、行号、需求 ID、表名和协议标识保持原样，不写审查过程复述。直接运行
    `validate-completion`，不得用 `execute_code` 包裹；成功后直接调用
    `kanban_complete` 并立即结束。

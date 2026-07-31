@@ -33,6 +33,8 @@ version: 4.0.0
    `ok=true`（包括 `tool_unavailable`）时不得声称通过。
 6. 执行 `hollysysctl completion-template --card-id "$HERMES_KANBAN_TASK" --outcome pass`
    生成 completion v8 文件，只补充模板中的 `repository_evidence`、验证和关键决策，不手写完整
-   metadata，不改 source/run/context/head_before/deterministic checks。再执行
+   metadata，不改 source/run/context/head_before/deterministic checks。人类可见的
+   `key_decisions`、`issues`、`residual_risk` 必须使用简短中文，单项不超过 120 个
+   字符；文件路径、行号、需求 ID、表名和协议标识保持原样，不写执行过程复述。再执行
    `hollysysctl validate-completion --card-id "$HERMES_KANBAN_TASK" --metadata <文件>`；
    只有 `ok=true` 才调用 `kanban_complete`。成功后立即结束，不再调用模型或业务工具。

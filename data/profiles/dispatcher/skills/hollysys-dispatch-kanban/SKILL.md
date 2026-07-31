@@ -27,8 +27,10 @@ version: 3.2.0
 - 第一行先给结论：`**<图标> <中文标题>**`；
 - 后续字段使用 `**字段：** 值`，run、Card、SHA 使用行内代码；
 - Stage、Agent、outcome 保留协议原值并追加中文解释；
-- MR、Gate 和证据使用 Markdown 链接；
-- findings、风险和待办使用短列表，不输出原始敏感日志；
+- MR、审查记录、流水线、Job 和提交使用能说明目标的 Markdown 链接，禁止使用
+  “链接 1”“证据 2”；
+- findings、决策、风险和待办使用简短中文列表，超长原文以省略号收敛，不输出
+  审查过程或原始敏感日志；
 - `✅` 表示完成/恢复，`ℹ️` 表示开始/推进，`⚠️` 表示等待/失败/跳过，
   `❗` 表示需要人类或异常，`⛔` 表示废止。
 
@@ -122,7 +124,9 @@ Controller 使用 Dispatcher 飞书身份和持久 outbox，在原消息/话题�
 试运行默认 `HOLLYSYS_NOTIFICATION_LEVEL=verbose`：
 
 - run 受理、每个阶段开始、每个 Agent 开始工作，以及 Controller 接受或拒绝其完成协议；
-- 文档 review 第 `n/3` 次失败、主要 findings、下一位 writer；
+- 文档 write→review 配对按已使用次数显示 `1/3`、`2/3`、`3/3`；Hermes 重派不增加
+  该阶段轮次；
+- 文档 review 第 `n/3` 次失败、简短中文 findings、下一位 writer；
 - 第三次失败进入 finalization，以及阶段最终按 review 通过或强制收敛冻结；
 - tester 与 code-reviewer 对同一 head 的汇总结论、第 `n/5` 次 coder 修改、
   测试条件不可用的结构化跳过、checked-head merge 完成；

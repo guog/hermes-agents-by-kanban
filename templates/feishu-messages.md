@@ -9,8 +9,10 @@
 - 第一行使用 `**<图标> <中文结论>**`，先给人类结论；
 - 字段使用 `**字段：** 值`，ID、Card、SHA 使用行内代码；
 - 状态值保留协议原值并追加中文解释，例如 `pass（通过）`；
-- findings、风险和证据使用短列表，不发送原始敏感日志；
-- MR、Gate 和证据 URL 使用 Markdown 可点击链接；
+- findings、决策和风险只展示最多三条简短中文摘要；超长原文以省略号收敛，
+  不发送审查过程或原始敏感日志；
+- MR、审查评论、流水线、Job 和提交 URL 使用能说明目标的 Markdown 链接，例如
+  `查看 MR !58`、`查看 MR !58 审查记录`，禁止使用“链接 1”“证据 2”；
 - 禁止重新拼接 `run=... stage=...` 机器格式或直接输出 JSON。
 
 ## 人类命令
@@ -75,8 +77,8 @@
 **状态：** <run-state（中文解释）>
 **Agent：** <agent>
 **Card：** `<card-id>`
-**轮次：** <attempt/attempt-limit>
-**审查轮次：** <n/3，仅审查阶段显示>
+**阶段轮次：** <n/3，文档 write/review 阶段显示>
+**执行尝试：** <attempt/attempt-limit，仅非文档阶段按需显示>
 **代码修改：** <n/5，仅 CODE 阶段显示>
 **下一步：** <Controller 返回的真实 next action>
 ```
@@ -90,15 +92,55 @@
 
 **任务 ID：** `<run_key>`
 **阶段：** tasks-write（拆分 TASKS）
-**轮次：** 1/3
+**阶段轮次：** 2/3
 **Agent：** Tasker
 **Card：** `<card-id>`
 **结论：** pass（通过）
 **耗时：** 8分54秒
 ```
 
-标题和 `Agent` 字段必须来自同一个真实 assignee。轮次为 Hermes attempt /
-`1 + worker_redispatch_limit`，不是 Card 的业务 iteration。
+标题和 `Agent` 字段必须来自同一个真实 assignee。SPEC、PLAN、TASKS 的一次
+write→review 配对只计一个阶段轮次：第一次为 `1/3`，退回重写并再次审查为 `2/3`，
+最后一次为 `3/3`。分子是已使用次数，分母是配置上限。Hermes 进程重派不增加阶段轮次；
+非文档阶段若必须展示重派信息，字段名使用“执行尝试”，不得混称“轮次”。
+
+## 文档审查未通过
+
+```markdown
+<at user_id="<initiator_open_id>"></at> **⚠️ TASKS 第 1/3 轮审查未通过**
+
+**任务 ID：** `<run_key>`
+**审查轮次：** 1/3
+**下一位 Agent：** Tasker
+**后续处理：** 已退回本阶段 Writer 修订；完成后进入下一轮审查。
+
+**主要问题：**
+- <一条简短中文问题，保留文件、行号和协议标识>
+
+**相关链接：**
+- [查看 MR !58 审查记录](<review-note-url>)
+```
+
+## 文档阶段冻结
+
+```markdown
+<at user_id="<initiator_open_id>"></at> **✅ PLAN 第 2/3 轮审查通过，工件已冻结**
+
+**任务 ID：** `<run_key>`
+**审查轮次：** 2/3
+**冻结结论：** 审查通过
+**工件摘要：** `<artifact-digest>`
+
+**关键决策：**
+- <最多两条简短中文结论>
+
+**残余风险：**
+- <最多两条简短中文风险或“无”>
+
+**相关链接：**
+- [查看 MR !58](<mr-url>)
+- [查看 MR !58 审查记录](<review-note-url>)
+```
 
 ## 需要人类
 

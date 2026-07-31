@@ -77,8 +77,26 @@ class RepositoryFirstContractTests(unittest.TestCase):
                 self.assertTrue("Stage" in text or "**阶段：**" in text)
                 self.assertIn("Agent", text)
                 self.assertIn("原", text)
-        self.assertIn("1 + worker_redispatch_limit", template)
+        self.assertIn("write→review 配对只计一个阶段轮次", template)
+        self.assertIn("禁止使用“链接 1”“证据 2”", template)
         self.assertIn("不回复 `run=... stage=...`", dispatcher)
+        for profile, skill in {
+            "spec-writer": "hollysys-write-spec",
+            "spec-reviewer": "hollysys-review-spec",
+            "planner": "hollysys-write-plan",
+            "plan-reviewer": "hollysys-review-plan",
+            "tasker": "hollysys-create-tasks",
+            "task-reviewer": "hollysys-analyze-tasks",
+        }.items():
+            role_skill = (
+                ROOT
+                / "data/profiles"
+                / profile
+                / "skills"
+                / skill
+                / "SKILL.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("必须使用简短中文", role_skill)
 
 
 if __name__ == "__main__":
