@@ -38,6 +38,7 @@ terminal:
 
 approvals:
   mode: off
+  destructive_slash_confirm: false
 
 memory:
   memory_enabled: true
