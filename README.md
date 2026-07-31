@@ -1,7 +1,7 @@
 # Hermes Kanban Hollysys Delivery Agent Fleet
 
-这是一套面向可信内部网络和 Linux/AMD64 的 Hermes 多 Agent 部署包。v4 从固定
-`nousresearch/hermes-agent:v2026.7.20` 完整 OCI digest 构建派生镜像，固定安装并验证
+这是一套面向可信内部网络和 Linux/AMD64 的 Hermes 多 Agent 部署包。v4 从
+`nousresearch/hermes-agent:v2026.7.30` 构建派生镜像，固定安装并验证
 `jq`、Node 22、npm 10 和 .NET SDK 8.0.423，并只在上游源码指纹完全匹配时应用
 terminal Kanban 补丁。
 
@@ -351,7 +351,7 @@ agent:
 
 `agent.reasoning_effort: xhigh` 是 Agent 主模型的全局默认值，也由未显式设置推理强度的委派调用继承。它比 Hermes 未配置时的 `medium` 使用更多推理 token，并可能增加延迟和账户用量。该值不是不可覆盖的策略锁；会话内显式 `/reasoning` 的优先级更高。辅助任务保留各自的推理默认值。
 
-上游依据：[Hermes v2026.7.20 Reasoning Effort 文档](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/website/docs/user-guide/configuration.md#reasoning-effort)。
+上游依据：[Hermes v2026.7.30 Reasoning Effort 文档](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/website/docs/user-guide/configuration.md#reasoning-effort)。
 
 #### 3.4.1 首选：Fleet 级 Codex OAuth
 
@@ -379,7 +379,7 @@ docker compose restart hermes
 
 全局登出会同时影响 12 个 Agent。`data/auth.json` 包含可刷新凭据，备份时必须加密或限制访问，禁止输出内容。若已有 `data/profiles/<profile>/auth.json`，其中的 Codex 凭据会覆盖该 Profile 的全局凭据；迁移时只检查认证状态，不打印 token，也不要未经确认自动删除已有凭据。
 
-上游依据：[Hermes v2026.7.20 AI Provider 文档](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/website/docs/integrations/providers.md#nous-portal)。
+上游依据：[Hermes v2026.7.30 AI Provider 文档](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/website/docs/integrations/providers.md#nous-portal)。
 
 #### 3.4.2 备用：OpenAI-compatible BaseURL + API Key
 
@@ -435,7 +435,7 @@ Dashboard 左侧 Profile 切换器决定当前查看哪个 Agent。选择 Profil
 
 这些数字来自 Hermes 本地会话历史，只统计返回了可用 usage 的成功主 Agent 响应，是本地统计下限，不是供应商账单。辅助调用、供应商重试、fallback、缺失 usage 的调用及部分缓存数据可能不计入。
 
-上游依据：[Hermes v2026.7.20 Dashboard Analytics 文档](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/website/docs/user-guide/features/web-dashboard.md#analytics)；[同版本 `show_token_analytics` 配置定义](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/hermes_cli/config.py#L2052-L2074)。
+上游依据：[Hermes v2026.7.30 Dashboard Analytics 文档](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/website/docs/user-guide/features/web-dashboard.md#analytics)；[同版本 `show_token_analytics` 配置定义](https://github.com/NousResearch/hermes-agent/blob/cc4cab2f592e60a197e796506de9168f74baf3ea/hermes_cli/config.py)。
 
 ## 4. 启动与运维
 
@@ -544,6 +544,11 @@ Agent 已审批的运行态 Skill。运行中的 Agent 也不下载或更新这�
    `hollysys-*` Skill；若卡片没有预加载，则先调用 `skill_view`。
 3. 正式 Kanban 卡保存准确的 `skills` 列表。Worker 启动时 Hermes 将每个名称转换为
    `--skills <name>` 并把完整 `SKILL.md` 预加载到该会话，不依赖模型仅凭描述猜测。
+
+容器每次启动时会在官方基础初始化之后、Gateway reconcile 之前，对全部 12 个命名
+Profile 执行 Hermes 官方 bundled-Skills 同步。各 Profile 因而拥有同一套镜像内置
+Skills；`config.yaml` 的 `skills.disabled` 仍是运行时启用状态的唯一配置约定。部署
+就绪检查会验证 12 份 `.bundled_manifest` 一致且对应 Skill 文件完整。
 
 因此，`controller/config.yaml` 的 stage→assignee→Skill 映射必须与 Skill 目录名、
 frontmatter `name` 和 SOUL 引用一致。Controller 创建后会从 Kanban DB 回读并验证这些

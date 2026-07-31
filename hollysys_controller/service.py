@@ -3881,7 +3881,7 @@ class ControllerService:
             if isinstance(pid_candidate, int) and pid_candidate > 0:
                 worker_pid = pid_candidate
         if worker_session_id is None and event.run_id is not None:
-            # Hermes v2026.7.20 identifies attempts by task_events.run_id but
+            # Hermes v2026.7.30 identifies attempts by task_events.run_id but
             # does not emit worker_session_id in claimed/heartbeat/terminal
             # payloads.  Preserve that durable identity so health timelines
             # do not collapse multiple retries into one perpetually-running

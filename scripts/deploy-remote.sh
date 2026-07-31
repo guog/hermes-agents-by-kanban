@@ -450,6 +450,8 @@ validate_local_configuration() {
     hollysysctl
     controller/config.yaml
     container/run-hollysys-controller.sh
+    container/sync-profile-skills.py
+    container/sync-profile-skills.sh
     scripts/install-external-assets.mjs
   )
 
@@ -476,6 +478,12 @@ validate_local_configuration() {
       die "缺少 Profile 目录：${profile}"
     [[ -f "${profile_env}" && ! -L "${profile_env}" ]] ||
       die "缺少普通文件 data/profiles/${profile}/.env"
+    [[ ! -e "${SOURCE_DIR}/data/profiles/${profile}/.no-bundled-skills" &&
+       ! -L "${SOURCE_DIR}/data/profiles/${profile}/.no-bundled-skills" ]] ||
+      die "${profile} 禁止播种 Hermes bundled Skills"
+    [[ ! -e "${SOURCE_DIR}/data/profiles/${profile}/skills/.curator_suppressed" &&
+       ! -L "${SOURCE_DIR}/data/profiles/${profile}/skills/.curator_suppressed" ]] ||
+      die "${profile} 禁止完整播种 Hermes bundled Skills"
     require_dotenv_value "${profile_env}" "HERMES_PROFILE" "${profile} .env"
     require_dotenv_value "${profile_env}" "GITLAB_HOST" "${profile} .env"
     require_dotenv_value "${profile_env}" "GITLAB_ALLOWED_GROUPS" "${profile} .env"
@@ -1307,6 +1315,11 @@ done
 log "两个容器均 healthy，在 Controller 容器执行静态 preflight"
 docker compose exec -T controller hollysysctl preflight
 docker compose exec -T controller hollysysctl health --probe readiness
+log "在 Hermes 容器核对 12 个 Profile 的 bundled Skills"
+docker compose exec -T hermes \
+  /opt/hermes/.venv/bin/python \
+  /opt/fleet/container/sync-profile-skills.py \
+  --verify-only
 
 if docker compose exec -T controller \
     hermes auth status openai-codex >/dev/null 2>&1; then
