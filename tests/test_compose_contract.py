@@ -80,8 +80,11 @@ class ComposeContractTests(unittest.TestCase):
     def test_derived_image_pins_base_and_toolchain(self) -> None:
         dockerfile = (self.root / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
-            "v2026.7.20@sha256:f7b35053268f532f98955195c909f15a"
-            "230470fbcbdacaa9fdecb95707dad04a",
+            "HERMES_BASE_IMAGE=nousresearch/hermes-agent:v2026.7.30",
+            dockerfile,
+        )
+        self.assertNotIn(
+            "HERMES_BASE_IMAGE=nousresearch/hermes-agent:v2026.7.30@",
             dockerfile,
         )
         self.assertIn("NODE_VERSION=22.18.0", dockerfile)
@@ -129,6 +132,40 @@ class ComposeContractTests(unittest.TestCase):
             .strip(),
             'index-url = "https://mirrors.aliyun.com/pypi/simple/"',
         )
+
+    def test_all_profiles_seed_bundled_skills_before_gateway_reconcile(
+        self,
+    ) -> None:
+        service = self.compose["services"]["hermes"]
+        init_mount = (
+            "./container/sync-profile-skills.sh:"
+            "/etc/cont-init.d/019-hollysys-profile-skills:ro"
+        )
+        self.assertIn(init_mount, service["volumes"])
+        init_script = (
+            self.root / "container" / "sync-profile-skills.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("s6-setuidgid hermes", init_script)
+        self.assertIn("sync-profile-skills.py", init_script)
+
+        profile_configs = sorted(
+            (self.root / "data" / "profiles").glob("*/config.yaml")
+        )
+        baseline_disabled = yaml.safe_load(
+            profile_configs[0].read_text(encoding="utf-8")
+        )["skills"]["disabled"]
+        for config_path in profile_configs:
+            with self.subTest(profile=config_path.parent.name):
+                config = yaml.safe_load(
+                    config_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    config["skills"]["disabled"],
+                    baseline_disabled,
+                )
+                self.assertFalse(
+                    (config_path.parent / ".no-bundled-skills").exists()
+                )
 
     def test_required_feishu_gateways_are_declared_running(self) -> None:
         for profile in ("dispatcher", "fde", "prd-writer"):
@@ -198,9 +235,11 @@ class ComposeContractTests(unittest.TestCase):
         )
         self.assertEqual(
             service["build"]["args"]["HERMES_BASE_IMAGE"],
-            "${HERMES_BASE_IMAGE:-nousresearch/hermes-agent:v2026.7.20@"
-            "sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fde"
-            "cb95707dad04a}",
+            "${HERMES_BASE_IMAGE:-nousresearch/hermes-agent:v2026.7.30}",
+        )
+        self.assertNotIn(
+            "@sha256:",
+            service["build"]["args"]["HERMES_BASE_IMAGE"],
         )
 
     def test_hollysysctl_uses_the_managed_python_environment(self) -> None:

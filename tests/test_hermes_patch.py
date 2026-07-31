@@ -205,25 +205,46 @@ class HermesPatchTests(unittest.TestCase):
     def test_executor_rejects_terminal_tools_from_delegated_session(self) -> None:
         source = (
             "logger = logging.getLogger(__name__)\n\n\n"
-            "def _budget_for_agent(agent) -> BudgetConfig:\n"
+            "def _ensure_file_checkpoint(\n"
             "\n"
-            "    tool_calls = assistant_message.tool_calls\n"
-            "    num_tools = len(tool_calls)\n"
+            '        if function_name == "todo":\n'
             "\n"
-            "        _flush_session_db_after_tool_progress(\n"
-            "            agent,\n"
-            "            messages,\n"
-            '            stage=f"tool result {function_name}",\n'
-            "        )\n\n"
             "        # ── Per-tool /steer drain ───────────────────────────────────\n"
+            "        # Drain pending steer BETWEEN individual tool calls so the\n"
             "\n"
-            '        elif function_name == "todo":\n'
+            "    for kind, calls in segments:\n"
+            "\n"
+            '        if getattr(agent, "_incremental_persistence_failed", False):\n'
+            "            return\n\n"
+            "    # ── Whole-turn finalize (budget + /steer) ─────────────────────────\n"
         )
 
         patched = self.patch.patch_executor(source)
 
         self.assertIn('getattr(agent, "_parent_session_id", None)', patched)
         self.assertIn("delegated subagents cannot complete or block", patched)
+        self.assertIn("for segment_index, (kind, calls)", patched)
+        self.assertIn("segments[segment_index + 1:]", patched)
+        self.assertIn("terminal skipped tool result", patched)
+
+    def test_named_profile_prompt_uses_active_and_default_roots(self) -> None:
+        source = (
+            "    else:\n"
+            "        post_workspace_parts.append(\n"
+            "            f\"Active Hermes profile: {active_profile}. This session reads \"\n"
+            "            f\"and writes {get_hermes_home()}/profiles/{active_profile}/. The default \"\n"
+            "            f\"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, \"\n"
+            "            f\"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a \"\n"
+        )
+
+        patched = self.patch.patch_system_prompt(source)
+
+        self.assertIn("get_default_hermes_root", patched)
+        self.assertIn('f"and writes {get_hermes_home()}/.', patched)
+        self.assertIn(
+            "f\"profile's data lives at {profile_root}/skills/",
+            patched,
+        )
 
 
 if __name__ == "__main__":

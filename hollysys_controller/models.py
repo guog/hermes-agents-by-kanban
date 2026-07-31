@@ -657,7 +657,7 @@ class CompletionMetadata(StrictModel):
 def validate_persisted_completion_metadata(raw: object) -> CompletionMetadata:
     """Validate the worker payload after separating the trusted runtime envelope.
 
-    Hermes v2026.7.20 appends ``worker_session_id`` after a scoped worker calls
+    Hermes v2026.7.30 appends ``worker_session_id`` after a scoped worker calls
     ``kanban_complete``.  It is runtime provenance, not part of the worker's
     strict business completion contract.
     """

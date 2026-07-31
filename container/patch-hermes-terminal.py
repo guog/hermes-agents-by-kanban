@@ -9,31 +9,31 @@ from pathlib import Path
 
 EXPECTED = {
     "agent/tool_executor.py": (
-        "1036cd27e23e17f8d8ede3a2bf812965a31675d444e0a34a53dea8aeae235e26"
+        "6201f54c6b7ebdf455bd468687bd447a7f352ccf64f0fcd503c5608d9170a4e1"
     ),
     "agent/conversation_loop.py": (
-        "c9111ed90d038299f31848e97de1501ad06915c9459b4437934c79956119231b"
+        "316e07a67ddb321a317bc9f2727bc24b144c3fa242da7f560ca746c1281d0529"
     ),
     "agent/system_prompt.py": (
-        "261481c471ddee92ced3fe381d63acbbe9136bedb6420f613983225007e2bb9a"
+        "b19e30b1bbc0cb46b5344be81e2000a7fade00ee7fe2331ca2328458d3df5e94"
     ),
     "agent/turn_finalizer.py": (
-        "b23acd0d2e896c8e47f227751e257733ccd7bead026f04c3bb691bf6db3bd162"
+        "b9b48011dc1c226ca4c8e2890919b748922c2379334b4ab45c18e11d45946e72"
     ),
     "cli.py": (
-        "cbcf1780174a03b225508244575915225a36502f54ad4cddf1da644d9174fec4"
+        "f91980953205e15bec824085736708cdf4082674169811a567132385ccf4c544"
     ),
     "gateway/run.py": (
-        "c6e0f443772e4a8a7eac0d9ccf9a4f659de5fc5493c572a69a46e4c61a8aa966"
+        "223cabed56396b163b57d13258f83070959231d4632bddce14c468ea3b212c18"
     ),
     "hermes_cli/kanban_db.py": (
-        "6adf52e2e8445afe51ce1d3bbf1676ca550d525c9c17035bde026587d46e9c3b"
+        "f96e9f76fb505c6e4c6c1a9534e3aa79584e9eb9009aa5ab2c741fbd0a43fe69"
     ),
     "tools/delegate_tool.py": (
-        "df54e9d8797c471947d43807a6530410843a7002c0a271739c7bbbfca9efaf6f"
+        "9c537dd695d990c27e7a7cec51267ed9167fbe6bb752cdb803d43880d50a1cff"
     ),
     "tools/kanban_tools.py": (
-        "d8aebd3e0e3dec2fe2573c1e0fe4222ca0d1e96540cf3c53b20c6fc916069835"
+        "a2244b040d8d8399d42f8509f86aea0ccd426751234ae6fc06b42867e53fbb34"
     ),
 }
 TERMINAL_TOOLS = frozenset({"kanban_complete", "kanban_block"})
@@ -50,7 +50,7 @@ def patch_executor(text: str) -> str:
     text = replace_once(
         text,
         "logger = logging.getLogger(__name__)\n\n\n"
-        "def _budget_for_agent(agent) -> BudgetConfig:\n",
+        "def _ensure_file_checkpoint(\n",
         "logger = logging.getLogger(__name__)\n\n"
         "_HOLLYSYS_TERMINAL_TOOLS = frozenset("
         '{"kanban_complete", "kanban_block"})\n\n\n'
@@ -59,38 +59,13 @@ def patch_executor(text: str) -> str:
         "        return False\n"
         "    failed, _ = _detect_tool_failure(function_name, result)\n"
         "    return not failed\n\n\n"
-        "def _budget_for_agent(agent) -> BudgetConfig:\n",
+        "def _ensure_file_checkpoint(\n",
         label="executor helper",
     )
     text = replace_once(
         text,
-        "    tool_calls = assistant_message.tool_calls\n"
-        "    num_tools = len(tool_calls)\n",
-        "    tool_calls = assistant_message.tool_calls\n"
-        "    if any(\n"
-        "        tc.function.name in _HOLLYSYS_TERMINAL_TOOLS\n"
-        "        for tc in tool_calls\n"
-        "    ):\n"
-        "        return execute_tool_calls_sequential(\n"
-        "            agent, assistant_message, messages, effective_task_id,\n"
-        "            api_call_count, finalize=finalize,\n"
-        "        )\n"
-        "    num_tools = len(tool_calls)\n",
-        label="concurrent terminal barrier",
-    )
-    text = replace_once(
-        text,
-        "        _flush_session_db_after_tool_progress(\n"
-        "            agent,\n"
-        "            messages,\n"
-        "            stage=f\"tool result {function_name}\",\n"
-        "        )\n\n"
-        "        # ── Per-tool /steer drain ───────────────────────────────────\n",
-        "        _flush_session_db_after_tool_progress(\n"
-        "            agent,\n"
-        "            messages,\n"
-        "            stage=f\"tool result {function_name}\",\n"
-        "        )\n\n"
+        "        # ── Per-tool /steer drain ───────────────────────────────────\n"
+        "        # Drain pending steer BETWEEN individual tool calls so the\n",
         "        if (\n"
         "            not _execution_blocked\n"
         "            and _hollysys_terminal_success(function_name, function_result)\n"
@@ -115,18 +90,20 @@ def patch_executor(text: str) -> str:
         "                    skipped_tc.id,\n"
         "                    effect_disposition=\"none\",\n"
         "                ))\n"
-        "                _flush_session_db_after_tool_progress(\n"
+        "                if not _flush_session_db_after_tool_progress(\n"
         "                    agent, messages,\n"
         "                    stage=f\"terminal skipped tool result {skipped_name}\",\n"
-        "                )\n"
+        "                ):\n"
+        "                    return\n"
         "            break\n\n"
-        "        # ── Per-tool /steer drain ───────────────────────────────────\n",
+        "        # ── Per-tool /steer drain ───────────────────────────────────\n"
+        "        # Drain pending steer BETWEEN individual tool calls so the\n",
         label="sequential terminal stop",
     )
     text = replace_once(
         text,
-        '        elif function_name == "todo":\n',
-        "        elif (\n"
+        '        if function_name == "todo":\n',
+        "        if (\n"
         "            function_name in _HOLLYSYS_TERMINAL_TOOLS\n"
         "            and getattr(agent, \"_parent_session_id\", None)\n"
         "        ):\n"
@@ -140,17 +117,48 @@ def patch_executor(text: str) -> str:
         '        elif function_name == "todo":\n',
         label="delegated terminal runtime guard",
     )
+    text = replace_once(
+        text,
+        "    for kind, calls in segments:\n",
+        "    for segment_index, (kind, calls) in enumerate(segments):\n",
+        label="segmented terminal index",
+    )
+    text = replace_once(
+        text,
+        "        if getattr(agent, \"_incremental_persistence_failed\", False):\n"
+        "            return\n\n"
+        "    # ── Whole-turn finalize (budget + /steer) ─────────────────────────\n",
+        "        if getattr(agent, \"_incremental_persistence_failed\", False):\n"
+        "            return\n\n"
+        "        if getattr(agent, \"_hollysys_terminal_tool\", None):\n"
+        "            for _, remaining_calls in segments[segment_index + 1:]:\n"
+        "                for skipped_tc in remaining_calls:\n"
+        "                    skipped_name = skipped_tc.function.name\n"
+        "                    messages.append(make_tool_result_message(\n"
+        "                        skipped_name,\n"
+        "                        \"[Tool execution skipped — a successful terminal \"\n"
+        "                        \"Kanban tool ended this worker turn]\",\n"
+        "                        skipped_tc.id,\n"
+        "                        effect_disposition=\"none\",\n"
+        "                    ))\n"
+        "                    if not _flush_session_db_after_tool_progress(\n"
+        "                        agent, messages,\n"
+        "                        stage=(\n"
+        "                            \"terminal skipped tool result \" + skipped_name\n"
+        "                        ),\n"
+        "                    ):\n"
+        "                        return\n"
+        "            break\n\n"
+        "    # ── Whole-turn finalize (budget + /steer) ─────────────────────────\n",
+        label="segmented terminal stop",
+    )
     return text
 
 
 def patch_loop(text: str) -> str:
     return replace_once(
         text,
-        "                agent._execute_tool_calls("
-        "assistant_message, messages, effective_task_id, api_call_count)\n\n"
         "                if agent._tool_guardrail_halt_decision is not None:\n",
-        "                agent._execute_tool_calls("
-        "assistant_message, messages, effective_task_id, api_call_count)\n\n"
         "                if getattr(agent, \"_hollysys_terminal_tool\", None):\n"
         "                    _turn_exit_reason = \"hollysys_terminal_tool\"\n"
         "                    final_response = \"\"\n"
@@ -483,7 +491,7 @@ def patch_system_prompt(text: str) -> str:
     return replace_once(
         text,
         "    else:\n"
-        "        stable_parts.append(\n"
+        "        post_workspace_parts.append(\n"
         "            f\"Active Hermes profile: {active_profile}. This session reads \"\n"
         "            f\"and writes {get_hermes_home()}/profiles/{active_profile}/. The default \"\n"
         "            f\"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, \"\n"
@@ -491,7 +499,7 @@ def patch_system_prompt(text: str) -> str:
         "    else:\n"
         "        from hermes_constants import get_default_hermes_root\n"
         "        profile_root = get_default_hermes_root()\n"
-        "        stable_parts.append(\n"
+        "        post_workspace_parts.append(\n"
         "            f\"Active Hermes profile: {active_profile}. This session reads \"\n"
         "            f\"and writes {get_hermes_home()}/. The default \"\n"
         "            f\"profile's data lives at {profile_root}/skills/, {profile_root}/plugins/, \"\n"
@@ -530,7 +538,7 @@ def main() -> None:
         if digest != EXPECTED[relative]:
             raise RuntimeError(
                 f"{relative}: source fingerprint {digest} does not match "
-                f"pinned v2026.7.20 fingerprint {EXPECTED[relative]}"
+                f"pinned v2026.7.30 fingerprint {EXPECTED[relative]}"
             )
         patched = patcher(original.decode("utf-8"))
         path.write_text(patched, encoding="utf-8")
