@@ -174,7 +174,7 @@ class ComposeContractTests(unittest.TestCase):
             "${HOLLYSYS_DOCKER_SUBNET:-10.253.252.0/29}",
         )
 
-    def test_all_agent_profiles_default_to_xhigh_reasoning(self) -> None:
+    def test_all_agent_profiles_share_runtime_budget_contract(self) -> None:
         profile_configs = sorted(
             (self.root / "data" / "profiles").glob("*/config.yaml")
         )
@@ -186,6 +186,8 @@ class ComposeContractTests(unittest.TestCase):
                     config["agent"]["reasoning_effort"],
                     "xhigh",
                 )
+                self.assertEqual(config["agent"]["max_turns"], 500)
+                self.assertEqual(config["agent"]["api_max_retries"], 10)
 
     def test_image_uses_derived_v4_image_for_linux_amd64(self) -> None:
         service = self.compose["services"]["hermes"]

@@ -21,5 +21,7 @@ version: 4.0.0
    `implementation_entry` Gate，引用真实 requirement IDs/contract refs 和精确 note
    URL；fail 给出 TASKS 内可执行 findings。
 5. 用 `completion-template` 生成 pass/fail completion v8，保持 Controller 生成的
-   deterministic checks 原样，只填写真实 reviewer/gate/decision/risk。通过
+   deterministic checks 原样，只填写真实 reviewer/gate/decision/risk。人类可见的
+   `issues`、`key_decisions`、`residual_risk` 必须使用简短中文，单项不超过 120 个
+   字符；文件路径、行号、需求 ID、表名和协议标识保持原样，不写审查过程复述。通过
    `validate-completion` 后完成卡片并立即结束。

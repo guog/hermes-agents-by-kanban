@@ -5,6 +5,8 @@ model:
   base_url: https://chatgpt.com/backend-api/codex
 agent:
   reasoning_effort: xhigh
+  max_turns: 500
+  api_max_retries: 10
 tool_output:
   max_bytes: 12000
   max_lines: 400

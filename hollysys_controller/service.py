@@ -54,6 +54,8 @@ from .messages import (
     format_event,
     format_outcome,
     format_stage,
+    gitlab_link_label,
+    human_summary,
     inline_code,
     markdown_link,
     markdown_payload,
@@ -2867,6 +2869,7 @@ class ControllerService:
                         run,
                         latest,
                         str(exc),
+                        history=history,
                         mr_iid=metadata.mr_iid,
                         head_sha=metadata.head_sha,
                     )
@@ -2890,6 +2893,7 @@ class ControllerService:
                     run,
                     latest,
                     violation,
+                    history=history,
                     mr_iid=metadata.mr_iid,
                     head_sha=current_head,
                 )
@@ -2926,6 +2930,7 @@ class ControllerService:
                         run,
                         latest,
                         str(exc),
+                        history=history,
                         mr_iid=metadata.mr_iid,
                         head_sha=current_head,
                     )
@@ -2947,6 +2952,7 @@ class ControllerService:
                         run,
                         latest,
                         str(exc),
+                        history=history,
                         mr_iid=metadata.mr_iid,
                         head_sha=current_head,
                     )
@@ -2987,7 +2993,7 @@ class ControllerService:
                 ),
                 expected_head_sha=metadata.head_sha,
             )
-        self._enqueue_agent_completed(run, latest, metadata)
+        self._enqueue_agent_completed(run, latest, metadata, history=history)
 
         review_attempts = self._review_attempts_by_stage(history)
         code_modifications = self._code_modification_count(history)
@@ -3099,12 +3105,17 @@ class ControllerService:
                     run,
                     PHASE_FOR_STAGE[metadata.stage],
                     metadata,
+                    review_attempts.get(metadata.stage, 0),
                 )
             if metadata.mode == WorkMode.FINALIZATION:
+                final_review_stage = DOCUMENT_REVIEW_FOR_PRODUCER[
+                    metadata.stage
+                ]
                 self._enqueue_phase_frozen(
                     run,
                     PHASE_FOR_STAGE[metadata.stage],
                     metadata,
+                    review_attempts.get(final_review_stage, 0),
                 )
             created = self._create_work(
                 run,
@@ -3913,7 +3924,7 @@ class ControllerService:
         if not should_notify:
             return
         try:
-            _, run = self._history(managed.run_key)
+            history, run = self._history(managed.run_key)
             task = self.reader.task(managed.board, managed.card_id)
         except (DependencyError, ControllerFatalError):
             # Do not advance the Kanban event cursor. The durable runtime write
@@ -3931,6 +3942,14 @@ class ControllerService:
             else None
         )
         attempt = int((runtime or {}).get("attempt") or 1)
+        round_field = self._round_field(
+            document_round=self._document_round(
+                history,
+                Stage(managed.stage),
+                accepted_completion=False,
+            ),
+            worker_attempt=attempt,
+        )
         state_version = int(
             self._run_control(run.run_key).get("state_version") or 1
         )
@@ -3949,13 +3968,7 @@ class ControllerService:
                     fields=[
                         ("任务 ID", inline_code(run.run_key)),
                         ("阶段", format_stage(managed.stage)),
-                        (
-                            "轮次",
-                            format_attempt(
-                                attempt,
-                                self.config.worker_redispatch_limit,
-                            ),
-                        ),
+                        round_field,
                         ("Agent", agent_label),
                         ("Card", inline_code(task.id)),
                     ],
@@ -3977,13 +3990,7 @@ class ControllerService:
                     fields=[
                         ("任务 ID", inline_code(run.run_key)),
                         ("阶段", format_stage(managed.stage)),
-                        (
-                            "轮次",
-                            format_attempt(
-                                attempt,
-                                self.config.worker_redispatch_limit,
-                            ),
-                        ),
+                        round_field,
                         ("Agent", agent_label),
                         ("Card", inline_code(task.id)),
                         ("事件", format_event(event.kind)),
@@ -4014,7 +4021,7 @@ class ControllerService:
                 if task is None or task.status != "running":
                     continue
                 try:
-                    _, run = self._history(run_key)
+                    history, run = self._history(run_key)
                 except DependencyContractError as exc:
                     self._record_run_exception(run_key, exc)
                     break
@@ -4026,6 +4033,11 @@ class ControllerService:
                 except (ValidationError, ValueError, TypeError) as exc:
                     self._record_run_exception(run_key, exc)
                     break
+                document_round = self._document_round(
+                    history,
+                    Stage(str(runtime["stage"])),
+                    accepted_completion=False,
+                )
                 process_state = self._worker_process_state(runtime.get("worker_pid"))
                 if process_state == "running":
                     self.store.update_worker_watchdog(
@@ -4042,6 +4054,7 @@ class ControllerService:
                         deadline,
                         "evidence_insufficient",
                         "worker PID/session evidence is incomplete or inaccessible",
+                        document_round=document_round,
                     )
                     continue
                 if (
@@ -4056,6 +4069,7 @@ class ControllerService:
                         deadline,
                         "identity_mismatch",
                         "profile/session/worktree/branch evidence does not match",
+                        document_round=document_round,
                     )
                     continue
                 if not hasattr(self.gitlab, "local_workspace_state"):
@@ -4065,6 +4079,7 @@ class ControllerService:
                         deadline,
                         "workspace_probe_unavailable",
                         "local workspace probe is unavailable",
+                        document_round=document_round,
                     )
                     continue
                 workspace = self.gitlab.local_workspace_state(run)
@@ -4083,6 +4098,7 @@ class ControllerService:
                             or "workspace_evidence_incomplete"
                         ),
                         "worktree or branch identity could not be verified",
+                        document_round=document_round,
                     )
                     continue
                 if not hasattr(self.gitlab, "delivery_mr"):
@@ -4092,6 +4108,7 @@ class ControllerService:
                         deadline,
                         "mr_probe_unavailable",
                         "delivery MR probe is unavailable",
+                        document_round=document_round,
                     )
                     continue
                 try:
@@ -4112,6 +4129,7 @@ class ControllerService:
                         deadline,
                         exc.context.error_code or exc.error_class,
                         "MR/head evidence is temporarily unavailable",
+                        document_round=document_round,
                     )
                     break
                 persisted_mr = runtime.get("mr_iid")
@@ -4146,6 +4164,7 @@ class ControllerService:
                         deadline,
                         "mr_head_mismatch",
                         "local and persisted MR/head evidence does not match GitLab",
+                        document_round=document_round,
                     )
                     continue
                 redispatch_count = int(runtime.get("redispatch_count") or 0)
@@ -4227,11 +4246,10 @@ class ControllerService:
                                         "阶段",
                                         format_stage(runtime["stage"]),
                                     ),
-                                    (
-                                        "轮次",
-                                        format_attempt(
-                                            runtime.get("attempt"),
-                                            self.config.worker_redispatch_limit,
+                                    self._round_field(
+                                        document_round=document_round,
+                                        worker_attempt=int(
+                                            runtime.get("attempt") or 1
                                         ),
                                     ),
                                     (
@@ -4312,6 +4330,8 @@ class ControllerService:
         deadline: int,
         error_code: str,
         explanation: str,
+        *,
+        document_round: int | None = None,
     ) -> None:
         if self.config.notification_level != NotificationLevel.VERBOSE:
             return
@@ -4331,11 +4351,10 @@ class ControllerService:
                     fields=[
                         ("任务 ID", inline_code(run.run_key)),
                         ("阶段", format_stage(runtime["stage"])),
-                        (
-                            "轮次",
-                            format_attempt(
-                                runtime.get("attempt"),
-                                self.config.worker_redispatch_limit,
+                        self._round_field(
+                            document_round=document_round,
+                            worker_attempt=int(
+                                runtime.get("attempt") or 1
                             ),
                         ),
                         ("Card", inline_code(runtime["card_id"])),
@@ -4367,6 +4386,8 @@ class ControllerService:
         run: RunRecord,
         item: HistoryItem,
         metadata: CompletionMetadata,
+        *,
+        history: list[HistoryItem] | None = None,
     ) -> None:
         if (
             self.config.notification_level != NotificationLevel.VERBOSE
@@ -4387,6 +4408,26 @@ class ControllerService:
             else None
         )
         attempt = int((runtime or {}).get("attempt") or 1)
+        document_round = (
+            self._document_round(
+                history,
+                metadata.stage,
+                accepted_completion=True,
+            )
+            if history is not None
+            else (
+                min(
+                    self.config.document_review_limit,
+                    max(1, metadata.iteration),
+                )
+                if metadata.stage
+                in {
+                    *DOCUMENT_REVIEW_FOR_PRODUCER,
+                    *DOCUMENT_REVIEW_FOR_PRODUCER.values(),
+                }
+                else None
+            )
+        )
         agent_label = format_agent(item.task.assignee)
         related_links = list(
             dict.fromkeys(
@@ -4411,12 +4452,9 @@ class ControllerService:
                 fields=[
                     ("任务 ID", inline_code(run.run_key)),
                     ("阶段", format_stage(metadata.stage)),
-                    (
-                        "轮次",
-                        format_attempt(
-                            attempt,
-                            self.config.worker_redispatch_limit,
-                        ),
+                    self._round_field(
+                        document_round=document_round,
+                        worker_attempt=attempt,
                     ),
                     ("Agent", agent_label),
                     ("Card", inline_code(item.task.id)),
@@ -4427,11 +4465,8 @@ class ControllerService:
                     (
                         "相关链接",
                         [
-                            markdown_link(f"链接 {index}", url)
-                            for index, url in enumerate(
-                                related_links,
-                                start=1,
-                            )
+                            markdown_link(gitlab_link_label(url), url)
+                            for url in related_links
                         ],
                     )
                 ],
@@ -4443,6 +4478,8 @@ class ControllerService:
         run: RunRecord,
         item: HistoryItem,
         reason: str,
+        *,
+        history: list[HistoryItem] | None = None,
     ) -> None:
         if (
             getattr(self, "config", None) is None
@@ -4458,6 +4495,27 @@ class ControllerService:
             else None
         )
         attempt = int((runtime or {}).get("attempt") or 1)
+        stage = Stage(item.managed.stage)
+        document_round = (
+            self._document_round(
+                history,
+                stage,
+                accepted_completion=False,
+            )
+            if history is not None
+            else (
+                min(
+                    self.config.document_review_limit,
+                    max(1, item.managed.iteration),
+                )
+                if stage
+                in {
+                    *DOCUMENT_REVIEW_FOR_PRODUCER,
+                    *DOCUMENT_REVIEW_FOR_PRODUCER.values(),
+                }
+                else None
+            )
+        )
         agent_label = format_agent(item.task.assignee)
         self._enqueue_progress(
             run,
@@ -4473,12 +4531,9 @@ class ControllerService:
                 fields=[
                     ("任务 ID", inline_code(run.run_key)),
                     ("阶段", format_stage(item.managed.stage)),
-                    (
-                        "轮次",
-                        format_attempt(
-                            attempt,
-                            self.config.worker_redispatch_limit,
-                        ),
+                    self._round_field(
+                        document_round=document_round,
+                        worker_attempt=attempt,
                     ),
                     ("Agent", agent_label),
                     ("Card", inline_code(item.task.id)),
@@ -4487,7 +4542,7 @@ class ControllerService:
                 sections=[
                     (
                         "拒绝原因",
-                        [escape_markdown(reason, limit=700)],
+                        [human_summary(reason, limit=180)],
                     )
                 ],
             ),
@@ -4975,6 +5030,55 @@ class ControllerService:
             result[stage] = result.get(stage, 0) + 1
         return result
 
+    def _document_round(
+        self,
+        history: list[HistoryItem],
+        stage: Stage,
+        *,
+        accepted_completion: bool,
+    ) -> int | None:
+        review_stage = DOCUMENT_REVIEW_FOR_PRODUCER.get(stage)
+        is_review = False
+        if review_stage is None and stage in set(
+            DOCUMENT_REVIEW_FOR_PRODUCER.values()
+        ):
+            review_stage = stage
+            is_review = True
+        if review_stage is None:
+            return None
+        completed_reviews = self._review_attempts_by_stage(history).get(
+            review_stage,
+            0,
+        )
+        used = (
+            completed_reviews
+            if is_review and accepted_completion
+            else completed_reviews + 1
+        )
+        return min(
+            self.config.document_review_limit,
+            max(1, used),
+        )
+
+    def _round_field(
+        self,
+        *,
+        document_round: int | None,
+        worker_attempt: int,
+    ) -> tuple[str, str]:
+        if document_round is not None:
+            return (
+                "阶段轮次",
+                f"{document_round}/{self.config.document_review_limit}",
+            )
+        return (
+            "执行尝试",
+            format_attempt(
+                worker_attempt,
+                self.config.worker_redispatch_limit,
+            ),
+        )
+
     def _review_attempts_by_stage(
         self, history: list[HistoryItem]
     ) -> dict[Stage, int]:
@@ -5417,6 +5521,7 @@ class ControllerService:
         item: HistoryItem,
         reason: str,
         *,
+        history: list[HistoryItem] | None = None,
         mr_iid: int | None = None,
         head_sha: str | None = None,
     ) -> None:
@@ -5428,7 +5533,12 @@ class ControllerService:
             head_sha=head_sha,
             reason=reason,
         )
-        self._enqueue_agent_completion_rejected(run, item, reason)
+        self._enqueue_agent_completion_rejected(
+            run,
+            item,
+            reason,
+            history=history,
+        )
 
     def _validate_finalization_context(
         self,
@@ -5497,7 +5607,12 @@ class ControllerService:
         reason: str,
     ) -> None:
         self._assert_reconcile_mutable(run.run_key)
-        self._reject_agent_completion(run, latest, reason)
+        self._reject_agent_completion(
+            run,
+            latest,
+            reason,
+            history=history,
+        )
         marker = "[controller-protocol-error:v4]"
         already_marked = any(
             marker in str(comment["body"]) for comment in latest.task.comments
@@ -5899,18 +6014,33 @@ class ControllerService:
         next_mode: WorkMode,
     ) -> None:
         phase = PHASE_FOR_STAGE[metadata.stage]
-        summary = "；".join(metadata.issues[:3])
         if next_mode == WorkMode.FINALIZATION:
-            action = "三次 review 已用尽，进入 finalization；完成关键决策后将冻结并继续。"
+            action = (
+                "三轮审查均未通过，已交回本阶段 Writer 完成最终取舍；"
+                "完成后将按强制收敛规则冻结。"
+            )
         else:
-            action = "已退回本阶段 writer 重写，完成后再次 review。"
+            action = "已退回本阶段 Writer 修订；完成后进入下一轮审查。"
+        urls = list(
+            dict.fromkeys(
+                [
+                    *([str(metadata.mr_url)] if metadata.mr_url else []),
+                    *(str(url) for url in metadata.gitlab_urls),
+                    *(str(url) for url in metadata.gate_evidence_refs),
+                ]
+            )
+        )
         self._enqueue_progress(
             run,
             f"{phase.value}:review-failed:{review_attempt}:{metadata.kanban_card_id}",
             self._render_notification(
                 run,
                 icon="⚠️",
-                title=f"{phase.value.upper()} Review 未通过",
+                title=(
+                    f"{phase.value.upper()} 第 "
+                    f"{review_attempt}/{self.config.document_review_limit} "
+                    "轮审查未通过"
+                ),
                 fields=[
                     ("任务 ID", inline_code(run.run_key)),
                     (
@@ -5925,17 +6055,29 @@ class ControllerService:
                             ]
                         ),
                     ),
-                    ("后续处理", escape_markdown(action, limit=300)),
+                    ("后续处理", escape_markdown(action)),
                 ],
                 sections=[
                     (
                         "主要问题",
                         [
-                            escape_markdown(issue, limit=300)
+                            human_summary(issue, limit=180)
                             for issue in metadata.issues[:3]
-                        ]
-                        or [escape_markdown(summary, limit=500)],
-                    )
+                        ],
+                    ),
+                    (
+                        "相关链接",
+                        [
+                            markdown_link(
+                                gitlab_link_label(
+                                    url,
+                                    default="查看审查证据",
+                                ),
+                                url,
+                            )
+                            for url in urls
+                        ],
+                    ),
                 ],
             ),
         )
@@ -5945,12 +6087,24 @@ class ControllerService:
         run: RunRecord,
         phase: Phase,
         metadata: CompletionMetadata,
+        review_attempt: int,
     ) -> None:
         disposition = metadata.baseline_disposition
         label = (
-            "review 通过"
+            "审查通过"
             if disposition == BaselineDisposition.REVIEWED
-            else "达到 review 上限后强制收敛"
+            else "达到审查上限后强制收敛"
+        )
+        title = (
+            f"{phase.value.upper()} 第 "
+            f"{review_attempt}/{self.config.document_review_limit} "
+            "轮审查通过，工件已冻结"
+            if disposition == BaselineDisposition.REVIEWED
+            else (
+                f"{phase.value.upper()} 已在 "
+                f"{review_attempt}/{self.config.document_review_limit} "
+                "轮后强制收敛并冻结"
+            )
         )
         urls = list(
             dict.fromkeys(
@@ -5967,9 +6121,16 @@ class ControllerService:
             self._render_notification(
                 run,
                 icon="✅",
-                title=f"{phase.value.upper()} 阶段工件已冻结",
+                title=title,
                 fields=[
                     ("任务 ID", inline_code(run.run_key)),
+                    (
+                        "审查轮次",
+                        (
+                            f"{review_attempt}/"
+                            f"{self.config.document_review_limit}"
+                        ),
+                    ),
                     ("冻结结论", escape_markdown(label)),
                     (
                         "工件摘要",
@@ -5980,24 +6141,24 @@ class ControllerService:
                     (
                         "关键决策",
                         [
-                            escape_markdown(decision, limit=300)
-                            for decision in metadata.key_decisions[:3]
+                            human_summary(decision, limit=180)
+                            for decision in metadata.key_decisions[:2]
                         ]
                         or ["无"],
                     ),
                     (
                         "残余风险",
                         [
-                            escape_markdown(risk, limit=300)
-                            for risk in metadata.residual_risk[:3]
+                            human_summary(risk, limit=180)
+                            for risk in metadata.residual_risk[:2]
                         ]
                         or ["无"],
                     ),
                     (
                         "相关链接",
                         [
-                            markdown_link(f"证据 {index}", url)
-                            for index, url in enumerate(urls, start=1)
+                            markdown_link(gitlab_link_label(url), url)
+                            for url in urls
                         ],
                     ),
                 ],
