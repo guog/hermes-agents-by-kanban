@@ -231,7 +231,7 @@ class ComposeContractTests(unittest.TestCase):
         self.assertEqual(service["platform"], "linux/amd64")
         self.assertEqual(
             service["image"],
-            "${HOLLYSYS_IMAGE:-hollysys/hermes-agent:v4}",
+            "${HOLLYSYS_IMAGE:-hollysys-hermes-agents:latest}",
         )
         self.assertEqual(
             service["build"]["args"]["HERMES_BASE_IMAGE"],
@@ -241,6 +241,16 @@ class ComposeContractTests(unittest.TestCase):
             "@sha256:",
             service["build"]["args"]["HERMES_BASE_IMAGE"],
         )
+
+    def test_remote_deploy_uses_the_same_default_derived_image(self) -> None:
+        deploy_script = (
+            self.root / "scripts" / "deploy-remote.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'IMAGE_REF="hollysys-hermes-agents:latest"',
+            deploy_script,
+        )
+        self.assertNotIn("hollysys/hermes-agent:v4-", deploy_script)
 
     def test_hollysysctl_uses_the_managed_python_environment(self) -> None:
         wrapper = (self.root / "hollysysctl").read_text(encoding="utf-8")

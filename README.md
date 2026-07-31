@@ -3,7 +3,7 @@
 这是一套面向可信内部网络和 Linux/AMD64 的 Hermes 多 Agent 部署包。v4 从
 `nousresearch/hermes-agent:v2026.7.30` 构建派生镜像，固定安装并验证
 `jq`、Node 22、npm 10 和 .NET SDK 8.0.423，并只在上游源码指纹完全匹配时应用
-terminal Kanban 补丁。
+terminal Kanban 补丁。派生镜像默认命名为 `hollysys-hermes-agents:latest`。
 
 人类通过飞书 Dispatcher 启动或废止一次正式交付；Dispatcher 是唯一命令、状态和异常入口，
 并通过飞书汇报 Agent/阶段事件。Controller 独立于 Dispatcher/Gateway 会话，持续监听 Kanban
@@ -43,7 +43,7 @@ Compose 有两个独立 service：
 ```text
 .
 ├── docker-compose.yaml
-├── Dockerfile                 # 固定 Hermes digest 的 v4 派生镜像
+├── Dockerfile                 # 固定 Hermes 版本的 v4 派生镜像
 ├── .env.example
 ├── external-assets.json        # 第三方 Skills 与 CLI 的唯一依赖清单
 ├── package.json
@@ -861,7 +861,7 @@ blocked 卡的 `promote` 同样记录为 `promoted_manual`；Controller 只在�
 
 ## 7. 固定派生镜像的安全边界
 
-本部署从固定完整 digest 构建派生镜像，并在构建时对预期 Hermes 源文件 hash 做指纹校验；
+本部署从固定 Hermes 版本 tag 构建派生镜像，并在构建时对预期 Hermes 源文件 hash 做指纹校验；
 只有精确匹配时才应用 terminal Kanban 补丁。硬门禁来自 Controller 对自己创建对象的外部控制：
 
 - `dispatcher.kanban.dispatch_in_gateway: true`、`prd-writer/fde: false` 决定哪个 Gateway 自动轮询 Kanban。

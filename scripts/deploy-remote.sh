@@ -31,8 +31,6 @@ CONTROLLER_CONTAINER="${HERMES_DEPLOY_CONTROLLER_CONTAINER:-}"
 DASHBOARD_PORT="${HERMES_DEPLOY_DASHBOARD_PORT:-}"
 DOCKER_SUBNET="${HERMES_DEPLOY_DOCKER_SUBNET:-}"
 IMAGE_REF="${HERMES_DEPLOY_IMAGE:-}"
-IMAGE_REF_EXPLICIT=0
-[[ -z "${IMAGE_REF}" ]] || IMAGE_REF_EXPLICIT=1
 BUILD_NETWORK="${HERMES_DEPLOY_BUILD_NETWORK:-host}"
 HEALTH_TIMEOUT="${HERMES_DEPLOY_HEALTH_TIMEOUT:-600}"
 
@@ -95,11 +93,11 @@ usage() {
   --controller-container N  Controller 容器名，默认 <project>-controller
   --dashboard-port PORT     Dashboard 宿主机端口（必填）
   --subnet CIDR             独立 Docker IPv4 子网（必填）
-  --image IMAGE:TAG         派生镜像引用；默认生成带 UTC 时间的唯一 tag
+  --image IMAGE:TAG         派生镜像引用；默认 hollysys-hermes-agents:latest
   --build-network MODE      docker build 网络：host（默认）、default 或 none
   --health-timeout SEC      等待两个容器 healthy 的秒数，默认 600
   --refresh-assets          打包前运行 npm ci 和 npm run assets:install
-  --skip-build              不构建镜像，要求远端已存在 --image 指定的镜像
+  --skip-build              不构建镜像，要求远端已存在指定或默认镜像
   --allow-missing-auth      兼容旧调用；本机 data/auth.json 始终不会上传
   --replace-existing       彻底清除并替换同目录、同项目的已有实例
   --yes                     与 --replace-existing 一起使用，取消交互确认
@@ -200,7 +198,6 @@ while (($# > 0)); do
     --image)
       require_arg "$1" "${2:-}"
       IMAGE_REF="$2"
-      IMAGE_REF_EXPLICIT=1
       shift 2
       ;;
     --build-network)
@@ -362,13 +359,10 @@ validate_inputs() {
   esac
 
   if [[ -z "${IMAGE_REF}" ]]; then
-    IMAGE_REF="hollysys/hermes-agent:v4-${COMPOSE_PROJECT}-${DEPLOYMENT_ID}"
+    IMAGE_REF="hollysys-hermes-agents:latest"
   fi
   [[ "${IMAGE_REF}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
     die "镜像引用必须是安全的 IMAGE:TAG：${IMAGE_REF}"
-  if ((SKIP_BUILD == 1 && IMAGE_REF_EXPLICIT == 0)); then
-    die "--skip-build 必须同时显式传入 --image 或设置 HERMES_DEPLOY_IMAGE"
-  fi
 
   if ((ASSUME_YES == 1 && REPLACE_EXISTING == 0)); then
     warn "--yes 只对 --replace-existing 生效"
@@ -1237,7 +1231,7 @@ if [ "${skip_build}" = "1" ]; then
     fail "远端不存在指定镜像：${image_ref}"
   log "复用已存在镜像：${image_ref}"
 else
-  log "构建唯一派生镜像：${image_ref}"
+  log "构建派生镜像：${image_ref}"
   docker build \
     --network="${build_network}" \
     --platform=linux/amd64 \
