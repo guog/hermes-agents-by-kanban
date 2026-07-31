@@ -102,6 +102,23 @@ class HermesPatchTests(unittest.TestCase):
         self.assertIn('"server_error"', patched)
         self.assertIn('"upstream_rate_limit"', patched)
 
+    def test_fresh_docker_config_is_migrated_and_version_stamped(self) -> None:
+        source = (
+            "    get_env_path,\n"
+            "    migrate_config,\n"
+            "\n"
+            "    if current_ver < SUPPORT_FLOOR_VERSION:\n"
+        )
+
+        patched = self.patch.patch_docker_config_migrate(source)
+
+        self.assertIn("_raw_config_has_explicit_version,", patched)
+        self.assertIn(
+            "_raw_config_has_explicit_version()\n"
+            "        and current_ver < SUPPORT_FLOOR_VERSION",
+            patched,
+        )
+
     def test_all_kanban_workers_use_machine_exit_contract(self) -> None:
         source = (
             "    if task.goal_mode:\n"
