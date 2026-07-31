@@ -29,6 +29,9 @@ EXPECTED = {
     "hermes_cli/kanban_db.py": (
         "f96e9f76fb505c6e4c6c1a9534e3aa79584e9eb9009aa5ab2c741fbd0a43fe69"
     ),
+    "scripts/docker_config_migrate.py": (
+        "62fdbd91cad654c0ce6277527ef2c25184d62f5dfca09025d670135baacb1fc6"
+    ),
     "tools/delegate_tool.py": (
         "9c537dd695d990c27e7a7cec51267ed9167fbe6bb752cdb803d43880d50a1cff"
     ),
@@ -324,6 +327,27 @@ def patch_cli(text: str) -> str:
     )
 
 
+def patch_docker_config_migrate(text: str) -> str:
+    text = replace_once(
+        text,
+        "    get_env_path,\n"
+        "    migrate_config,\n",
+        "    get_env_path,\n"
+        "    migrate_config,\n"
+        "    _raw_config_has_explicit_version,\n",
+        label="docker config explicit-version import",
+    )
+    return replace_once(
+        text,
+        "    if current_ver < SUPPORT_FLOOR_VERSION:\n",
+        "    if (\n"
+        "        _raw_config_has_explicit_version()\n"
+        "        and current_ver < SUPPORT_FLOOR_VERSION\n"
+        "    ):\n",
+        label="docker config support-floor guard",
+    )
+
+
 def patch_kanban(text: str) -> str:
     text = replace_once(
         text,
@@ -526,6 +550,7 @@ def main() -> None:
         "cli.py": patch_cli,
         "gateway/run.py": patch_gateway,
         "hermes_cli/kanban_db.py": patch_kanban,
+        "scripts/docker_config_migrate.py": patch_docker_config_migrate,
         "tools/delegate_tool.py": patch_delegate,
         "tools/kanban_tools.py": patch_kanban_tools,
     }
