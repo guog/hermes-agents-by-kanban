@@ -23,6 +23,7 @@ def config(tmp_path: Path) -> ControllerConfig:
         lock_path=tmp_path / "state" / "controller.lock",
         controller_token_file=tmp_path / "controller-token",
         profiles_root=tmp_path / "profiles",
+        skills_root=tmp_path / "skills",
         projects_root=tmp_path / "projects",
         gitlab_host="green-git.hollysys.net",
         controller_mode="active",

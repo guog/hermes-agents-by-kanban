@@ -67,6 +67,7 @@ class ControllerConfig(BaseModel):
     lock_path: Path = Path("/opt/data/controller/controller.lock")
     config_path: Path = Path("/opt/hollysys-controller/config.yaml")
     profiles_root: Path = Path("/opt/data/profiles")
+    skills_root: Path = Path("/opt/skills")
     projects_root: Path = Path("/workspace/projects")
     hermes_command: str = "hermes"
     glab_command: str = "/usr/local/bin/glab"
@@ -86,6 +87,11 @@ class ControllerConfig(BaseModel):
     reconcile_workers: int = Field(default=4, ge=1, le=32)
     outbox_poll_interval_seconds: float = Field(default=2.0, gt=0)
     command_timeout_seconds: int = Field(default=120, gt=0)
+    start_request_sync_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+    )
     offline_cache_timeout_seconds: int = Field(default=1800, ge=60, le=7200)
     gitlab_host: str = ""
     allowed_groups: list[str] = Field(default_factory=list)
@@ -299,6 +305,10 @@ class ControllerConfig(BaseModel):
             "HOLLYSYS_OFFLINE_CACHE_TIMEOUT_SECONDS": (
                 "offline_cache_timeout_seconds",
                 int,
+            ),
+            "HOLLYSYS_START_REQUEST_SYNC_TIMEOUT_SECONDS": (
+                "start_request_sync_timeout_seconds",
+                float,
             ),
             "HOLLYSYS_NOTIFICATION_LEVEL": "notification_level",
             "HOLLYSYS_RECONCILE_WORKERS": ("reconcile_workers", int),

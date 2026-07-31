@@ -8,17 +8,8 @@ import sys
 import uuid
 from pathlib import Path
 
-from .config import ControllerConfig
 from .models import RpcRequest
 from .rpc import rpc_call
-from .service import ControllerService
-
-
-def controller_snapshot_config(config: ControllerConfig) -> ControllerConfig:
-    """Use the Controller data root even when an Agent has a profile home."""
-    return config.model_copy(
-        update={"hermes_home": config.state_dir.parent},
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_completion = sub.add_parser("validate-completion")
     validate_completion.add_argument("--card-id", required=True)
-    validate_completion.add_argument("--metadata", required=True, type=Path)
+    validate_completion.add_argument("--metadata", required=True)
 
     publish_delivery = sub.add_parser("publish-delivery")
     publish_delivery.add_argument("--card-id", required=True)
@@ -137,10 +128,19 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
             "initiator": values["initiator"],
         }
     elif method == "validate-completion":
-        metadata_path = values.pop("metadata")
-        values["metadata"] = json.loads(
-            metadata_path.read_text(encoding="utf-8")
-        )
+        metadata_argument = str(values.pop("metadata")).strip()
+        metadata_path = Path(metadata_argument)
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        elif metadata_argument.startswith("{"):
+            metadata = json.loads(metadata_argument)
+        else:
+            raise ValueError(
+                "--metadata must be an existing JSON file or an inline JSON object"
+            )
+        if not isinstance(metadata, dict):
+            raise ValueError("--metadata JSON must be an object")
+        values["metadata"] = metadata
     elif method == "publish-delivery":
         description_path = values.pop("description_file")
         if not description_path.is_file():
@@ -153,26 +153,25 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
 
 async def _run(args: argparse.Namespace) -> int:
     method, params = params_for(args)
-    if method == "preflight":
-        config = controller_snapshot_config(ControllerConfig.load())
-        result = ControllerService(config).preflight(
-            deep=bool(params.get("deep", False))
-        )
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result["ok"] else 1
     request = RpcRequest(id=str(uuid.uuid4()), method=method, params=params)
     response = await rpc_call(Path(args.socket), request)
     if not response.ok:
         print(response.error or "controller request failed", file=sys.stderr)
         return 1
     print(json.dumps(response.result or {}, ensure_ascii=False, indent=2))
-    if method == "health" and not (response.result or {}).get("ok", False):
+    if method in {"health", "preflight"} and not (
+        response.result or {}
+    ).get("ok", False):
         return 1
     return 0
 
 
 def main() -> int:
-    return asyncio.run(_run(build_parser().parse_args()))
+    try:
+        return asyncio.run(_run(build_parser().parse_args()))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"hollysysctl: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -59,6 +59,7 @@ OUTCOME_LABELS = {
 EVENT_LABELS = {
     "blocked": "blocked（已阻塞）",
     "crashed": "crashed（进程崩溃）",
+    "rate_limited": "rate_limited（外部依赖暂不可用，冷却后重试）",
     "timed_out": "timed_out（执行超时）",
     "gave_up": "gave_up（已停止重试）",
     "spawn_auto_blocked": "spawn_auto_blocked（自动启动受阻）",

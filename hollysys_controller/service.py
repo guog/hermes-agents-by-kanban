@@ -14,7 +14,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from pydantic import ValidationError
 
@@ -97,10 +97,12 @@ from .workflow import (
 
 ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "blocked"}
 LOG = logging.getLogger(__name__)
+CANONICAL_SCRATCH_ROOT = PurePosixPath("/opt/data/scratch")
 TERMINAL_EVENT_KINDS = {
     "completed",
     "blocked",
     "crashed",
+    "rate_limited",
     "timed_out",
     "gave_up",
     "spawn_auto_blocked",
@@ -178,17 +180,86 @@ class ControllerService:
         self.last_reconcile_at: int | None = None
         self.last_reconcile_error: str | None = None
 
+    def _prepare_card_scratch_dir(self, record: CardRecord) -> Path:
+        """Create the published attempt scratch directory before dispatch."""
+        canonical = PurePosixPath(record.scratch_dir)
+        try:
+            relative = canonical.relative_to(CANONICAL_SCRATCH_ROOT)
+        except ValueError as exc:
+            raise RunPolicyError("unsafe_card_scratch_dir") from exc
+
+        root = self.config.hermes_home / "scratch"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RunPolicyError("scratch_root_unavailable") from exc
+        if root.is_symlink() or not root.is_dir():
+            raise RunPolicyError("unsafe_scratch_root")
+
+        current = root
+        for part in relative.parts:
+            current /= part
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise RunPolicyError("scratch_dir_unavailable") from exc
+            if current.is_symlink() or not current.is_dir():
+                raise RunPolicyError("unsafe_scratch_component")
+
+        resolved_root = root.resolve(strict=True)
+        resolved = current.resolve(strict=True)
+        if resolved_root not in resolved.parents:
+            raise RunPolicyError("unsafe_card_scratch_dir")
+        return current
+
     def start(self, raw: dict) -> dict:
         if getattr(self.config, "controller_mode", "active") != "active":
             raise ValueError("controller_preflight_mode")
         request = StartRequest.model_validate(raw)
         request_key = f"start:{request.message_id}"
         if not self._begin_request_execution(request_key):
-            raise RunPolicyError(f"request_in_progress:{request_key}")
+            return self.start_request_status(raw)
         try:
             return self._start(raw)
         finally:
             self._finish_request_execution(request_key)
+
+    def start_request_status(self, raw: dict) -> dict:
+        """Return a non-mutating snapshot for an accepted, in-flight start."""
+        request = StartRequest.model_validate(raw)
+        request_key = f"start:{request.message_id}"
+        persisted = self.store.request(request_key)
+        if persisted is None:
+            return {
+                "request_key": request_key,
+                "request_status": "starting",
+                "run_key": None,
+                "phase": "request-validation",
+                "stage": "run-initialization",
+                "active_card": None,
+            }
+        if persisted["status"] == "done" and persisted.get("response"):
+            return dict(persisted["response"])
+        if persisted["status"] == "failed":
+            raise RuntimeError(
+                persisted.get("error") or f"request {request_key} failed"
+            )
+        run_key = str(persisted.get("run_key") or "")
+        if run_key and self.store.run_record(run_key) is not None:
+            result = self.status_summary(run_key)
+            result["request_key"] = request_key
+            result["request_status"] = "running"
+            return result
+        return {
+            "request_key": request_key,
+            "request_status": "running",
+            "run_key": None,
+            "phase": "request-validation",
+            "stage": "run-initialization",
+            "active_card": None,
+        }
 
     def _begin_reconcile(self, run_key: str) -> bool:
         if not hasattr(self, "_inflight_guard"):
@@ -1047,6 +1118,16 @@ class ControllerService:
             "ok": self.config.profiles_root.is_dir(),
             "path": str(self.config.profiles_root),
         }
+        checks["projects_root"] = {
+            "ok": (
+                self.config.projects_root.is_dir()
+                and os.access(
+                    self.config.projects_root,
+                    os.W_OK | os.X_OK,
+                )
+            ),
+            "path": str(self.config.projects_root),
+        }
         agent_git = Path(self.config.agent_git_command)
         askpass = agent_git.with_name("gitlab-askpass")
         credential_helper = agent_git.with_name("gitlab-credential")
@@ -1162,7 +1243,7 @@ class ControllerService:
             or current_digest != accepted["credential_contract_digest"]
         ):
             raise ControllerFatalError(
-                "profile_credentials_changed_after_deep_preflight"
+                "profile_contract_changed_after_deep_preflight"
             )
         for path in (
             Path(self.config.agent_git_command),
@@ -1302,6 +1383,27 @@ class ControllerService:
         record = parse_card_body(item.task.body)
         binding = self.store.delivery_binding(run.run_key)
         live_mr = self._delivery_mr(run)
+        workspace_state = self.gitlab.local_workspace_state(run)
+        attempts = [
+            attempt
+            for attempt in self.store.attempts_for_run(run.run_key)
+            if attempt["card_id"] == card_id
+        ]
+        runtime = self.store.card_runtime(managed.board, card_id)
+        retry = len(attempts) > 1 or bool(
+            runtime and int(runtime.get("redispatch_count") or 0) > 0
+        )
+        remote_head = (
+            str(live_mr.get("sha") or "") if live_mr is not None else None
+        )
+        resume_mode = self._resume_mode(
+            stage=Stage(managed.stage),
+            retry=retry,
+            workspace_state=workspace_state,
+            remote_head=remote_head,
+            expected_head=record.expected_head_sha,
+        )
+        current_attempt = attempts[-1] if attempts else None
         return {
             "protocol_version": "hollysys-controller/v4",
             "trusted": True,
@@ -1324,6 +1426,7 @@ class ControllerService:
             },
             "source": run.source.model_dump(mode="json"),
             "workspace": run.workspace.model_dump(mode="json"),
+            "workspace_state": workspace_state,
             "expected_head_sha": record.expected_head_sha,
             "context_digest": record.context_digest,
             "scratch_dir": record.scratch_dir,
@@ -1347,7 +1450,67 @@ class ControllerService:
                 else None
             ),
             "resume_answer": record.resume_answer,
+            "resume": {
+                "mode": resume_mode,
+                "attempt_count": len(attempts),
+                "redispatch_count": (
+                    int(runtime.get("redispatch_count") or 0)
+                    if runtime is not None
+                    else 0
+                ),
+                "current_attempt": (
+                    {
+                        key: current_attempt.get(key)
+                        for key in (
+                            "run_id",
+                            "attempt",
+                            "status",
+                            "started_at",
+                            "last_progress_at",
+                            "terminal_reason",
+                            "updated_at",
+                        )
+                    }
+                    if current_attempt is not None
+                    else None
+                ),
+                "remote_head_sha": remote_head,
+                "remaining_protocol_steps": (
+                    [
+                        "validate-artifact",
+                        "completion-template",
+                        "validate-completion",
+                        "kanban_complete",
+                    ]
+                    if resume_mode == "protocol-finalization"
+                    else []
+                ),
+            },
         }
+
+    @staticmethod
+    def _resume_mode(
+        *,
+        stage: Stage,
+        retry: bool,
+        workspace_state: dict,
+        remote_head: str | None,
+        expected_head: str,
+    ) -> str:
+        if not retry:
+            return "fresh"
+        if stage in {Stage.SPEC_REVIEW, Stage.PLAN_REVIEW, Stage.TASKS_REVIEW}:
+            return "review-resume"
+        if (
+            stage in {Stage.SPEC_WRITE, Stage.PLAN_WRITE, Stage.TASKS_WRITE}
+            and workspace_state.get("ok") is True
+            and workspace_state.get("clean") is True
+            and workspace_state.get("head_sha")
+            and workspace_state.get("head_sha") == remote_head
+            and workspace_state.get("head_sha") != expected_head
+        ):
+            return "protocol-finalization"
+        return "artifact-repair"
 
     def completion_template(self, raw: dict) -> dict:
         card_id = str(raw.get("card_id") or "")
@@ -1547,11 +1710,22 @@ class ControllerService:
             raise ValueError("artifact validation requires a bound delivery MR")
         head_sha = str(mr["sha"])
         fetch_started = time.monotonic()
-        paths = self.gitlab.artifact_paths(
-            run.project.project_id,
-            head_sha,
-            self.config.artifact_patterns.get(pattern_stage.value, []),
-        )
+        patterns = self.config.artifact_patterns.get(pattern_stage.value, [])
+        try:
+            paths = self.gitlab.artifact_paths(
+                run.project.project_id,
+                head_sha,
+                patterns,
+            )
+        except ValueError as exc:
+            if "matched no files" not in str(exc):
+                raise
+            raise ValueError(
+                "remote_artifact_missing: validate-artifact reads the bound "
+                "GitLab MR head only; commit and push the artifact, verify the "
+                f"remote head, then retry; stage={stage.value}; "
+                f"head={head_sha}; patterns={patterns}"
+            ) from exc
         documents: list[str] = []
         for path in paths:
             payload = self.gitlab.file(run.project.project_id, path, head_sha)
@@ -1612,6 +1786,13 @@ class ControllerService:
             "run_key": run.run_key,
             "card_id": card_id,
             "head_sha": head_sha,
+            "source": "bound_delivery_remote_head",
+            "required_order": [
+                "commit",
+                "push",
+                "verify_remote_head",
+                "validate-artifact",
+            ],
             "artifact_paths": paths,
             **validation,
             "timing": timing,
@@ -2413,6 +2594,43 @@ class ControllerService:
             for future in as_completed(futures):
                 future.result()
 
+    def _promotion_is_authorized(self, item: HistoryItem) -> bool:
+        """Bind a manual-looking promotion to Controller-owned evidence.
+
+        Hermes names every ``kanban promote`` event ``promoted_manual``, even
+        when Controller publishes a newly created, initially blocked card.
+        A single promotion is therefore legitimate when the matching durable
+        release operation is in flight or completed. Any additional promotion
+        still requires the audited human-resolution comment.
+        """
+        if any(
+            "[human-resolution:v1]" in str(comment["body"])
+            and "resolved_by:" in str(comment["body"])
+            and "new_card_id:" in str(comment["body"])
+            for comment in item.task.comments
+        ):
+            return True
+        if item.task.event_kinds.count("promoted_manual") != 1:
+            return False
+        operation = self.store.operation_record(
+            f"{item.managed.idempotency_key}:release"
+        )
+        if (
+            operation is None
+            or operation.get("kind") != "release"
+            or operation.get("status")
+            not in {"executing", "uncertain", "done"}
+        ):
+            return False
+        try:
+            payload = json.loads(str(operation.get("payload") or ""))
+        except json.JSONDecodeError:
+            return False
+        return payload == {
+            "board": item.managed.board,
+            "card_id": item.task.id,
+        }
+
     def _reconcile_run(self, run_key: str) -> None:
         control = self._run_control(run_key)
         if control and control["state"] in {
@@ -2433,12 +2651,7 @@ class ControllerService:
                 item
                 for item in history
                 if "promoted_manual" in item.task.event_kinds
-                and not any(
-                    "[human-resolution:v1]" in str(comment["body"])
-                    and "resolved_by:" in str(comment["body"])
-                    and "new_card_id:" in str(comment["body"])
-                    for comment in item.task.comments
-                )
+                and not self._promotion_is_authorized(item)
             ),
             None,
         )
@@ -2512,7 +2725,7 @@ class ControllerService:
                     # block. Initial status events vary by Hermes version, so
                     # the absence of a task-run outcome is the stable signal.
                     self._assert_reconcile_mutable(run_key)
-                    self.kanban.release(run.workspace.board, item.task.id)
+                    self._ensure_work_published(run, item.task)
                     return
                 if (
                     item.task.latest_outcome == "blocked"
@@ -3656,6 +3869,13 @@ class ControllerService:
             pid_candidate = event.payload.get("worker_pid", event.payload.get("pid"))
             if isinstance(pid_candidate, int) and pid_candidate > 0:
                 worker_pid = pid_candidate
+        if worker_session_id is None and event.run_id is not None:
+            # Hermes v2026.7.20 identifies attempts by task_events.run_id but
+            # does not emit worker_session_id in claimed/heartbeat/terminal
+            # payloads.  Preserve that durable identity so health timelines
+            # do not collapse multiple retries into one perpetually-running
+            # attempt.
+            worker_session_id = f"kanban-run:{event.run_id}"
         if hasattr(self.store, "record_card_runtime_event"):
             self.store.record_card_runtime_event(
                 board=managed.board,
@@ -3675,6 +3895,7 @@ class ControllerService:
         interrupted = event.kind in {
             "blocked",
             "crashed",
+            "rate_limited",
             "timed_out",
             "gave_up",
             "spawn_auto_blocked",
@@ -4572,6 +4793,7 @@ class ControllerService:
             ),
             delivery=binding,
         )
+        self._prepare_card_scratch_dir(record)
         task = self.kanban.create_work(record)
         self._verify_work(task, record)
         self.store.add_managed_card(
@@ -5311,6 +5533,13 @@ class ControllerService:
         self, run: RunRecord, parent_card_id: str, reason: str
     ) -> TaskRecord:
         self._assert_reconcile_mutable(run.run_key)
+        parent = self.reader.task(run.workspace.board, parent_card_id)
+        if parent is not None and parent.status in ACTIVE_STATUSES:
+            self.kanban.abort_task(
+                run.workspace.board,
+                parent_card_id,
+                "Controller entered exception: " + reason[:400],
+            )
         suffix = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:12]
         key = f"{run.run_key}:exception:{suffix}:work"
         task = self.kanban.create_exception(run, parent_card_id, reason, key)

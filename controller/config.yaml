@@ -3,6 +3,7 @@ reconcile_interval_seconds: 30
 reconcile_workers: 4
 outbox_poll_interval_seconds: 2
 command_timeout_seconds: 120
+start_request_sync_timeout_seconds: 10
 controller_mode: preflight
 notification_level: verbose
 abort_confirmation_ttl_seconds: 600

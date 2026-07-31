@@ -62,6 +62,12 @@ hollysysctl start \
 active_card、board 和 worktree 按以下格式精简展示给原会话。命令失败时原样保留错误类别，
 但不得回显 token、环境变量值或原始敏感日志。
 
+全新 worktree 的 workspace 和离线依赖准备可能持续数分钟。Controller 会在同步等待窗口
+结束后返回 `request_status=running` 和 `stage=run-initialization`，后台继续同一个幂等
+start；这不是失败，不得再次创建任务。已有 `run_key` 时改用 `status-summary` 跟踪；
+尚无 `run_key` 时只允许用完全相同参数重放一次 `hollysysctl start` 获取已持久化状态。
+不得把 `request_status=running` 报成 `request_in_progress` 异常。
+
 ```markdown
 **ℹ️ 已受理 PRD 自动交付**
 

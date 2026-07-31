@@ -8,6 +8,8 @@ ARG NODE_VERSION=22.18.0
 ARG NODE_SHA256=c1bfeecf1d7404fa74728f9db72e697decbd8119ccc6f5a294d795756dfcfca7
 ARG DOTNET_SDK_VERSION=8.0.423
 ARG DOTNET_SHA512=e94513dfe42271a85f01e87bd4272aa80b4ec13556f4531754802542225667775242c5e281a94837dae6cc65f7bcc457d2f663f240c0e2b7573fd909e786b1a5
+ARG TIRITH_VERSION=0.3.3
+ARG TIRITH_SHA256=6cdbe35e8f9ccf42e70ad95b501c93cd218ac18201c3df958d54f6ba0d995ce2
 
 RUN test "${TARGETARCH:-amd64}" = "amd64" \
     && apt-get update \
@@ -16,6 +18,7 @@ RUN test "${TARGETARCH:-amd64}" = "amd64" \
         curl \
         jq \
         libicu76 \
+        util-linux \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -41,6 +44,16 @@ RUN set -eux; \
     ln -sfn /usr/share/dotnet/dotnet /usr/local/bin/dotnet; \
     dotnet --list-sdks | grep -Fx "${DOTNET_SDK_VERSION} [/usr/share/dotnet/sdk]"
 
+RUN set -eux; \
+    tirith_archive="tirith-x86_64-unknown-linux-gnu.tar.gz"; \
+    curl -fsSLo "${tirith_archive}" \
+        "https://github.com/sheeki03/tirith/releases/download/v${TIRITH_VERSION}/${tirith_archive}"; \
+    echo "${TIRITH_SHA256}  ${tirith_archive}" | sha256sum -c -; \
+    tar -xzf "${tirith_archive}" tirith; \
+    install -o root -g root -m 0555 tirith /usr/local/bin/tirith; \
+    rm -f "${tirith_archive}" tirith; \
+    tirith --version | grep -F "${TIRITH_VERSION}"
+
 COPY requirements-controller.txt /opt/hollysys-controller-src/
 RUN /usr/local/bin/uv pip install \
         --python /opt/hermes/.venv/bin/python \
@@ -57,8 +70,10 @@ COPY hollysysctl /usr/local/bin/hollysysctl
 COPY cli /opt/cli
 COPY container/git /opt/fleet/container/git
 COPY container/install-git-wrapper.sh /opt/fleet/container/install-git-wrapper.sh
+COPY container/sync-lark-config.py /opt/fleet/container/sync-lark-config.py
 RUN chmod -R a+rX /opt/hollysys-controller-src \
     && chmod 0555 /usr/local/bin/hollysysctl \
+    && chmod 0555 /opt/fleet/container/sync-lark-config.py \
     && sh /opt/fleet/container/install-git-wrapper.sh \
     && /opt/hermes/.venv/bin/python -m py_compile \
         /opt/hollysys-controller-src/hollysys_controller/*.py \

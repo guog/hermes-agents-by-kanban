@@ -75,6 +75,10 @@ class ConfigTests(unittest.TestCase):
             defaults["preflight_command_timeout_seconds"].default,
             120,
         )
+        self.assertEqual(
+            defaults["start_request_sync_timeout_seconds"].default,
+            10.0,
+        )
 
     def test_gitlab_endpoint_rejects_unsafe_or_mistyped_origins(self) -> None:
         valid = normalize_gitlab_endpoint(

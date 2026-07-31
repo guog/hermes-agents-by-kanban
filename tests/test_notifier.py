@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from hollysys_controller.errors import DependencyContractError
 from hollysys_controller.notifier import LarkNotifier
 from tests.helpers import config, origin
 
@@ -65,6 +66,44 @@ class LarkNotifierTests(unittest.TestCase):
                     "content",
                     message_format="interactive",  # type: ignore[arg-type]
                 )
+
+    def test_bot_not_in_chat_is_a_sanitized_contract_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notifier = LarkNotifier(config(Path(tmp)))
+
+            def rejected(command, **kwargs):
+                del kwargs
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr=(
+                        '{"ok":false,"error":{"code":230002,'
+                        '"message":"Bot/User can NOT be out of the chat."}}'
+                    ),
+                )
+
+            with patch(
+                "hollysys_controller.notifier.subprocess.run",
+                rejected,
+            ), self.assertRaisesRegex(
+                DependencyContractError,
+                "feishu_bot_not_in_origin_chat",
+            ) as raised:
+                notifier.send(
+                    "run:exception",
+                    origin(),
+                    "sensitive notification content",
+                )
+
+        self.assertEqual(
+            raised.exception.context.error_code,
+            "bot_not_in_chat",
+        )
+        self.assertNotIn(
+            "sensitive notification content",
+            str(raised.exception),
+        )
 
 
 if __name__ == "__main__":

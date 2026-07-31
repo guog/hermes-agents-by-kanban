@@ -423,6 +423,13 @@ class CompletionMetadata(StrictModel):
                 bool(self.requirement_ids),
             )
         )
+        if self.stage in {Stage.SPEC_REVIEW, Stage.PLAN_REVIEW} and (
+            self.gate_phase is not None or gate_fields_present
+        ):
+            raise ValueError(
+                "SPEC/PLAN review comments are not semantic gates; leave "
+                "gate_phase and all gate evidence fields empty"
+            )
         if self.gate_phase is not None and (
             self.gate_decision is None
             or self.gate_reviewer is None

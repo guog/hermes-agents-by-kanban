@@ -1179,6 +1179,7 @@ class ControllerStore:
             "completed",
             "blocked",
             "crashed",
+            "rate_limited",
             "timed_out",
             "gave_up",
             "spawn_auto_blocked",
@@ -1187,6 +1188,7 @@ class ControllerStore:
             "completed",
             "blocked",
             "crashed",
+            "rate_limited",
             "timed_out",
             "gave_up",
             "spawn_auto_blocked",
@@ -1256,6 +1258,8 @@ class ControllerStore:
                                 if kind == "blocked"
                                 else "completion_recorded"
                                 if kind == "completed"
+                                else kind
+                                if terminal
                                 else "running"
                             ),
                             kind if terminal else None,
@@ -1291,6 +1295,7 @@ class ControllerStore:
                                 WHEN ?='worker_exited' THEN 'exited'
                                 WHEN ?='blocked' THEN 'blocked'
                                 WHEN ?='completed' THEN 'completion_recorded'
+                                WHEN ? THEN ?
                                 ELSE status
                             END,
                             terminal_reason=CASE
@@ -1316,6 +1321,8 @@ class ControllerStore:
                             created_at,
                             kind,
                             kind,
+                            kind,
+                            int(terminal),
                             kind,
                             int(terminal),
                             kind,
@@ -1360,6 +1367,7 @@ class ControllerStore:
                 new_attempt
                 and previous is not None
                 and previous["attempt_status"] != "redispatch_requested"
+                and previous["terminal_reason"] != "rate_limited"
             )
             conn.execute(
                 """
@@ -2827,6 +2835,10 @@ class ControllerStore:
                      AND cards.card_id=runtime.card_id
                     WHERE runtime.deadline_at IS NOT NULL
                       AND runtime.deadline_at < ?
+                      AND runtime.finished_at IS NULL
+                      AND runtime.attempt_status IN (
+                          'created', 'running', 'redispatch_requested'
+                      )
                     ORDER BY runtime.deadline_at
                     """,
                     (int(time.time()),),
@@ -2848,7 +2860,8 @@ class ControllerStore:
                     """
                     SELECT run_id, run_key, card_id, attempt, status,
                            started_at, blocked_at, completion_at, exited_at,
-                           updated_at
+                           last_heartbeat_at, last_progress_at,
+                           terminal_reason, updated_at
                     FROM card_attempts
                     ORDER BY updated_at DESC, run_id DESC LIMIT 50
                     """

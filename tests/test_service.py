@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from hollysys_controller.errors import RunPolicyError
 from hollysys_controller.kanban import (
     EventRecord,
     TaskRecord,
@@ -26,6 +28,7 @@ from hollysys_controller.models import (
     RepairContext,
     RepairKind,
     Stage,
+    StartRequest,
     WorkMode,
 )
 from hollysys_controller.service import ControllerService, HistoryItem
@@ -106,6 +109,115 @@ def task_record(
     )
 
 
+class ScratchDirectoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.run = run_record(self.root)
+        self.service = object.__new__(ControllerService)
+        self.service.config = config(self.root)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _record(self, scratch_dir: str) -> CardRecord:
+        return CardRecord(
+            run=self.run,
+            stage=Stage.SPEC_REVIEW,
+            iteration=1,
+            idempotency_key=(
+                f"{self.run.run_key}:spec-review:1:normal:work"
+            ),
+            parent_card_id="t_parent",
+            assignee="spec-reviewer",
+            skills=["hollysys-review-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir=scratch_dir,
+        )
+
+    def test_attempt_scratch_directory_exists_before_dispatch(self) -> None:
+        record = self._record(
+            "/opt/data/scratch/0123456789abcdefghij/card-attempt"
+        )
+
+        actual = self.service._prepare_card_scratch_dir(record)
+
+        expected = (
+            self.root
+            / "data"
+            / "scratch"
+            / "0123456789abcdefghij"
+            / "card-attempt"
+        )
+        self.assertEqual(actual, expected)
+        self.assertTrue(expected.is_dir())
+        self.assertEqual(expected.stat().st_mode & 0o777, 0o700)
+
+    def test_attempt_scratch_directory_rejects_symlink_component(self) -> None:
+        scratch_root = self.root / "data" / "scratch"
+        scratch_root.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        (scratch_root / "0123456789abcdefghij").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+        record = self._record(
+            "/opt/data/scratch/0123456789abcdefghij/card-attempt"
+        )
+
+        with self.assertRaisesRegex(
+            RunPolicyError,
+            "unsafe_scratch_component",
+        ):
+            self.service._prepare_card_scratch_dir(record)
+
+    def test_resume_mode_skips_artifact_rework_after_verified_push(self) -> None:
+        head = "d" * 40
+        mode = self.service._resume_mode(
+            stage=Stage.PLAN_WRITE,
+            retry=True,
+            workspace_state={
+                "ok": True,
+                "clean": True,
+                "head_sha": head,
+            },
+            remote_head=head,
+            expected_head="c" * 40,
+        )
+
+        self.assertEqual(mode, "protocol-finalization")
+        self.assertEqual(
+            self.service._resume_mode(
+                stage=Stage.PLAN_REVIEW,
+                retry=True,
+                workspace_state={
+                    "ok": True,
+                    "clean": True,
+                    "head_sha": head,
+                },
+                remote_head=head,
+                expected_head=head,
+            ),
+            "review-resume",
+        )
+        self.assertEqual(
+            self.service._resume_mode(
+                stage=Stage.PLAN_WRITE,
+                retry=True,
+                workspace_state={
+                    "ok": True,
+                    "clean": False,
+                    "head_sha": head,
+                },
+                remote_head=head,
+                expected_head="c" * 40,
+            ),
+            "artifact-repair",
+        )
+
+
 class ServiceRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -114,6 +226,161 @@ class ServiceRecoveryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_controller_release_authorizes_only_one_initial_promotion(
+        self,
+    ) -> None:
+        card = CardRecord(
+            run=self.run,
+            stage=Stage.SPEC_WRITE,
+            iteration=1,
+            idempotency_key=f"{self.run.run_key}:spec-write:1:normal:work",
+            parent_card_id="t_root",
+            assignee="spec-writer",
+            skills=["hollysys-write-spec", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
+        )
+        task = task_record(
+            task_id="t_spec",
+            body=render_card_body(card),
+            status="running",
+            assignee=card.assignee,
+            idempotency_key=card.idempotency_key,
+            tenant=self.run.run_key,
+            skills=card.skills,
+            parents=[card.parent_card_id],
+            event_kinds=["created", "promoted_manual"],
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=card.stage.value,
+            iteration=card.iteration,
+            idempotency_key=card.idempotency_key,
+            parent_card_id=card.parent_card_id,
+            purpose="work",
+            created_at=1,
+        )
+        item = HistoryItem(managed, task)
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "promotion-controller.db")
+
+        self.assertFalse(service._promotion_is_authorized(item))
+
+        operation_key = f"{card.idempotency_key}:release"
+        payload = {"board": managed.board, "card_id": task.id}
+        service.store.operation_result(operation_key, "release", payload)
+        service.store.finish_operation(operation_key, {"card_id": task.id})
+
+        self.assertTrue(service._promotion_is_authorized(item))
+        duplicated = replace(
+            task,
+            event_kinds=[
+                "created",
+                "promoted_manual",
+                "promoted_manual",
+            ],
+        )
+        self.assertFalse(
+            service._promotion_is_authorized(
+                HistoryItem(managed, duplicated)
+            )
+        )
+
+    def test_duplicate_start_returns_initialization_snapshot(self) -> None:
+        cfg = config(self.root)
+        store = ControllerStore(cfg.state_dir / "controller.db")
+        service = ControllerService(cfg, store=store)
+        raw = {
+            "prd_blob_url": str(self.run.source.prd_blob_url),
+            "prd_mr_url": str(self.run.source.prd_mr_url),
+            "message_id": self.run.origin.message_id,
+            "chat_id": self.run.origin.chat_id,
+            "thread_id": self.run.origin.thread_id,
+            "chat_type": self.run.origin.chat_type,
+            "initiator": self.run.origin.initiator_open_id,
+        }
+        request = StartRequest.model_validate(raw)
+        request_key = f"start:{request.message_id}"
+        store.begin_request(
+            request_key,
+            "start",
+            request.model_dump(mode="json"),
+        )
+        store.save_run(self.run)
+        store.ensure_run_control(self.run.run_key)
+        store.bind_request_run(request_key, self.run.run_key)
+        service._active_requests.add(request_key)
+
+        result = service.start(raw)
+
+        self.assertEqual(result["request_status"], "running")
+        self.assertEqual(result["run_key"], self.run.run_key)
+        self.assertEqual(result["stage"], "run-initialization")
+        self.assertIsNone(result["active_card"])
+
+    def test_exception_reclaims_an_already_running_parent(self) -> None:
+        reason = "unauthorized state transition"
+        suffix = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:12]
+        key = f"{self.run.run_key}:exception:{suffix}:work"
+        parent = task_record(
+            task_id="t_running",
+            body="running",
+            status="running",
+            assignee="spec-writer",
+        )
+        exception = task_record(
+            task_id="t_exception",
+            body="exception",
+            status="blocked",
+            assignee="dispatcher",
+            idempotency_key=key,
+            tenant=self.run.run_key,
+            skills=["hollysys-dispatch-kanban"],
+            parents=[parent.id],
+        )
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "exception-controller.db")
+        service.store.save_run(self.run)
+        service.store.ensure_run_control(self.run.run_key)
+        service.reader = type(
+            "ParentReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: parent)},
+        )()
+        calls: list[tuple[str, str]] = []
+        service.kanban = type(
+            "ExceptionKanban",
+            (),
+            {
+                "abort_task": staticmethod(
+                    lambda board, task_id, message: calls.append(
+                        ("abort", task_id)
+                    )
+                ),
+                "create_exception": staticmethod(
+                    lambda run, parent_card_id, message, idempotency: (
+                        calls.append(("create", parent_card_id))
+                        or exception
+                    )
+                ),
+            },
+        )()
+
+        result = service._exception(self.run, parent.id, reason)
+
+        self.assertEqual(result.id, exception.id)
+        self.assertEqual(
+            calls,
+            [("abort", parent.id), ("create", parent.id)],
+        )
+        self.assertEqual(
+            service.store.run_control(self.run.run_key)["state"],
+            "exception",
+        )
 
     def test_resolve_reuses_retry_created_before_request_commit(self) -> None:
         card = CardRecord(
@@ -418,13 +685,10 @@ class ServiceRecoveryTests(unittest.TestCase):
             {"delivery_mr": staticmethod(lambda run: None)},
         )()
         attach_test_store(service, self.root, self.run, delivery=False)
-        service.reader = type("Reader", (), {})()
         released: list[str] = []
-        service.kanban = type(
-            "ReleaseRecorder",
-            (),
-            {"release": staticmethod(lambda board, task_id: released.append(task_id))},
-        )()
+        service._ensure_work_published = (
+            lambda run, task: released.append(task.id)
+        )
 
         service.reconcile_run(self.run.run_key)
 

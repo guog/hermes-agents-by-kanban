@@ -19,6 +19,12 @@ class ComposeContractTests(unittest.TestCase):
         controller = self.compose["services"]["controller"]
         hermes = self.compose["services"]["hermes"]
         self.assertEqual(controller["restart"], "unless-stopped")
+        self.assertTrue(controller["init"])
+        self.assertNotIn(
+            "init",
+            hermes,
+            "Hermes uses s6-overlay /init, which must remain PID 1",
+        )
         self.assertEqual(
             controller["entrypoint"],
             [
@@ -39,6 +45,7 @@ class ComposeContractTests(unittest.TestCase):
             "controller-socket:/run/hollysys-controller",
             controller["volumes"],
         )
+        self.assertIn("./skills:/opt/skills:ro", controller["volumes"])
         self.assertIn(
             "controller-socket:/run/hollysys-controller",
             hermes["volumes"],
@@ -52,6 +59,15 @@ class ComposeContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('usermod -u "$target_uid" hermes', entrypoint)
         self.assertIn('groupmod -o -g "$target_gid" hermes', entrypoint)
+        self.assertIn(
+            "sync-lark-config.py",
+            entrypoint,
+        )
+        self.assertIn(
+            "exec setpriv --reuid=hermes --regid=hermes --init-groups",
+            entrypoint,
+        )
+        self.assertIn("/workspace/projects", entrypoint)
 
     def test_container_health_uses_local_liveness_probe(self) -> None:
         healthcheck = self.compose["services"]["hermes"]["healthcheck"]
@@ -70,8 +86,17 @@ class ComposeContractTests(unittest.TestCase):
         )
         self.assertIn("NODE_VERSION=22.18.0", dockerfile)
         self.assertIn("DOTNET_SDK_VERSION=8.0.423", dockerfile)
+        self.assertIn("TIRITH_VERSION=0.3.3", dockerfile)
+        self.assertIn(
+            "TIRITH_SHA256="
+            "6cdbe35e8f9ccf42e70ad95b501c93cd218ac18201c3df958d54f6ba0d995ce2",
+            dockerfile,
+        )
+        self.assertIn("/usr/local/bin/tirith", dockerfile)
         self.assertIn("jq", dockerfile)
+        self.assertIn("util-linux", dockerfile)
         self.assertIn("patch-hermes-terminal.py", dockerfile)
+        self.assertIn("sync-lark-config.py", dockerfile)
         self.assertIn(
             "chmod -R a+rX /opt/hollysys-controller-src",
             dockerfile,
@@ -83,6 +108,9 @@ class ComposeContractTests(unittest.TestCase):
             "./container/ensure-feishu.sh:/etc/cont-init.d/02-hollysys-feishu:ro",
             service["volumes"],
         )
+        image_requirements = (
+            self.root / "requirements-controller.txt"
+        ).read_text(encoding="utf-8")
         script = (self.root / "container/ensure-feishu.sh").read_text(
             encoding="utf-8"
         )
@@ -91,6 +119,7 @@ class ComposeContractTests(unittest.TestCase):
             "qrcode==7.4.2",
             "requests-toolbelt==1.0.0",
         ):
+            self.assertIn(requirement, image_requirements)
             self.assertIn(requirement, script)
         self.assertIn("/opt/data/.cache/uv", script)
         self.assertIn("import lark_oapi", script)
@@ -100,6 +129,24 @@ class ComposeContractTests(unittest.TestCase):
             .strip(),
             'index-url = "https://mirrors.aliyun.com/pypi/simple/"',
         )
+
+    def test_required_feishu_gateways_are_declared_running(self) -> None:
+        for profile in ("dispatcher", "fde", "prd-writer"):
+            with self.subTest(profile=profile):
+                state_path = (
+                    self.root
+                    / "data"
+                    / "profiles"
+                    / profile
+                    / "gateway_state.json"
+                )
+                self.assertTrue(state_path.is_file())
+                self.assertTrue(
+                    state_path.is_relative_to(self.root / "data" / "profiles")
+                )
+                state = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(state["desired_state"], "running")
+                self.assertEqual(state["gateway_state"], "running")
 
     def test_dashboard_is_published_on_configured_port(self) -> None:
         service = self.compose["services"]["hermes"]

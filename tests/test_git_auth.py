@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -11,13 +12,17 @@ import yaml
 
 from hollysys_controller.git_auth import (
     ALL_PROFILES,
+    GATEWAY_PROFILES,
     ProfileCredential,
     _failure_code,
     _profile_token_is_persisted,
     _safe_env,
+    lark_profile_preflight,
     profile_credential,
     profile_preflight,
+    profile_skill_preflight,
     read_profile_env,
+    required_profile_skills,
     summarize_profile_preflight,
 )
 from tests.helpers import config
@@ -426,6 +431,7 @@ class GitAuthenticationTests(unittest.TestCase):
         cfg = config(self.root)
         cfg.gitlab_host = "green-git.hollysys.net"
         cfg.profiles_root = self.root / "profiles"
+        cfg.skills_root = self.root / "skills"
         dispatcher_token = ""
         for index, profile in enumerate(sorted(ALL_PROFILES), start=1):
             profile_token = f"profile-token-{index}"
@@ -434,19 +440,64 @@ class GitAuthenticationTests(unittest.TestCase):
             profile_root = cfg.profiles_root / profile
             (profile_root / "home").mkdir(parents=True)
             env_file = profile_root / ".env"
-            env_file.write_text(
-                "\n".join(
+            env_lines = [
+                f"HERMES_PROFILE={profile}",
+                "GITLAB_HOST=https://green-git.hollysys.net",
+                "GITLAB_ALLOWED_GROUPS=group",
+                f"GITLAB_TOKEN={profile_token}",
+            ]
+            if profile in GATEWAY_PROFILES:
+                env_lines.extend(
                     [
-                        f"HERMES_PROFILE={profile}",
-                        "GITLAB_HOST=https://green-git.hollysys.net",
-                        "GITLAB_ALLOWED_GROUPS=group",
-                        f"GITLAB_TOKEN={profile_token}",
+                        f"FEISHU_APP_ID=app-{profile}",
+                        f"FEISHU_APP_SECRET=secret-{profile}",
                     ]
                 )
-                + "\n",
-                encoding="utf-8",
-            )
+                lark_config = (
+                    profile_root
+                    / ".lark-cli"
+                    / "config"
+                    / "hermes"
+                    / "config.json"
+                )
+                lark_config.parent.mkdir(parents=True)
+                lark_config.write_text(
+                    json.dumps(
+                        {
+                            "apps": [
+                                {
+                                    "name": profile,
+                                    "appId": f"app-{profile}",
+                                    "appSecret": f"secret-{profile}",
+                                    "brand": "feishu",
+                                    "defaultAs": "bot",
+                                    "strictMode": "bot",
+                                    "users": [],
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                lark_config.chmod(0o600)
+            env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
             env_file.chmod(0o600)
+            for skill in required_profile_skills(cfg, profile):
+                root = (
+                    profile_root / "skills"
+                    if skill.startswith("hollysys-")
+                    else (
+                        cfg.skills_root / "gitlab"
+                        if skill == "glab"
+                        else cfg.skills_root
+                    )
+                )
+                skill_file = root / skill / "SKILL.md"
+                skill_file.parent.mkdir(parents=True, exist_ok=True)
+                skill_file.write_text(
+                    f"---\nname: {skill}\n---\n",
+                    encoding="utf-8",
+                )
         cfg.controller_token_file.write_text(
             f"{dispatcher_token}\n",
             encoding="utf-8",
@@ -462,6 +513,29 @@ class GitAuthenticationTests(unittest.TestCase):
             "dispatcher-secret-mirror",
         )
         self.assertNotIn("token_fingerprint", str(result))
+
+        missing = (
+            cfg.skills_root
+            / "skill-spec-write"
+            / "SKILL.md"
+        )
+        missing.unlink()
+        result = summarize_profile_preflight(cfg, deep=False)
+        self.assertFalse(result["ok"])
+        spec_writer = next(
+            item
+            for item in result["profiles"]
+            if item["profile"] == "spec-writer"
+        )
+        self.assertFalse(spec_writer["skills_ok"])
+        self.assertEqual(
+            spec_writer["skill_error_code"],
+            "missing_profile_skill",
+        )
+        missing.write_text(
+            "---\nname: skill-spec-write\n---\n",
+            encoding="utf-8",
+        )
 
         duplicate = cfg.profiles_root / "tester" / ".env"
         duplicate.write_text(
@@ -511,6 +585,86 @@ class GitAuthenticationTests(unittest.TestCase):
             deep=False,
         )["_credential_contract_digest"]
         self.assertNotEqual(second_digest, third_digest)
+
+    def test_profile_skill_preflight_rejects_missing_or_symlinked_skill(
+        self,
+    ) -> None:
+        cfg = config(self.root)
+        required = required_profile_skills(cfg, "spec-writer")
+        self.assertEqual(required, ("glab", "skill-spec-write"))
+
+        glab = cfg.skills_root / "gitlab" / "glab" / "SKILL.md"
+        glab.parent.mkdir(parents=True)
+        glab.write_text("---\nname: glab\n---\n", encoding="utf-8")
+        profile_skill = (
+            cfg.profiles_root
+            / "spec-writer"
+            / "skills"
+            / "skill-spec-write"
+            / "SKILL.md"
+        )
+        profile_skill.parent.mkdir(parents=True)
+        profile_skill.write_text(
+            "---\nname: skill-spec-write\n---\n",
+            encoding="utf-8",
+        )
+
+        result = profile_skill_preflight(cfg, "spec-writer")
+        self.assertTrue(result["ok"])
+        profile_skill.unlink()
+        profile_skill.symlink_to(glab)
+
+        result = profile_skill_preflight(cfg, "spec-writer")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "missing_profile_skill")
+
+    def test_lark_preflight_rejects_stale_config_without_exposing_secrets(
+        self,
+    ) -> None:
+        cfg = config(self.root)
+        profile_root = cfg.profiles_root / "dispatcher"
+        profile_root.mkdir(parents=True)
+        env_file = profile_root / ".env"
+        env_file.write_text(
+            "FEISHU_APP_ID=new-app\n"
+            "FEISHU_APP_SECRET=new-secret\n",
+            encoding="utf-8",
+        )
+        env_file.chmod(0o600)
+        config_path = (
+            profile_root
+            / ".lark-cli"
+            / "config"
+            / "hermes"
+            / "config.json"
+        )
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps(
+                {
+                    "apps": [
+                        {
+                            "name": "dispatcher",
+                            "appId": "old-app",
+                            "appSecret": "old-secret",
+                            "brand": "feishu",
+                            "defaultAs": "bot",
+                            "strictMode": "bot",
+                            "users": [],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+
+        result = lark_profile_preflight(cfg, "dispatcher")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "lark_credentials_mismatch")
+        self.assertNotIn("new-secret", str(result))
+        self.assertNotIn("old-secret", str(result))
 
     def test_missing_profile_env_has_a_stable_error_code(self) -> None:
         cfg = config(self.root)

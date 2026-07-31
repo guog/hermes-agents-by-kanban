@@ -58,6 +58,40 @@ class CompletionMetadataTests(unittest.TestCase):
         )
         self.assertEqual(metadata.gate_phase.value, "deployment_entry")
 
+    def test_spec_and_plan_review_comments_are_not_semantic_gates(self) -> None:
+        review = completion(
+            self.root,
+            Stage.PLAN_REVIEW,
+            outcome="fail",
+            issues=["PLAN omits the runtime project mapping"],
+            artifact_paths=["docs/plans/feature/plan.md"],
+            artifact_digest="b" * 64,
+            artifact_commit_sha="c" * 40,
+        ).model_dump(mode="json")
+        review.update(
+            {
+                "gate_phase": "implementation_entry",
+                "gate_decision": "rejected",
+                "gate_reviewer": "id:42",
+                "gate_reviewed_at": "2026-07-31T00:00:00+08:00",
+                "gate_reason": "PLAN needs repair",
+                "gate_evidence_refs": [
+                    "https://gitlab.example.com/group/project/-/merge_requests/2#note_9"
+                ],
+                "gate_artifact_paths": ["docs/plans/feature/plan.md"],
+                "gate_artifact_commit_sha": "c" * 40,
+                "gate_artifact_digest": "b" * 64,
+                "contract_refs": ["PLAN-BLK-001"],
+                "requirement_ids": ["OP-001"],
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "SPEC/PLAN review comments are not semantic gates",
+        ):
+            CompletionMetadata.model_validate(review)
+
     def test_runtime_worker_session_stamp_is_not_a_worker_schema_field(self) -> None:
         payload = completion(self.root).model_dump(mode="json")
         payload["worker_session_id"] = "20260728_122745_220289"

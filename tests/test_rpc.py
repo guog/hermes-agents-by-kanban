@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from hollysys_controller.cli import (
+    _run,
     build_parser,
-    controller_snapshot_config,
     params_for,
 )
 from hollysys_controller.daemon import ControllerDaemon
 from hollysys_controller.errors import ControllerFatalError
-from hollysys_controller.models import RpcRequest
+from hollysys_controller.models import RpcRequest, RpcResponse
 from hollysys_controller.rpc import RpcServer, rpc_call
-from tests.helpers import config
 
 
 class RpcTests(unittest.IsolatedAsyncioTestCase):
@@ -40,6 +44,73 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(response.ok)
         self.assertEqual(response.result, {"method": "health", "probe": True})
+
+    async def test_disconnected_client_does_not_raise_broken_pipe(self) -> None:
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            RpcRequest(
+                id="disconnect",
+                method="health",
+                params={"probe": "readiness"},
+            ).model_dump_json().encode("utf-8")
+            + b"\n"
+        )
+        reader.feed_eof()
+
+        class DisconnectedWriter:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def write(self, data: bytes) -> None:
+                del data
+
+            async def drain(self) -> None:
+                raise ConnectionResetError("client disconnected")
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                raise BrokenPipeError("already closed")
+
+        writer = DisconnectedWriter()
+
+        await self.server._handle_connection(  # type: ignore[arg-type]
+            reader,
+            writer,
+        )
+
+        self.assertTrue(writer.closed)
+
+    async def test_long_start_returns_running_snapshot_before_completion(
+        self,
+    ) -> None:
+        daemon = ControllerDaemon.__new__(ControllerDaemon)
+        daemon.config = SimpleNamespace(
+            start_request_sync_timeout_seconds=0.01
+        )
+        daemon.background_requests = set()
+        daemon.service = SimpleNamespace(
+            start=lambda params: (
+                time.sleep(0.05)
+                or {"request_status": "done", **params}
+            ),
+            start_request_status=lambda params: {
+                "request_status": "running",
+                **params,
+            },
+        )
+
+        result = await daemon._handle_start({"run_key": "pending"})
+
+        self.assertEqual(
+            result,
+            {"request_status": "running", "run_key": "pending"},
+        )
+        await asyncio.gather(
+            *tuple(daemon.background_requests),
+            return_exceptions=True,
+        )
 
     async def test_rpc_controller_fatal_signals_daemon_exit(self) -> None:
         daemon = ControllerDaemon.__new__(ControllerDaemon)
@@ -107,19 +178,36 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
             {"run_key": "hollysys-abcdefghijklmnopqrst"},
         )
 
-    def test_status_summary_ignores_the_agent_profile_home(self) -> None:
-        controller_config = config(Path(self.temp.name)).model_copy(
-            update={
-                "hermes_home": Path(self.temp.name) / "profiles" / "dispatcher",
-                "state_dir": Path(self.temp.name) / "data" / "controller",
-            }
+    async def test_preflight_cli_runs_through_controller_rpc(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--socket",
+                str(self.socket),
+                "preflight",
+                "--deep",
+            ]
         )
+        call = AsyncMock(
+            return_value=RpcResponse(
+                id="preflight-response",
+                ok=True,
+                result={"ok": True, "mode": "deep"},
+            )
+        )
+        output = StringIO()
 
-        snapshot_config = controller_snapshot_config(controller_config)
+        with patch("hollysys_controller.cli.rpc_call", call), redirect_stdout(
+            output
+        ):
+            exit_code = await _run(args)
 
+        self.assertEqual(exit_code, 0)
+        request = call.await_args.args[1]
+        self.assertEqual(request.method, "preflight")
+        self.assertEqual(request.params, {"deep": True})
         self.assertEqual(
-            snapshot_config.hermes_home,
-            Path(self.temp.name) / "data",
+            json.loads(output.getvalue()),
+            {"ok": True, "mode": "deep"},
         )
 
     def test_validate_completion_reads_json_before_rpc(self) -> None:
@@ -144,6 +232,41 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
                 },
             ),
         )
+
+    def test_validate_completion_accepts_inline_json_for_compatibility(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "validate-completion",
+                "--card-id",
+                "t_work",
+                "--metadata",
+                '{"outcome":"fail","issues":["P1"]}',
+            ]
+        )
+
+        self.assertEqual(
+            params_for(args)[1]["metadata"],
+            {"outcome": "fail", "issues": ["P1"]},
+        )
+
+    def test_validate_completion_rejects_missing_file_without_traceback(
+        self,
+    ) -> None:
+        args = build_parser().parse_args(
+            [
+                "validate-completion",
+                "--card-id",
+                "t_work",
+                "--metadata",
+                "missing-completion.json",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "existing JSON file or an inline JSON object",
+        ):
+            params_for(args)
 
     def test_recover_cli_method_is_allowed_by_rpc_contract(self) -> None:
         args = build_parser().parse_args(
