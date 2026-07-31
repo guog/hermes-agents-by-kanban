@@ -35,6 +35,7 @@ terminal:
     - LARKSUITE_CLI_NO_SKILLS_NOTIFIER
 approvals:
   mode: off
+  destructive_slash_confirm: false
 memory:
   memory_enabled: true
   user_profile_enabled: false

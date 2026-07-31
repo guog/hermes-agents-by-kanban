@@ -28,6 +28,7 @@ terminal:
     - NUGET_PACKAGES
 approvals:
   mode: off
+  destructive_slash_confirm: false
 memory:
   memory_enabled: true
   user_profile_enabled: false
