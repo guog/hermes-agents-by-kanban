@@ -2975,24 +2975,6 @@ class ControllerService:
             mr_iid=metadata.mr_iid,
             head_sha=metadata.head_sha,
         )
-        if metadata.stage == Stage.IMPLEMENT and metadata.outcome == Outcome.PASS:
-            binding = self.store.delivery_binding(run.run_key)
-            if binding is None:
-                raise ValueError("IMPLEMENT completion has no delivery binding")
-            self._operation(
-                f"{run.run_key}:delivery-ready",
-                "delivery-ready",
-                {
-                    "run_key": run.run_key,
-                    "mr_iid": binding.mr_iid,
-                    "head_sha": metadata.head_sha,
-                },
-                lambda: self.gitlab.mark_delivery_ready(
-                    run,
-                    binding,
-                ),
-                expected_head_sha=metadata.head_sha,
-            )
         self._enqueue_agent_completed(run, latest, metadata, history=history)
 
         review_attempts = self._review_attempts_by_stage(history)
@@ -3155,6 +3137,23 @@ class ControllerService:
             except ValueError:
                 self._create_work(run, Stage.TEST, latest.task.id)
                 return
+            if live_mr.get("draft") or live_mr.get("work_in_progress"):
+                binding = self.store.delivery_binding(run.run_key)
+                if binding is None:
+                    raise ValueError("merge-ready delivery has no binding")
+                self._mark_delivery_ready_at_head(
+                    run,
+                    binding,
+                    current_head,
+                )
+                live_mr = self.gitlab.delivery_mr(run, test.mr_iid)
+                if (
+                    live_mr is None
+                    or str(live_mr.get("sha") or "") != current_head
+                ):
+                    self.store.clear_merge_wait(run.run_key)
+                    self._create_work(run, Stage.TEST, latest.task.id)
+                    return
             try:
                 mr, checked_head = self.gitlab.validate_merge(
                     run,
@@ -5317,7 +5316,7 @@ class ControllerService:
                 result[stage] = result.get(stage, 0) + 1
         return result
 
-    def _validate_completion_context(
+    def _validate_completion_identity(
         self,
         run: RunRecord,
         item: HistoryItem,
@@ -5363,12 +5362,6 @@ class ControllerService:
                 raise ValueError(
                     "completion MR does not match persisted delivery binding"
                 )
-            mr = self.gitlab.validate_delivery_binding(run, binding)
-            if (
-                metadata.head_sha is not None
-                and metadata.head_sha != str(mr.get("sha") or "")
-            ):
-                raise ValueError("completion head is not the bound current MR head")
         elif metadata.mr_iid is not None or metadata.mr_url is not None:
             raise ValueError("completion references an unbound delivery MR")
         if metadata.deterministic_checks:
@@ -5408,6 +5401,23 @@ class ControllerService:
             raise ValueError(
                 "repository evidence is not bound to the run base commit"
             )
+
+    def _validate_completion_context(
+        self,
+        run: RunRecord,
+        item: HistoryItem,
+        metadata: CompletionMetadata,
+    ) -> None:
+        self._validate_completion_identity(run, item, metadata)
+        binding = self.store.delivery_binding(run.run_key)
+        if binding is None:
+            return
+        mr = self.gitlab.validate_delivery_binding(run, binding)
+        if (
+            metadata.head_sha is not None
+            and metadata.head_sha != str(mr.get("sha") or "")
+        ):
+            raise ValueError("completion head is not the bound current MR head")
 
     def _validate_worker_attempt(self, item: HistoryItem) -> None:
         if not hasattr(self, "store") or not hasattr(
@@ -5856,11 +5866,20 @@ class ControllerService:
                 or item.task.status != "done"
             ):
                 continue
+            runtime = self.store.card_runtime(
+                item.managed.board,
+                item.managed.card_id,
+            )
+            if (
+                runtime is None
+                or runtime.get("attempt_status") != "completed_accepted"
+            ):
+                continue
             try:
                 metadata = validate_persisted_completion_metadata(
                     item.task.latest_metadata
                 )
-                self._validate_completion_context(
+                self._validate_completion_identity(
                     parse_card_body(item.task.body).run,
                     item,
                     metadata,
@@ -5948,6 +5967,28 @@ class ControllerService:
             raise ControllerFatalError(
                 f"operation_failed_without_classification:{kind}:{exc}"
             ) from exc
+
+    def _mark_delivery_ready_at_head(
+        self,
+        run: RunRecord,
+        binding: DeliveryBinding,
+        checked_head: str,
+    ) -> dict:
+        control = self._run_control(run.run_key)
+        state_version = int(control.get("state_version") or 1)
+        return self._operation(
+            f"{run.run_key}:delivery-ready:{checked_head}",
+            "delivery-ready",
+            {
+                "run_key": run.run_key,
+                "mr_iid": binding.mr_iid,
+                "checked_head": checked_head,
+            },
+            lambda: self.gitlab.mark_delivery_ready(run, binding),
+            run_key=run.run_key,
+            expected_state_version=state_version,
+            expected_head_sha=checked_head,
+        )
 
     def _render_notification(
         self,
