@@ -96,7 +96,8 @@ run 的 `repository_base_sha`、blocked 摘要，以及
 Controller store + Kanban 的权威流程快照，`gitlab_audit=not_requested` 表示本次
 没有复查 MR/head/gates，并不表示门禁失败。
 Controller 不再用含糊的 `reconciling` 填补无当前卡状态；无当前卡时展示真实
-`merge_wait|dependency_degraded|exception|completed|aborted` 等 run state。
+  `dependency_degraded|exception|completed_ready|completed_with_findings|`
+  `completed_test_failed|completed|aborted` 等 run state。
 `hollysysctl status` 同样只返回本地权威快照，不触发 GitLab I/O。需要外部 MR/head
 审计时，应说明长期版把它留给新的隔离环境准入/E2E，不在当前状态请求中临时访问远端。
 
@@ -128,9 +129,15 @@ Controller 使用 Dispatcher 飞书身份和持久 outbox，在原消息/话题�
   该阶段轮次；
 - 文档 review 第 `n/3` 次失败、简短中文 findings、下一位 writer；
 - 第三次失败进入 finalization，以及阶段最终按 review 通过或强制收敛冻结；
-- tester 与 code-reviewer 对同一 head 的汇总结论、第 `n/5` 次 coder 修改、
-  测试条件不可用的结构化跳过、checked-head merge 完成；
-- 第 5 次修改后的双门禁仍未同时通过时结束自动流程，立即 @ 发起人并要求人类决定。
+- 每轮先执行 Tester；只有 Tester PASS 才对同一 head 创建 Code Review。Tester FAIL
+  直接退回 Coder，不得运行或沿用旧 head 的 Code Review；
+- 第 `n/5` 次 Coder 修改、测试条件不可用的结构化跳过，以及 CODE 最终结论；
+- 双门禁同一 head 均 PASS 时将 MR 改为 Ready，终态为 `completed_ready`；
+- 第 5 次修改后 Tester PASS、Code Reviewer FAIL 时将 MR 改为 Ready，终态为
+  `completed_with_findings`；Tester FAIL 时不运行 Code Review、不改变 MR 状态，终态为
+  `completed_test_failed`；
+- Controller 不自动合并上述 MR。终态通知必须简短总结 SPEC、PLAN、TASKS、CODE，
+  使用“查看 MR !n 详情”等有意义链接并提醒人类进入 MR 处理后续审查、流水线和审批。
 
 Dispatcher 只解释通知中的 Controller 事实和链接，不自行补充门禁结论，不发送普通
 heartbeat。`standard` 保留阶段、门禁、阻塞和异常通知，`minimal` 只保留终态及必须

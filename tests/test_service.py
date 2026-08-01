@@ -12,6 +12,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from hollysys_controller.errors import RunPolicyError
+from hollysys_controller.gitlab import CheckedHeadConflict
 from hollysys_controller.kanban import (
     EventRecord,
     TaskRecord,
@@ -694,7 +695,7 @@ class ServiceRecoveryTests(unittest.TestCase):
 
         self.assertEqual(released, ["t_held"])
 
-    def test_reconcile_test_failure_still_creates_code_review(self) -> None:
+    def test_reconcile_test_failure_returns_to_coder_without_review(self) -> None:
         card = CardRecord(
             run=self.run,
             stage=Stage.TEST,
@@ -766,7 +767,12 @@ class ServiceRecoveryTests(unittest.TestCase):
 
         service.reconcile_run(self.run.run_key)
 
-        self.assertEqual(created, [(Stage.CODE_REVIEW, None)])
+        self.assertEqual(created[0][0], Stage.IMPLEMENT)
+        repair = created[0][1]
+        self.assertIsNotNone(repair)
+        self.assertEqual(repair.kind, RepairKind.CODE_GATE_FAILURE)
+        self.assertEqual(repair.related_card_ids, ["t_test"])
+        self.assertIn("[tester] browser assertion failed", repair.issues)
 
     def test_reconcile_implement_pass_keeps_mr_draft_and_creates_test(
         self,
@@ -1266,7 +1272,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         self.assertIn("**修改轮次：** 3/5", payload["content"])
         self.assertIn(
-            "[!2](https://gitlab.example.com/group/project/-/merge_requests/2)",
+            "[查看 MR !2 详情](https://gitlab.example.com/group/project/-/merge_requests/2)",
             payload["content"],
         )
         self.assertIn("dashboard browser assertion failed", payload["content"])
@@ -1495,6 +1501,288 @@ class ServiceRecoveryTests(unittest.TestCase):
                     "expected_head_sha": head,
                 }
             ],
+        )
+
+    def test_delivery_ready_rejects_changed_head_before_update(self) -> None:
+        service = object.__new__(ControllerService)
+        service.store = ControllerStore(self.root / "ready-controller.db")
+        service.store.save_run(self.run)
+        service.store.ensure_run_control(self.run.run_key)
+        service._run_control = service.store.run_control
+        binding = DeliveryBinding(
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            creator="controller-bot",
+            created_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+            initial_head_sha="a" * 40,
+            claim_note_id=99,
+        )
+        service.gitlab = type(
+            "ChangedHead",
+            (),
+            {
+                "delivery_mr": staticmethod(
+                    lambda run, mr_iid=None: {
+                        "iid": 2,
+                        "sha": "e" * 40,
+                        "draft": True,
+                    }
+                ),
+                "mark_delivery_ready": staticmethod(
+                    lambda run, current: (_ for _ in ()).throw(
+                        AssertionError("changed head was marked ready")
+                    )
+                ),
+            },
+        )()
+
+        with self.assertRaises(CheckedHeadConflict):
+            service._mark_delivery_ready_at_head(self.run, binding, "d" * 40)
+
+    def test_code_review_pass_finishes_ready_without_merge(self) -> None:
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.gitlab = type("BindingStub", (), {})()
+        attach_test_store(service, self.root, self.run, delivery=True)
+        service.store.ensure_run_control(self.run.run_key)
+        test = completion(
+            self.root,
+            Stage.TEST,
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+            kanban_card_id="t_test",
+        )
+        review = completion(
+            self.root,
+            Stage.CODE_REVIEW,
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+            kanban_card_id="t_review",
+        )
+        latest = HistoryItem(
+            ManagedCard(
+                board=self.run.workspace.board,
+                card_id="t_review",
+                run_key=self.run.run_key,
+                stage=Stage.CODE_REVIEW.value,
+                iteration=1,
+                idempotency_key="review",
+                parent_card_id="t_test",
+                purpose="work",
+                created_at=1,
+            ),
+            task_record(task_id="t_review", body="review", status="done"),
+        )
+        live = {
+            "iid": 2,
+            "sha": "d" * 40,
+            "draft": False,
+            "web_url": "https://gitlab.example.com/group/project/-/merge_requests/2",
+        }
+        service.gitlab = type(
+            "ReadyMR",
+            (),
+            {"delivery_mr": staticmethod(lambda run, mr_iid=None: live)},
+        )()
+        ready_calls: list[str] = []
+        service._mark_delivery_ready_at_head = (
+            lambda run, binding, head: ready_calls.append(head) or live
+        )
+        service._frozen_violation = lambda run, history, head: None
+        notifications: list[str] = []
+        service._enqueue_code_flow_completed = (
+            lambda run, history, **kwargs: notifications.append(
+                kwargs["terminal_state"]
+            )
+        )
+
+        service._finalize_code_flow(
+            self.run,
+            [latest],
+            latest,
+            review,
+            terminal_state="completed_ready",
+            paired_test=test,
+            code_modifications=2,
+        )
+
+        self.assertEqual(ready_calls, ["d" * 40])
+        self.assertEqual(notifications, ["completed_ready"])
+        self.assertEqual(
+            service.store.run_control(self.run.run_key)["state"],
+            "completed_ready",
+        )
+
+    def test_fifth_failed_test_finishes_without_ready_or_review(self) -> None:
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.gitlab = type("BindingStub", (), {})()
+        attach_test_store(service, self.root, self.run, delivery=True)
+        service.store.ensure_run_control(self.run.run_key)
+        test = completion(
+            self.root,
+            Stage.TEST,
+            outcome="fail",
+            issues=["integration suite failed"],
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+            kanban_card_id="t_test",
+        )
+        latest = HistoryItem(
+            ManagedCard(
+                board=self.run.workspace.board,
+                card_id="t_test",
+                run_key=self.run.run_key,
+                stage=Stage.TEST.value,
+                iteration=1,
+                idempotency_key="test",
+                parent_card_id="t_implement",
+                purpose="work",
+                created_at=1,
+            ),
+            task_record(task_id="t_test", body="test", status="done"),
+        )
+        live = {"iid": 2, "sha": "d" * 40, "draft": True}
+        service.gitlab = type(
+            "DraftMR",
+            (),
+            {"delivery_mr": staticmethod(lambda run, mr_iid=None: live)},
+        )()
+        service._mark_delivery_ready_at_head = lambda *args: (_ for _ in ()).throw(
+            AssertionError("failed test changed MR readiness")
+        )
+        service._frozen_violation = lambda run, history, head: None
+        service._enqueue_code_flow_completed = lambda *args, **kwargs: None
+
+        service._finalize_code_flow(
+            self.run,
+            [latest],
+            latest,
+            test,
+            terminal_state="completed_test_failed",
+            paired_test=None,
+            code_modifications=5,
+        )
+
+        self.assertEqual(
+            service.store.run_control(self.run.run_key)["state"],
+            "completed_test_failed",
+        )
+
+    def test_legacy_exhausted_exception_is_reopened_for_terminalization(self) -> None:
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / "legacy-controller.db")
+        service.store.save_run(self.run)
+        service.store.ensure_run_control(self.run.run_key)
+        service.store.set_run_exception(
+            self.run.run_key,
+            "code modification limit 5 exhausted; head=" + "d" * 40,
+        )
+        test = completion(
+            self.root,
+            Stage.TEST,
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+            kanban_card_id="t_test",
+        )
+        review = completion(
+            self.root,
+            Stage.CODE_REVIEW,
+            outcome="fail",
+            issues=["review defect remains"],
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+            kanban_card_id="t_review",
+        )
+        test_item = HistoryItem(
+            ManagedCard(
+                board=self.run.workspace.board,
+                card_id="t_test",
+                run_key=self.run.run_key,
+                stage=Stage.TEST.value,
+                iteration=1,
+                idempotency_key="test",
+                parent_card_id="t_implement",
+                purpose="work",
+                created_at=1,
+            ),
+            task_record(
+                task_id="t_test",
+                body="test",
+                status="done",
+                latest_metadata=test.model_dump(mode="json"),
+            ),
+        )
+        review_item = HistoryItem(
+            ManagedCard(
+                board=self.run.workspace.board,
+                card_id="t_review",
+                run_key=self.run.run_key,
+                stage=Stage.CODE_REVIEW.value,
+                iteration=1,
+                idempotency_key="review",
+                parent_card_id="t_test",
+                purpose="work",
+                created_at=2,
+            ),
+            task_record(
+                task_id="t_review",
+                body="review",
+                status="done",
+                latest_metadata=review.model_dump(mode="json"),
+            ),
+        )
+        exception_item = HistoryItem(
+            ManagedCard(
+                board=self.run.workspace.board,
+                card_id="t_exception",
+                run_key=self.run.run_key,
+                stage="exception",
+                iteration=1,
+                idempotency_key="exception",
+                parent_card_id="t_review",
+                purpose="exception",
+                created_at=3,
+            ),
+            task_record(
+                task_id="t_exception",
+                body="exception",
+                status="blocked",
+            ),
+        )
+        history = [test_item, review_item, exception_item]
+        service._history = lambda run_key: (history, self.run)
+        service._code_modification_count = lambda current: 5
+        calls: list[tuple[str, str]] = []
+        service.kanban = type(
+            "LegacyKanban",
+            (),
+            {
+                "comment": staticmethod(
+                    lambda board, card, text, author: calls.append(
+                        ("comment", card)
+                    )
+                ),
+                "abort_task": staticmethod(
+                    lambda board, card, reason: calls.append(("abort", card))
+                ),
+            },
+        )()
+
+        changed = service._upgrade_legacy_exhausted_code_exception(
+            self.run.run_key
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(calls, [("comment", "t_exception"), ("abort", "t_exception")])
+        self.assertEqual(
+            service.store.run_control(self.run.run_key)["state"], "active"
         )
 
     def test_completion_repository_evidence_must_match_run_base(self) -> None:

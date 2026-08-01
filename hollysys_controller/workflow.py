@@ -62,6 +62,7 @@ class Route:
     next_stage: Stage | None = None
     next_mode: WorkMode = WorkMode.NORMAL
     merge: bool = False
+    terminal_state: str | None = None
     blocked_reason: str | None = None
 
 
@@ -83,11 +84,12 @@ def route_completion(
             return Route(next_stage=Stage.TEST)
         return Route(blocked_reason=f"{metadata.stage} was cancelled")
 
-    # Tester and code-reviewer always inspect the same implementation head.
-    # A failed test does not short-circuit code review: both sets of findings
-    # are collected before deciding whether coder must modify the code.
     if metadata.stage == Stage.TEST:
-        return Route(next_stage=Stage.CODE_REVIEW)
+        if metadata.outcome == Outcome.PASS:
+            return Route(next_stage=Stage.CODE_REVIEW)
+        if code_modifications >= config.code_modification_limit:
+            return Route(terminal_state="completed_test_failed")
+        return Route(next_stage=Stage.IMPLEMENT)
 
     if metadata.stage == Stage.CODE_REVIEW:
         same_delivery = (
@@ -102,14 +104,9 @@ def route_completion(
             paired_test.outcome == Outcome.PASS
             and metadata.outcome == Outcome.PASS
         ):
-            return Route(merge=True)
+            return Route(terminal_state="completed_ready")
         if code_modifications >= config.code_modification_limit:
-            return Route(
-                blocked_reason=(
-                    "code modification limit "
-                    f"{config.code_modification_limit} exhausted"
-                )
-            )
+            return Route(terminal_state="completed_with_findings")
         return Route(next_stage=Stage.IMPLEMENT)
 
     if metadata.outcome == Outcome.FAIL:

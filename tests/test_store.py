@@ -82,6 +82,21 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertIn('"x": 1', pending[0]["payload"])
 
+    def test_flow_completion_states_are_terminal_and_health_valid(self) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.ensure_run_control(run_key)
+        completed = self.store.mark_flow_completed(
+            run_key,
+            state="completed_with_findings",
+            checked_head="d" * 40,
+            reason="review findings remain",
+        )
+        self.assertEqual(completed["state"], "completed_with_findings")
+        self.assertIsNotNone(completed["terminal_at"])
+        self.assertEqual(completed["compliance"], "unverified")
+        self.assertEqual(completed["completion_source"], "controller")
+        self.assertEqual(self.store.health()["quick_check"], "ok")
+
     def test_abort_confirmation_is_bound_to_requester_and_channel(self) -> None:
         run_key = "hollysys-abcdefghijklmnopqrst"
         token_hash = hashlib.sha256(b"SAFE2345").hexdigest()

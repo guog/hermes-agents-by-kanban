@@ -2428,6 +2428,17 @@ class ControllerService:
                     raise ControllerFatalError(
                         f"abort_reconcile_failed:{run_key}:{exc}"
                     ) from exc
+            for run_key in self.store.run_keys():
+                try:
+                    self._upgrade_legacy_exhausted_code_exception(run_key)
+                except DependencyError as exc:
+                    self._handle_dependency_error(run_key, exc)
+                except ControllerFatalError:
+                    raise
+                except Exception as exc:
+                    raise ControllerFatalError(
+                        f"legacy_code_terminal_upgrade_failed:{run_key}:{exc}"
+                    ) from exc
             if self._dependency_retry_blocked("gitlab"):
                 self.last_reconcile_at = int(time.time())
                 self.last_reconcile_error = "gitlab circuit is in backoff"
@@ -2450,6 +2461,90 @@ class ControllerService:
         except Exception as exc:
             self.last_reconcile_error = str(exc)
             raise
+
+    def _upgrade_legacy_exhausted_code_exception(self, run_key: str) -> bool:
+        control = self.store.run_control(run_key)
+        if control is None or control["state"] != "exception":
+            return False
+        prefix = (
+            "code modification limit "
+            f"{self.config.code_modification_limit} exhausted;"
+        )
+        if not str(control.get("last_transition_reason") or "").startswith(prefix):
+            return False
+        if not self._begin_reconcile(run_key):
+            return False
+        try:
+            history, run = self._history(run_key)
+            if self._code_modification_count(history) < self.config.code_modification_limit:
+                return False
+            work = [item for item in history if item.managed.purpose == "work"]
+            if not work:
+                return False
+            latest = work[-1]
+            if (
+                latest.managed.stage != Stage.CODE_REVIEW.value
+                or latest.task.status != "done"
+            ):
+                return False
+            review = validate_persisted_completion_metadata(
+                latest.task.latest_metadata
+            )
+            test = self._latest_valid_completion(
+                history,
+                Stage.TEST,
+                {Outcome.PASS},
+            )
+            if (
+                review.outcome != Outcome.FAIL
+                or test is None
+                or test.mr_iid != review.mr_iid
+                or test.mr_url != review.mr_url
+                or test.head_sha != review.head_sha
+            ):
+                return False
+            active_work = [
+                item
+                for item in history
+                if item.managed.purpose == "work"
+                and item.task.status in ACTIVE_STATUSES
+            ]
+            if active_work:
+                return False
+            for item in history:
+                if (
+                    item.managed.purpose == "exception"
+                    and item.task.status in ACTIVE_STATUSES
+                ):
+                    self.kanban.comment(
+                        run.workspace.board,
+                        item.task.id,
+                        "[controller-terminal-upgrade:v1]\n"
+                        "outcome: completed_with_findings\n"
+                        f"head_sha: {review.head_sha}\n"
+                        "reason: legacy exhausted CODE exception is now a "
+                        "non-merge terminal outcome",
+                        "hollysys-controller",
+                    )
+                    self.kanban.abort_task(
+                        run.workspace.board,
+                        item.task.id,
+                        "preserved legacy exception as completed_with_findings",
+                    )
+            self.store.transition_run(
+                run_key,
+                expected_states={"exception"},
+                new_state="active",
+                reason="upgrade_legacy_exhausted_code_exception",
+                expected_version=int(control["state_version"]),
+            )
+            self.store.enqueue_reconcile(
+                run_key,
+                reason="upgrade-legacy-exhausted-code-exception",
+            )
+            return True
+        finally:
+            self._finish_reconcile(run_key)
 
     def consume_reconcile_once(self, lease_owner: str) -> bool:
         intent = self.store.claim_reconcile(
@@ -3010,6 +3105,17 @@ class ControllerService:
             paired_test=paired_test,
             code_modifications=code_modifications,
         )
+        if route.terminal_state:
+            self._finalize_code_flow(
+                run,
+                history,
+                latest,
+                metadata,
+                terminal_state=route.terminal_state,
+                paired_test=paired_test,
+                code_modifications=code_modifications,
+            )
+            return
         if route.blocked_reason:
             reason = route.blocked_reason
             if metadata.stage == Stage.CODE_REVIEW and paired_test is not None:
@@ -3050,6 +3156,26 @@ class ControllerService:
                     metadata,
                     review_attempt,
                     route.next_mode,
+                )
+            if (
+                metadata.stage == Stage.TEST
+                and metadata.outcome == Outcome.FAIL
+            ):
+                next_modification = code_modifications + 1
+                repair_context = RepairContext(
+                    kind=RepairKind.CODE_GATE_FAILURE,
+                    trigger_card_id=latest.task.id,
+                    related_card_ids=[metadata.kanban_card_id],
+                    head_sha=metadata.head_sha,
+                    code_modification=next_modification,
+                    code_modification_limit=self.config.code_modification_limit,
+                    issues=self._test_gate_issues(metadata),
+                )
+                self._enqueue_code_retry(
+                    run,
+                    metadata,
+                    None,
+                    next_modification,
                 )
             if (
                 metadata.stage == Stage.CODE_REVIEW
@@ -3241,6 +3367,93 @@ class ControllerService:
                 merged,
                 operation_key=operation_key,
             )
+
+    def _finalize_code_flow(
+        self,
+        run: RunRecord,
+        history: list[HistoryItem],
+        latest: HistoryItem,
+        metadata: CompletionMetadata,
+        *,
+        terminal_state: str,
+        paired_test: CompletionMetadata | None,
+        code_modifications: int,
+    ) -> None:
+        if terminal_state == "completed_test_failed":
+            if metadata.stage != Stage.TEST or metadata.outcome != Outcome.FAIL:
+                raise ValueError("test-failed terminal requires a failed test")
+            test = metadata
+            review = None
+        else:
+            if (
+                metadata.stage != Stage.CODE_REVIEW
+                or paired_test is None
+                or paired_test.outcome != Outcome.PASS
+            ):
+                raise ValueError("ready terminal requires a passed paired test")
+            test = paired_test
+            review = metadata
+
+        head = str(metadata.head_sha or test.head_sha or "")
+        mr_iid = metadata.mr_iid or test.mr_iid
+        if mr_iid is None or not head:
+            raise ValueError("CODE terminal requires MR/head evidence")
+        live_mr = self.gitlab.delivery_mr(run, int(mr_iid))
+        if live_mr is None or str(live_mr.get("sha") or "") != head:
+            self._create_work(run, Stage.TEST, latest.task.id)
+            return
+        violation = self._frozen_violation(run, history, head)
+        if violation is not None:
+            self._exception(
+                run,
+                latest.task.id,
+                f"terminal frozen baseline violation: {violation}",
+            )
+            return
+
+        ready_required = terminal_state in {
+            "completed_ready",
+            "completed_with_findings",
+        }
+        if ready_required:
+            binding = self.store.delivery_binding(run.run_key)
+            if binding is None or binding.mr_iid != int(mr_iid):
+                raise ValueError("CODE terminal MR does not match delivery binding")
+            self._mark_delivery_ready_at_head(run, binding, head)
+            live_mr = self.gitlab.delivery_mr(run, int(mr_iid))
+            if (
+                live_mr is None
+                or str(live_mr.get("sha") or "") != head
+                or live_mr.get("draft")
+                or live_mr.get("work_in_progress")
+            ):
+                raise CheckedHeadConflict(
+                    "delivery-ready verification changed before terminal commit"
+                )
+
+        self.store.clear_merge_wait(run.run_key)
+        reason = (
+            f"code_flow_terminal:{terminal_state};head={head};"
+            f"tester={test.outcome.value};"
+            f"code-reviewer={review.outcome.value if review else 'not_run'};"
+            f"modifications={code_modifications}/"
+            f"{self.config.code_modification_limit};mr_ready={ready_required}"
+        )
+        self.store.mark_flow_completed(
+            run.run_key,
+            state=terminal_state,
+            checked_head=head,
+            reason=reason,
+        )
+        self._enqueue_code_flow_completed(
+            run,
+            history,
+            terminal_state=terminal_state,
+            test=test,
+            review=review,
+            mr=live_mr,
+            code_modifications=code_modifications,
+        )
 
     def _handle_merge_blocker(
         self,
@@ -5906,6 +6119,12 @@ class ControllerService:
         # this fallback only protects against malformed historical data.
         return issues or ["CODE 双门禁未同时通过，需人工核对门禁证据。"]
 
+    @staticmethod
+    def _test_gate_issues(test: CompletionMetadata) -> list[str]:
+        return [f"[tester] {issue}" for issue in test.issues] or [
+            "[tester] 测试未通过，需根据测试证据修改实现。"
+        ]
+
     def _operation(
         self,
         key: str,
@@ -5976,6 +6195,30 @@ class ControllerService:
     ) -> dict:
         control = self._run_control(run.run_key)
         state_version = int(control.get("state_version") or 1)
+
+        def mark_and_verify() -> dict:
+            before = self.gitlab.delivery_mr(run, binding.mr_iid)
+            if before is None or str(before.get("sha") or "") != checked_head:
+                raise CheckedHeadConflict(
+                    "MR head changed before delivery-ready transition"
+                )
+            self.gitlab.mark_delivery_ready(run, binding)
+            after = self.gitlab.delivery_mr(run, binding.mr_iid)
+            if after is None or str(after.get("sha") or "") != checked_head:
+                raise CheckedHeadConflict(
+                    "MR head changed during delivery-ready transition"
+                )
+            if after.get("draft") or after.get("work_in_progress"):
+                raise DependencyContractError(
+                    "GitLab did not confirm delivery MR is ready",
+                    context=ErrorContext(
+                        dependency="gitlab",
+                        endpoint="merge_requests",
+                        error_code="delivery_ready_not_confirmed",
+                    ),
+                )
+            return after
+
         return self._operation(
             f"{run.run_key}:delivery-ready:{checked_head}",
             "delivery-ready",
@@ -5984,7 +6227,7 @@ class ControllerService:
                 "mr_iid": binding.mr_iid,
                 "checked_head": checked_head,
             },
-            lambda: self.gitlab.mark_delivery_ready(run, binding),
+            mark_and_verify,
             run_key=run.run_key,
             expected_state_version=state_version,
             expected_head_sha=checked_head,
@@ -6210,27 +6453,49 @@ class ControllerService:
         self,
         run: RunRecord,
         test: CompletionMetadata,
-        review: CompletionMetadata,
+        review: CompletionMetadata | None,
         next_modification: int,
     ) -> None:
-        issues = self._code_gate_issues(test, review)[:6]
+        issues = (
+            self._code_gate_issues(test, review)
+            if review is not None
+            else self._test_gate_issues(test)
+        )[:6]
+        head_sha = review.head_sha if review is not None else test.head_sha
+        mr_iid = (
+            review.mr_iid if review is not None else test.mr_iid
+        ) or test.mr_iid
+        mr_url = (
+            review.mr_url if review is not None else test.mr_url
+        ) or test.mr_url
         self._enqueue_progress(
             run,
-            f"code:gates-failed:{review.head_sha}:modification:{next_modification}",
+            f"code:gates-failed:{head_sha}:modification:{next_modification}",
             self._render_notification(
                 run,
                 icon="⚠️",
-                title="CODE 双门禁未同时通过，已退回修改",
+                title=(
+                    "CODE 双门禁未同时通过，已退回修改"
+                    if review is not None
+                    else "CODE 测试未通过，已退回修改"
+                ),
                 fields=[
                     ("任务 ID", inline_code(run.run_key)),
-                    ("Head", inline_code(short_sha(review.head_sha))),
+                    ("Head", inline_code(short_sha(head_sha))),
                     ("Tester", format_outcome(test.outcome)),
-                    ("Code Reviewer", format_outcome(review.outcome)),
+                    (
+                        "Code Reviewer",
+                        (
+                            format_outcome(review.outcome)
+                            if review is not None
+                            else "not_run（因测试失败未执行）"
+                        ),
+                    ),
                     (
                         "MR",
                         markdown_link(
-                            f"!{review.mr_iid or test.mr_iid or 'MR'}",
-                            review.mr_url or test.mr_url or "",
+                            f"查看 MR !{mr_iid or 'MR'} 详情",
+                            mr_url or "",
                         ),
                     ),
                     (
@@ -6241,7 +6506,10 @@ class ControllerService:
                         ),
                     ),
                     ("下一位 Agent", format_agent("coder")),
-                    ("后续处理", "代码 push 后重新执行两道门禁"),
+                    (
+                        "后续处理",
+                        "代码 push 后先重新执行 Tester；仅通过后进入 Code Review",
+                    ),
                 ],
                 sections=[
                     (
@@ -6412,6 +6680,128 @@ class ControllerService:
             }:
                 return False
         return True
+
+    def _enqueue_code_flow_completed(
+        self,
+        run: RunRecord,
+        history: list[HistoryItem],
+        *,
+        terminal_state: str,
+        test: CompletionMetadata,
+        review: CompletionMetadata | None,
+        mr: dict,
+        code_modifications: int,
+    ) -> None:
+        presentation = {
+            "completed_ready": (
+                "✅",
+                "自动开发流程已完成，MR 已就绪",
+                "pass（双门禁通过）",
+            ),
+            "completed_with_findings": (
+                "⚠️",
+                "自动开发流程已完成，存在审查遗留问题",
+                "completed_with_findings（完成但有遗留问题）",
+            ),
+            "completed_test_failed": (
+                "❗",
+                "自动开发流程已结束，测试未通过",
+                "completed_test_failed（完成但测试未通过）",
+            ),
+        }
+        icon, title, outcome = presentation[terminal_state]
+        attempts = self._attempts_by_stage(history)
+        stage_summary = [
+            (
+                "SPEC "
+                f"write {attempts.get(Stage.SPEC_WRITE, 0)} / "
+                f"review {attempts.get(Stage.SPEC_REVIEW, 0)}"
+            ),
+            (
+                "PLAN "
+                f"write {attempts.get(Stage.PLAN_WRITE, 0)} / "
+                f"review {attempts.get(Stage.PLAN_REVIEW, 0)}"
+            ),
+            (
+                "TASKS "
+                f"write {attempts.get(Stage.TASKS_WRITE, 0)} / "
+                f"review {attempts.get(Stage.TASKS_REVIEW, 0)}"
+            ),
+            (
+                "CODE "
+                f"implement {attempts.get(Stage.IMPLEMENT, 0)} / "
+                f"test {attempts.get(Stage.TEST, 0)} / "
+                f"review {attempts.get(Stage.CODE_REVIEW, 0)}"
+            ),
+        ]
+        issues = (
+            self._test_gate_issues(test)
+            if review is None
+            else self._code_gate_issues(test, review)
+        )
+        if terminal_state == "completed_ready":
+            issues = ["Tester 与 Code Reviewer 已验证同一 MR/head。"]
+        mr_iid = mr.get("iid") or test.mr_iid
+        mr_url = str(mr.get("web_url") or test.mr_url or "")
+        mr_ready = terminal_state != "completed_test_failed"
+        self._enqueue_progress(
+            run,
+            f"code:terminal:{terminal_state}:{test.head_sha}",
+            self._render_notification(
+                run,
+                icon=icon,
+                title=title,
+                fields=[
+                    ("任务 ID", inline_code(run.run_key)),
+                    ("阶段", format_stage(Phase.CODE)),
+                    ("Agent", format_agent("dispatcher")),
+                    ("outcome", escape_markdown(outcome)),
+                    ("Head", inline_code(short_sha(test.head_sha))),
+                    ("Tester", format_outcome(test.outcome)),
+                    (
+                        "Code Reviewer",
+                        (
+                            format_outcome(review.outcome)
+                            if review is not None
+                            else "not_run（因测试失败未执行）"
+                        ),
+                    ),
+                    (
+                        "代码修改",
+                        (
+                            f"{code_modifications}/"
+                            f"{self.config.code_modification_limit}"
+                        ),
+                    ),
+                    (
+                        "MR",
+                        markdown_link(f"查看 MR !{mr_iid} 详情", mr_url),
+                    ),
+                    (
+                        "MR 状态",
+                        "Ready（等待人类处理）"
+                        if mr_ready
+                        else "保持原状态（未改为 Ready）",
+                    ),
+                    ("合并", "未执行（Controller 不自动合并）"),
+                ],
+                sections=[
+                    ("流程摘要", [escape_markdown(item) for item in stage_summary]),
+                    (
+                        "结论与遗留问题",
+                        [
+                            human_summary(issue, limit=240)
+                            for issue in issues[:4]
+                        ],
+                    ),
+                    (
+                        "下一步",
+                        ["请进入 MR 查看代码、审查意见、流水线和审批详情。"],
+                    ),
+                ],
+            ),
+            allow_minimal=True,
+        )
 
     def _enqueue_success(self, run: RunRecord, mr: dict) -> None:
         merge_sha = str(mr.get("merge_commit_sha") or "")
