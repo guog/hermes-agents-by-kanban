@@ -14,7 +14,7 @@ terminal Kanban 补丁。派生镜像默认命名为 `hollysys-hermes-agents:lat
 → SPEC（write ↔ review，最多 3 次 review）→ 冻结
 → PLAN（write ↔ review，最多 3 次 review）→ 冻结
 → TASKS（write ↔ review，最多 3 次 review）→ 冻结
-→ CODE（implement ↔ test ↔ code-review）→ checked-head merge
+→ CODE（implement → test；仅 test PASS 后 code-review）→ MR Ready / 终态
 ```
 
 同一 PRD 保留稳定 `source_key`；每次新启动生成随机唯一的 20 位
@@ -631,8 +631,8 @@ terminal 中的 `git` 固定命中容器启动时安装的 root-owned HTTPS wrap
 
 ```text
 spec-write → spec-review → plan-write → plan-review
-→ tasks-write → tasks-review → implement → test → code-review
-→ checked-head merge
+→ tasks-write → tasks-review → implement → test
+→（仅 test PASS）code-review → MR Ready / 终态
 ```
 
 不创建 continuation、spec/plan/tasks/test/code gate 或 merge 卡。Controller 每两秒
@@ -701,18 +701,17 @@ SQLite/配置/状态不变量错误令 daemon
   completion 和合并前逐项复算基线；若当前阶段误改冻结文件，只向当前 producer
   派发恢复基线修复，不重开上游阶段。
 - test/code-review note 必须由配置的独立身份发布，并与当前 MR 同一 `head_sha`；任何
-  push 使两者失效，从 test 重派。tester 无论 pass/fail，都继续由 code-reviewer
-  审查同一 head，完成后才汇总两份结论。
+  push 使两者失效，从 test 重派。只有 tester PASS 才创建 code-review；tester FAIL
+  直接将 findings 交回 coder，不运行或沿用旧 head 的 code-review。
 - 必要测试条件（如浏览器、专用硬件或外部环境）经预检确认不具备时，tester 执行
   其余可用检查，并以 `test_disposition=skipped_unavailable` 记录具体原因、证据和
   残余风险；gate marker 同样绑定该处置，不能伪装成已执行。
-- tester 与 code-reviewer 对同一 head 都 pass 才进入 checked-head merge。任一 fail
-  时，Controller 将两方 findings 通过 `repair_context.kind=code_gate_failure`
-  一次性交给 coder，计为第 `n/5` 次修改；修改 push 后重新执行 tester 和
-  code-reviewer。第 5 次修改后的版本仍未双通过则结束自动流程，创建 Dispatcher
-  异常卡并通过持久 outbox @ 发起人要求人类介入。
-- 合并前重读 MR ready、pipeline、讨论、所有最新 gate 和当前 head，只调用
-  `sha=<checked_head>` merge。SHA 变化只从 test 重派，绝不无 SHA 重试。
+- tester PASS 后，code-reviewer 对同一 head PASS 即将 MR 改为 Ready 并进入
+  `completed_ready`；Controller 不自动合并。第 5 次修改后 tester PASS、code-reviewer
+  FAIL 时同样将 MR 改为 Ready，进入 `completed_with_findings`；tester FAIL 时不运行
+  code-review、不改变 MR 状态，进入 `completed_test_failed`。额度内任一门禁失败均以
+  `repair_context.kind=code_gate_failure` 交回 coder，修改 push 后重新从 tester 开始。
+- Ready 前后均重读当前 MR/head；SHA 变化只从 test 重派，不用旧 head 门禁完成流程。
 - 若 MR 在 Controller 已实际提交的同-head merge operation 之外被人工或其他自动化合并，流程
   仍会停止调度并落为 `completed`，但固定标记 `source=external,
   compliance=unverified` 并通知人类，不把同-head review 误当成完整合并时证据。
@@ -773,8 +772,8 @@ Dispatcher 不把普通 heartbeat 转发到飞书。试运行默认
 `HOLLYSYS_NOTIFICATION_LEVEL=verbose`，Controller 在每个 Agent 被领取/开始以及完成协议
 被接受或拒绝时分别通知原会话，并继续在下列业务事件写入持久
 outbox：run 受理、阶段开始、每次 review fail、第三次失败进入 finalization、阶段冻结、
-CODE 开始、同一 head 双门禁汇总失败后的第 n/5 次重实现、测试结构化跳过、
-修改上限耗尽、checked-head merge 和最终摘要。事件键稳定，
+CODE 开始、Tester/Code Reviewer 失败后的第 n/5 次重实现、测试结构化跳过、
+三类 CODE 终态、MR Ready 和最终摘要。事件键稳定，
 发送成功前保持 pending/retrying；永久 payload 合同错误进入 dead letter，Controller
 或 Gateway 重启后按 `next_attempt_at` 指数退避，不重复创建事件。独立 outbox worker
 默认每 2 秒投递一次（`HOLLYSYS_OUTBOX_POLL_INTERVAL_SECONDS`），不等待某个 run 的
@@ -870,7 +869,7 @@ blocked 卡的 `promote` 同样记录为 `promoted_manual`；Controller 只在�
   idempotency、parent、assignee、Skill 和严格 card JSON。
 - completion schema 由 worker 自检、Controller 强制验证；非法 done 卡不能推进。
 - Controller 使用 Dispatcher Maintainer token 的只读 secret 镜像，preflight 强制
-  两处值一致；checked-head merge、Draft MR 创建与 ready 切换只由 Controller 流程执行，
+  两处值一致；Draft MR 创建与 ready 切换只由 Controller 流程执行，
   Agent Git wrapper 额外拒绝 Dispatcher push。
 - Memory/Skill 修改仍经过 Hermes 官方 write approval。
 - Hermes 补丁保证成功 `kanban_complete`/`kanban_block` 后停止同批后续业务工具和下一次
@@ -955,8 +954,8 @@ git diff --check
 ```
 
 静态测试与 Compose 解析不是生产 E2E。发布门禁必须额外完成一次真实
-PRD→SPEC→PLAN→TASKS→implement→test→code-review→checked-head merge，并验证非法
+PRD→SPEC→PLAN→TASKS→implement→test→按条件 code-review→MR Ready/终态，并验证非法
 metadata、三次 review/finalization、冻结文件恢复、同 head 代码门禁、blocked/resume、
 verbose Agent 开始/完成通知、两阶段废止、通知幂等、重复答复、依赖断连恢复和
 Controller 独立重启。E2E 的 PRD 必须包含遗漏、模糊和
-相互矛盾内容，以证明流程不中途回退并最终完成 checked-head merge。
+相互矛盾内容，以证明流程不中途回退并准确进入三类 CODE 终态。

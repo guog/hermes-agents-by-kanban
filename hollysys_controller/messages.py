@@ -28,8 +28,16 @@ STAGE_LABELS = {
     "implement": "implement（代码实现）",
     "test": "test（测试）",
     "code-review": "code-review（代码审查）",
+    "code": "code（代码交付）",
     "merge-wait": "merge-wait（等待合并）",
     "exception": "exception（异常处理）",
+    "completed_ready": "completed_ready（流程完成，MR 已就绪）",
+    "completed_with_findings": (
+        "completed_with_findings（流程完成，存在审查遗留问题）"
+    ),
+    "completed_test_failed": (
+        "completed_test_failed（流程完成，测试未通过）"
+    ),
 }
 
 AGENT_LABELS = {

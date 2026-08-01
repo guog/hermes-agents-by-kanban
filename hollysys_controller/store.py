@@ -15,6 +15,9 @@ from .models import DeliveryBinding, RunRecord
 SCHEMA_VERSION = 4
 TERMINAL_RUN_STATES = {
     "completed",
+    "completed_ready",
+    "completed_with_findings",
+    "completed_test_failed",
     "aborted",
     "completed_before_abort",
 }
@@ -549,7 +552,9 @@ class ControllerStore:
                         'active', 'transition_pending', 'human_blocked',
                         'retry_wait', 'dependency_degraded', 'merge_wait',
                         'abort_requested', 'aborting', 'exception',
-                        'completed', 'aborted', 'completed_before_abort'
+                        'completed', 'completed_ready',
+                        'completed_with_findings', 'completed_test_failed',
+                        'aborted', 'completed_before_abort'
                     ) LIMIT 1
                 """,
                 "invalid_state_version": """
@@ -560,11 +565,15 @@ class ControllerStore:
                     SELECT 1 FROM run_control
                     WHERE (
                         state IN (
-                            'completed', 'aborted', 'completed_before_abort'
+                            'completed', 'completed_ready',
+                            'completed_with_findings', 'completed_test_failed',
+                            'aborted', 'completed_before_abort'
                         ) AND terminal_at IS NULL
                     ) OR (
                         state NOT IN (
-                            'completed', 'aborted', 'completed_before_abort'
+                            'completed', 'completed_ready',
+                            'completed_with_findings', 'completed_test_failed',
+                            'aborted', 'completed_before_abort'
                         ) AND terminal_at IS NOT NULL
                     ) LIMIT 1
                 """,
@@ -591,6 +600,20 @@ class ControllerStore:
                         OR checked_head IS NULL
                         OR length(checked_head) != 40
                         OR checked_head GLOB '*[^0-9a-f]*'
+                    ) LIMIT 1
+                """,
+                "flow_completion_metadata_missing": """
+                    SELECT 1 FROM run_control
+                    WHERE state IN (
+                        'completed_ready', 'completed_with_findings',
+                        'completed_test_failed'
+                    ) AND (
+                        compliance NOT IN ('verified', 'unverified')
+                        OR completion_source != 'controller'
+                        OR checked_head IS NULL
+                        OR length(checked_head) != 40
+                        OR checked_head GLOB '*[^0-9a-f]*'
+                        OR merge_commit_sha IS NOT NULL
                     ) LIMIT 1
                 """,
                 "abort_metadata_missing": """
@@ -1705,6 +1728,47 @@ class ControllerStore:
             completion_source="external" if external else "controller",
             checked_head=checked_head,
             merge_commit_sha=merge_commit_sha,
+        )
+
+    def mark_flow_completed(
+        self,
+        run_key: str,
+        *,
+        state: str,
+        checked_head: str,
+        reason: str,
+    ) -> dict:
+        allowed = {
+            "completed_ready": "verified",
+            "completed_with_findings": "unverified",
+            "completed_test_failed": "unverified",
+        }
+        if state not in allowed:
+            raise ValueError(f"invalid flow terminal state {state}")
+        if len(checked_head) != 40 or any(
+            character not in "0123456789abcdef" for character in checked_head
+        ):
+            raise ValueError("flow completion requires a valid checked head SHA")
+        current = self.run_control(run_key)
+        if current is None:
+            raise ValueError(f"unknown_run:{run_key}")
+        if current["state"] in TERMINAL_RUN_STATES:
+            return current
+        return self.transition_run(
+            run_key,
+            expected_states={
+                "active",
+                "transition_pending",
+                "human_blocked",
+                "retry_wait",
+                "dependency_degraded",
+                "merge_wait",
+            },
+            new_state=state,
+            reason=reason,
+            compliance=allowed[state],
+            completion_source="controller",
+            checked_head=checked_head,
         )
 
     def set_run_exception(self, run_key: str, reason: str) -> dict:

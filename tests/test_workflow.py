@@ -125,7 +125,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(route.next_stage, Stage.PLAN_WRITE)
         self.assertNotEqual(route.next_stage, Stage.SPEC_REVIEW)
 
-    def test_test_failure_still_routes_to_code_review(self) -> None:
+    def test_test_failure_returns_to_implement_without_code_review(self) -> None:
         metadata = completion(
             self.root,
             Stage.TEST,
@@ -140,14 +140,13 @@ class WorkflowTests(unittest.TestCase):
             review_attempts_by_stage={},
             config=self.config,
         )
-        self.assertEqual(route.next_stage, Stage.CODE_REVIEW)
+        self.assertEqual(route.next_stage, Stage.IMPLEMENT)
 
     def test_code_gate_failure_returns_to_implement_within_limit(self) -> None:
         test = completion(
             self.root,
             Stage.TEST,
-            outcome="fail",
-            issues=["browser assertion failed"],
+            outcome="pass",
             mr_iid=2,
             mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
             head_sha="d" * 40,
@@ -155,6 +154,8 @@ class WorkflowTests(unittest.TestCase):
         review = completion(
             self.root,
             Stage.CODE_REVIEW,
+            outcome="fail",
+            issues=["review defect remains"],
             mr_iid=2,
             mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
             head_sha="d" * 40,
@@ -189,7 +190,8 @@ class WorkflowTests(unittest.TestCase):
             config=self.config,
             paired_test=test,
         )
-        self.assertTrue(route.merge)
+        self.assertEqual(route.terminal_state, "completed_ready")
+        self.assertFalse(route.merge)
 
         stale_test = test.model_copy(update={"head_sha": "e" * 40})
         stale = route_completion(
@@ -226,7 +228,26 @@ class WorkflowTests(unittest.TestCase):
             code_modifications=5,
         )
         self.assertIsNone(route.next_stage)
-        self.assertIn("limit 5 exhausted", route.blocked_reason or "")
+        self.assertEqual(route.terminal_state, "completed_with_findings")
+
+    def test_fifth_failed_test_completes_without_code_review(self) -> None:
+        test = completion(
+            self.root,
+            Stage.TEST,
+            outcome="fail",
+            issues=["browser assertion failed"],
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+        )
+        route = route_completion(
+            test,
+            review_attempts_by_stage={},
+            config=self.config,
+            code_modifications=5,
+        )
+        self.assertIsNone(route.next_stage)
+        self.assertEqual(route.terminal_state, "completed_test_failed")
 
     def test_stale_code_gate_cancellation_restarts_test(self) -> None:
         metadata = completion(
