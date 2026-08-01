@@ -768,6 +768,94 @@ class ServiceRecoveryTests(unittest.TestCase):
 
         self.assertEqual(created, [(Stage.CODE_REVIEW, None)])
 
+    def test_reconcile_implement_pass_keeps_mr_draft_and_creates_test(
+        self,
+    ) -> None:
+        card = CardRecord(
+            run=self.run,
+            stage=Stage.IMPLEMENT,
+            iteration=2,
+            idempotency_key=f"{self.run.run_key}:implement:2:normal:work",
+            parent_card_id="t_code_review",
+            assignee="coder",
+            skills=["hollysys-implement", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha=self.run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
+        )
+        metadata = completion(
+            self.root,
+            Stage.IMPLEMENT,
+            iteration=2,
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            head_sha="d" * 40,
+            kanban_card_id="t_implement_2",
+        )
+        task = task_record(
+            task_id="t_implement_2",
+            body=render_card_body(card),
+            status="done",
+            assignee=card.assignee,
+            idempotency_key=card.idempotency_key,
+            tenant=self.run.run_key,
+            skills=card.skills,
+            parents=[card.parent_card_id],
+            latest_metadata=metadata.model_dump(mode="json"),
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=Stage.IMPLEMENT.value,
+            iteration=2,
+            idempotency_key=card.idempotency_key,
+            parent_card_id=card.parent_card_id,
+            purpose="work",
+            created_at=1,
+        )
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service._run_protocol_version = lambda _: "hollysys-controller/v4"
+        service._history = lambda _: ([HistoryItem(managed, task)], self.run)
+        service.gitlab = type(
+            "DraftDelivery",
+            (),
+            {
+                "delivery_mr": staticmethod(
+                    lambda run, mr_iid=None: {
+                        "iid": 2,
+                        "sha": "d" * 40,
+                        "draft": True,
+                    }
+                ),
+                "validate_repository_evidence": staticmethod(
+                    lambda run, current: None
+                ),
+                "validate_author_completion": staticmethod(
+                    lambda run, current: {"iid": 2, "sha": "d" * 40}
+                ),
+                "mark_delivery_ready": staticmethod(
+                    lambda run, binding: (_ for _ in ()).throw(
+                        AssertionError("IMPLEMENT pass changed Draft state")
+                    )
+                ),
+            },
+        )()
+        attach_test_store(service, self.root, self.run, delivery=True)
+        service._frozen_violation = lambda run, history, ref: None
+        service._review_attempts_by_stage = lambda history: {}
+        service._code_modification_count = lambda history: 1
+        service._enqueue_agent_completed = lambda *args, **kwargs: None
+        created: list[Stage] = []
+        service._create_work = (
+            lambda run, stage, parent, **kwargs: created.append(stage)
+        )
+
+        service.reconcile_run(self.run.run_key)
+
+        self.assertEqual(created, [Stage.TEST])
+
     def test_reconcile_code_review_aggregates_both_gate_findings(self) -> None:
         test_card = CardRecord(
             run=self.run,
@@ -1268,8 +1356,146 @@ class ServiceRecoveryTests(unittest.TestCase):
             parent = card_id
 
         service = object.__new__(ControllerService)
-        service._validate_completion_context = lambda *args: None
+        service.store = type(
+            "AcceptedRuntimeStore",
+            (),
+            {
+                "card_runtime": staticmethod(
+                    lambda board, card_id: {
+                        "attempt_status": "completed_accepted"
+                    }
+                )
+            },
+        )()
+        service._validate_completion_identity = lambda *args: None
+        service._validate_completion_context = staticmethod(
+            lambda *args: (_ for _ in ()).throw(
+                AssertionError("historical count performed live validation")
+            )
+        )
         self.assertEqual(service._code_modification_count(history), 5)
+
+    def test_code_modification_count_excludes_rejected_completion(self) -> None:
+        history: list[HistoryItem] = []
+        parent = "t_root"
+        for iteration in range(1, 4):
+            card_id = f"t_implement_{iteration}"
+            card = CardRecord(
+                run=self.run,
+                stage=Stage.IMPLEMENT,
+                iteration=iteration,
+                idempotency_key=(
+                    f"{self.run.run_key}:implement:{iteration}:normal:work"
+                ),
+                parent_card_id=parent,
+                assignee="coder",
+                skills=["hollysys-implement", "glab"],
+                context_digest="e" * 64,
+                expected_head_sha=self.run.workspace.repository_base_sha,
+                scratch_dir="/opt/data/scratch/test-attempt",
+            )
+            metadata = completion(
+                self.root,
+                Stage.IMPLEMENT,
+                iteration=iteration,
+                kanban_card_id=card_id,
+            )
+            task = task_record(
+                task_id=card_id,
+                body=render_card_body(card),
+                status="done",
+                assignee=card.assignee,
+                idempotency_key=card.idempotency_key,
+                tenant=self.run.run_key,
+                skills=card.skills,
+                parents=[parent],
+                latest_metadata=metadata.model_dump(mode="json"),
+            )
+            managed = ManagedCard(
+                board=self.run.workspace.board,
+                card_id=card_id,
+                run_key=self.run.run_key,
+                stage=Stage.IMPLEMENT.value,
+                iteration=iteration,
+                idempotency_key=card.idempotency_key,
+                parent_card_id=parent,
+                purpose="work",
+                created_at=iteration,
+            )
+            history.append(HistoryItem(managed, task))
+            parent = card_id
+
+        service = object.__new__(ControllerService)
+        service.store = type(
+            "MixedRuntimeStore",
+            (),
+            {
+                "card_runtime": staticmethod(
+                    lambda board, card_id: {
+                        "attempt_status": (
+                            "completed_rejected"
+                            if card_id == "t_implement_2"
+                            else "completed_accepted"
+                        )
+                    }
+                )
+            },
+        )()
+        service._validate_completion_identity = lambda *args: None
+
+        self.assertEqual(service._code_modification_count(history), 1)
+
+    def test_delivery_ready_operation_is_bound_to_checked_head(self) -> None:
+        service = object.__new__(ControllerService)
+        service._run_control = lambda run_key: {"state_version": 7}
+        calls: list[dict] = []
+
+        def operation(key, kind, payload, action, **kwargs):
+            calls.append(
+                {
+                    "key": key,
+                    "kind": kind,
+                    "payload": payload,
+                    **kwargs,
+                }
+            )
+            return {"draft": False}
+
+        service._operation = operation
+        service.gitlab = type(
+            "ReadyGitLab",
+            (),
+            {"mark_delivery_ready": staticmethod(lambda run, binding: {})},
+        )()
+        binding = DeliveryBinding(
+            mr_iid=2,
+            mr_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            creator="controller-bot",
+            created_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+            initial_head_sha="a" * 40,
+            claim_note_id=99,
+        )
+        head = "d" * 40
+
+        service._mark_delivery_ready_at_head(self.run, binding, head)
+
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "key": f"{self.run.run_key}:delivery-ready:{head}",
+                    "kind": "delivery-ready",
+                    "payload": {
+                        "run_key": self.run.run_key,
+                        "mr_iid": 2,
+                        "checked_head": head,
+                    },
+                    "run_key": self.run.run_key,
+                    "expected_state_version": 7,
+                    "expected_head_sha": head,
+                }
+            ],
+        )
 
     def test_completion_repository_evidence_must_match_run_base(self) -> None:
         card = CardRecord(
