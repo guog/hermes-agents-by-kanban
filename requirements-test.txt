@@ -2,5 +2,5 @@ pydantic==2.13.4
 PyYAML==6.0.3
 jsonschema==4.23.0
 ruff==0.16.0
-pytest==8.4.2
+pytest==9.0.3
 pytest-subtests==0.15.0
