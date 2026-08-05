@@ -539,7 +539,9 @@ class KanbanCLI:
             "--initial-status",
             "blocked",
             "--max-retries",
-            str(self.config.worker_redispatch_limit),
+            # Hermes counts the initial failure in max_retries; Controller
+            # configuration counts only redispatches after that first attempt.
+            str(self.config.worker_redispatch_limit + 1),
         ]
         for skill in card.skills:
             args.extend(["--skill", skill])

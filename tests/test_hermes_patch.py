@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from hollysys_controller.kanban import render_card_body
 
 
 class HermesPatchTests(unittest.TestCase):
@@ -592,6 +599,8 @@ class HermesPatchTests(unittest.TestCase):
         self.assertIn('"worker_exited"', patched)
         self.assertIn("_register_worker_attempt", patched)
         self.assertEqual(patched.count("_register_worker_attempt("), 3)
+        self.assertIn("_log.warning", patched)
+        self.assertNotIn("            logger.warning", patched)
 
     def test_controller_worker_receives_validated_attempt_scratch(self) -> None:
         source = (
@@ -599,12 +608,66 @@ class HermesPatchTests(unittest.TestCase):
             '        env["HERMES_TENANT"] = task.tenant\n'
             '    env["HERMES_KANBAN_TASK"] = task.id\n'
         )
-
         patched = self.patch.patch_worker_run_scratch(source)
+        namespace = {"json": json, "os": os}
+        exec(  # noqa: S102 - execute the generated runtime patch in isolation
+            "def build_env(task, env):\n" + patched + "    return env\n",
+            namespace,
+        )
 
-        self.assertIn('task.created_by == "hollysys-controller"', patched)
-        self.assertIn("os.path.commonpath", patched)
-        self.assertIn('env["HERMES_RUN_SCRATCH_DIR"]', patched)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scratch_root = root / "scratch"
+            scratch = scratch_root / "attempt"
+            scratch.mkdir(parents=True)
+            card = SimpleNamespace(
+                stage="spec-write",
+                mode="create",
+                iteration=1,
+                model_dump=lambda **kwargs: {"scratch_dir": str(scratch)},
+            )
+            task = SimpleNamespace(
+                tenant="run",
+                created_by="hollysys-controller",
+                body=render_card_body(card),
+                id="t_work",
+            )
+            with patch.dict(
+                os.environ,
+                {"HERMES_SCRATCH_DIR": str(scratch_root)},
+            ):
+                env = namespace["build_env"](task, {})
+
+        self.assertEqual(
+            env["HERMES_RUN_SCRATCH_DIR"],
+            os.path.realpath(scratch),
+        )
+        self.assertEqual(env["HERMES_KANBAN_TASK"], "t_work")
+
+    def test_controller_worker_rejects_malformed_attempt_scratch_contract(self) -> None:
+        source = (
+            "    if task.tenant:\n"
+            '        env["HERMES_TENANT"] = task.tenant\n'
+            '    env["HERMES_KANBAN_TASK"] = task.id\n'
+        )
+        patched = self.patch.patch_worker_run_scratch(source)
+        namespace = {"json": json, "os": os}
+        exec(  # noqa: S102 - execute the generated runtime patch in isolation
+            "def build_env(task, env):\n" + patched + "    return env\n",
+            namespace,
+        )
+        task = SimpleNamespace(
+            tenant="run",
+            created_by="hollysys-controller",
+            body="not a controller card",
+            id="t_bad",
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "controller task t_bad has no safe run scratch",
+        ):
+            namespace["build_env"](task, {})
 
     def test_named_profile_prompt_uses_active_and_default_roots(self) -> None:
         source = (

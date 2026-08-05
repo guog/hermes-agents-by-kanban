@@ -122,6 +122,65 @@ class KanbanReaderTests(unittest.TestCase):
         self.assertEqual(parse_run_body(render_run_body(run)), run)
         self.assertEqual(parse_card_body(render_card_body(card)), card)
 
+    def test_work_card_budget_counts_initial_attempt_plus_redispatches(self) -> None:
+        run = run_record(self.root)
+        card = CardRecord(
+            run=run,
+            stage=Stage.SPEC_WRITE,
+            iteration=1,
+            idempotency_key=f"{run.run_key}:spec-write:1:work",
+            parent_card_id="t_root",
+            assignee="spec-writer",
+            skills=["hollysys-write-spec"],
+            context_digest="e" * 64,
+            expected_head_sha=run.workspace.repository_base_sha,
+            scratch_dir="/opt/data/scratch/test-attempt",
+        )
+        created = TaskRecord(
+            id="t_work",
+            title="work",
+            body=render_card_body(card),
+            assignee="spec-writer",
+            status="blocked",
+            created_by="hollysys-controller",
+            created_at=1,
+            completed_at=None,
+            idempotency_key=card.idempotency_key,
+            tenant=run.run_key,
+            workspace_path=run.workspace.worktree,
+            branch_name=None,
+            skills=card.skills,
+            current_run_id=None,
+            latest_summary=None,
+            latest_metadata=None,
+            latest_outcome=None,
+            parents=["t_root"],
+            comments=[],
+            event_kinds=[],
+        )
+        reader = type(
+            "CreateReader",
+            (),
+            {
+                "task_by_idempotency": staticmethod(
+                    lambda board, key: None
+                ),
+                "task": staticmethod(lambda board, task_id: created),
+            },
+        )()
+        cli = KanbanCLI(config(self.root), reader)
+        completed = subprocess.CompletedProcess([], 0, '{"id":"t_work"}', "")
+
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            return_value=completed,
+        ) as run_command:
+            cli.create_work(card)
+
+        command = run_command.call_args.args[0]
+        retry_index = command.index("--max-retries")
+        self.assertEqual(command[retry_index + 1], "3")
+
     def test_prepares_triage_for_completion_with_hermes_transitions(self) -> None:
         states = iter(["triage", "todo", "ready"])
 
