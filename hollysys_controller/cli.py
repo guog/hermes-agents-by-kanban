@@ -104,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also verify isolated Profile API and repository access",
     )
+    preflight.add_argument(
+        "--require-supervisor",
+        action="store_true",
+        help="require the Hermes Worker Supervisor protocol to be ready",
+    )
     health = sub.add_parser("health")
     health.add_argument(
         "--probe",
@@ -148,6 +153,8 @@ def params_for(args: argparse.Namespace) -> tuple[str, dict]:
                 f"description file does not exist: {description_path}"
             )
         values["description"] = description_path.read_text(encoding="utf-8")
+    elif method == "preflight" and not values.get("require_supervisor"):
+        values.pop("require_supervisor", None)
     return method, {key: value for key, value in values.items() if value is not None}
 
 

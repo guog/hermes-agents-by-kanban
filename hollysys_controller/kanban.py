@@ -67,6 +67,7 @@ class TaskRecord:
     parents: list[str]
     comments: list[dict]
     event_kinds: list[str]
+    worker_pid: int | None = None
 
 
 def render_run_body(run: RunRecord) -> str:
@@ -323,6 +324,11 @@ class KanbanReader:
             parents=parents,
             comments=comments,
             event_kinds=event_kinds,
+            worker_pid=(
+                int(task["worker_pid"])
+                if "worker_pid" in keys and task["worker_pid"] is not None
+                else None
+            ),
         )
 
     def task_by_idempotency(self, board: str, key: str) -> TaskRecord | None:
@@ -555,41 +561,100 @@ class KanbanCLI:
         if released is None or released.status not in {"ready", "running", "todo"}:
             raise RuntimeError(f"card {task_id} did not leave controller hold")
 
-    def abort_task(self, board: str, task_id: str, reason: str) -> None:
-        """Stop an active worker through Hermes, then archive its task.
-
-        ``reclaim`` performs the host-local claim/PID validation and sends
-        SIGTERM followed by SIGKILL when needed.  Archiving preserves the task,
-        run, comments, log pointers, and worktree while preventing redispatch.
-        """
+    def abort_task(
+        self,
+        board: str,
+        task_id: str,
+        reason: str,
+        *,
+        expected_run_id: int | None = None,
+        expected_worker_pid: int | None = None,
+    ) -> None:
+        """CAS-reclaim a Supervisor-confirmed attempt, then archive it."""
         task = self.reader.task(board, task_id)
         if task is None or task.status == "archived":
             return
         if task.status == "running":
+            if expected_run_id is None or expected_worker_pid is None:
+                raise ValueError("running_task_requires_supervisor_evidence")
+            if (
+                task.current_run_id != expected_run_id
+                or task.worker_pid != expected_worker_pid
+            ):
+                raise ValueError("stale_attempt")
             self._run(
-                ["reclaim", task_id, "--reason", reason[:500]],
+                [
+                    "reclaim",
+                    task_id,
+                    "--reason",
+                    reason[:500],
+                    "--expected-run-id",
+                    str(expected_run_id),
+                    "--expected-worker-pid",
+                    str(expected_worker_pid),
+                    "--archive",
+                ],
                 board=board,
             )
         task = self.reader.task(board, task_id)
+        if task is not None and task.status == "running":
+            raise ValueError("stale_attempt")
         if task is not None and task.status != "archived":
-            self._run(["archive", task_id], board=board)
+            self._run(
+                ["archive", "--expected-unclaimed", task_id],
+                board=board,
+            )
+            archived = self.reader.task(board, task_id)
+            if archived is not None and archived.status != "archived":
+                raise ValueError("stale_attempt")
+
+    def archive_controller_task(self, board: str, task_id: str) -> None:
+        """Archive a Controller-owned card that has no Worker process."""
+        task = self.reader.task(board, task_id)
+        if task is None or task.status == "archived":
+            return
+        if task.status == "running" and task.worker_pid is not None:
+            raise ValueError("running_task_requires_supervisor_evidence")
+        self._run(
+            ["archive", "--expected-unclaimed", task_id],
+            board=board,
+        )
 
     def redispatch_stale_worker(
         self,
         board: str,
         task_id: str,
         reason: str,
+        *,
+        expected_run_id: int,
+        expected_worker_pid: int,
     ) -> TaskRecord:
         """Ask Hermes to reclaim a confirmed-dead attempt without archiving it."""
         task = self.reader.task(board, task_id)
         if task is None:
             raise ValueError(f"unknown task {task_id}")
         if task.status == "running":
+            if (
+                task.current_run_id != expected_run_id
+                or task.worker_pid != expected_worker_pid
+            ):
+                raise ValueError("stale_attempt")
             self._run(
-                ["reclaim", task_id, "--reason", reason[:500]],
+                [
+                    "reclaim",
+                    task_id,
+                    "--reason",
+                    reason[:500],
+                    "--expected-run-id",
+                    str(expected_run_id),
+                    "--expected-worker-pid",
+                    str(expected_worker_pid),
+                ],
                 board=board,
             )
         refreshed = self.reader.task(board, task_id)
+        if refreshed is not None and refreshed.status == "running":
+            raise ValueError("stale_attempt")
         if refreshed is None:
             raise RuntimeError(f"reclaimed task {task_id} disappeared")
         if refreshed.status == "blocked":

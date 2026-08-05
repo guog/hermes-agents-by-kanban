@@ -71,9 +71,14 @@ COPY cli /opt/cli
 COPY container/git /opt/fleet/container/git
 COPY container/install-git-wrapper.sh /opt/fleet/container/install-git-wrapper.sh
 COPY container/sync-lark-config.py /opt/fleet/container/sync-lark-config.py
+COPY container/services.d/hollysys-worker-supervisor \
+    /etc/services.d/hollysys-worker-supervisor
 RUN chmod -R a+rX /opt/hollysys-controller-src \
     && chmod 0555 /usr/local/bin/hollysysctl \
     && chmod 0555 /opt/fleet/container/sync-lark-config.py \
+    && chmod 0555 \
+        /etc/services.d/hollysys-worker-supervisor/run \
+        /etc/services.d/hollysys-worker-supervisor/finish \
     && sh /opt/fleet/container/install-git-wrapper.sh \
     && /opt/hermes/.venv/bin/python -m py_compile \
         /opt/hollysys-controller-src/hollysys_controller/*.py \

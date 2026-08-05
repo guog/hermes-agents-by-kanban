@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ from hollysys_controller.models import (
 )
 from hollysys_controller.service import ControllerService, HistoryItem
 from hollysys_controller.store import ControllerStore, ManagedCard
+from hollysys_controller.worker_recovery import SupervisorObservation
 from tests.helpers import completion, config, run_record
 
 
@@ -85,6 +87,8 @@ def task_record(
     latest_outcome: str | None = None,
     event_kinds: list[str] | None = None,
     latest_metadata: dict | None = None,
+    current_run_id: int | None = None,
+    worker_pid: int | None = None,
 ) -> TaskRecord:
     return TaskRecord(
         id=task_id,
@@ -100,13 +104,14 @@ def task_record(
         workspace_path=None,
         branch_name=None,
         skills=skills or [],
-        current_run_id=None,
+        current_run_id=current_run_id,
         latest_summary=None,
         latest_metadata=latest_metadata,
         latest_outcome=latest_outcome,
         parents=parents or [],
         comments=comments or [],
         event_kinds=event_kinds or [],
+        worker_pid=worker_pid,
     )
 
 
@@ -323,7 +328,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(result["stage"], "run-initialization")
         self.assertIsNone(result["active_card"])
 
-    def test_exception_reclaims_an_already_running_parent(self) -> None:
+    def test_exception_does_not_reclaim_running_parent_without_supervisor(self) -> None:
         reason = "unauthorized state transition"
         suffix = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:12]
         key = f"{self.run.run_key}:exception:{suffix}:work"
@@ -371,16 +376,13 @@ class ServiceRecoveryTests(unittest.TestCase):
             },
         )()
 
-        result = service._exception(self.run, parent.id, reason)
+        with self.assertRaisesRegex(RunPolicyError, "worker_recovery_pending"):
+            service._exception(self.run, parent.id, reason)
 
-        self.assertEqual(result.id, exception.id)
-        self.assertEqual(
-            calls,
-            [("abort", parent.id), ("create", parent.id)],
-        )
+        self.assertEqual(calls, [])
         self.assertEqual(
             service.store.run_control(self.run.run_key)["state"],
-            "exception",
+            "active",
         )
 
     def test_resolve_reuses_retry_created_before_request_commit(self) -> None:
@@ -1758,6 +1760,11 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         history = [test_item, review_item, exception_item]
         service._history = lambda run_key: (history, self.run)
+        service.reader = type(
+            "LegacyReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: exception_item.task)},
+        )()
         service._code_modification_count = lambda current: 5
         calls: list[tuple[str, str]] = []
         service.kanban = type(
@@ -2654,6 +2661,8 @@ class ServiceRecoveryTests(unittest.TestCase):
             tenant=self.run.run_key,
             skills=card.skills,
             parents=[card.parent_card_id],
+            current_run_id=4,
+            worker_pid=404,
         )
         managed = ManagedCard(
             board=self.run.workspace.board,
@@ -2672,12 +2681,28 @@ class ServiceRecoveryTests(unittest.TestCase):
         service.config = config(self.root)
         service.store = ControllerStore(self.root / "abort-controller.db")
         service._history = lambda _: ([HistoryItem(managed, task)], self.run)
+        service.reader = type(
+            "AbortReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: task)},
+        )()
+        service.worker_recovery = type(
+            "ConfirmedExitRecovery",
+            (),
+            {
+                "observe": staticmethod(
+                    lambda identity, terminate_running: SupervisorObservation(
+                        "terminated", 10, identity.worker_pid
+                    )
+                )
+            },
+        )()
         service.kanban = type(
             "AbortKanban",
             (),
             {
                 "abort_task": staticmethod(
-                    lambda board, task_id, reason: calls.append(
+                    lambda board, task_id, reason, **kwargs: calls.append(
                         ("abort-task", board, task_id)
                     )
                 )
@@ -2696,6 +2721,35 @@ class ServiceRecoveryTests(unittest.TestCase):
             },
         )()
         attach_test_store(service, self.root, self.run, delivery=True)
+        service.store.add_managed_card(
+            board=managed.board,
+            card_id=managed.card_id,
+            run_key=managed.run_key,
+            stage=managed.stage,
+            iteration=managed.iteration,
+            idempotency_key=managed.idempotency_key,
+            parent_card_id=managed.parent_card_id,
+            purpose=managed.purpose,
+            created_at=managed.created_at,
+        )
+        service.store.register_card_attempt(
+            board=managed.board,
+            card_id=managed.card_id,
+            profile="coder",
+            dispatch_key=managed.idempotency_key,
+            worktree=self.run.workspace.worktree,
+            branch=self.run.workspace.branch,
+        )
+        service.store.record_card_runtime_event(
+            board=managed.board,
+            card_id=managed.card_id,
+            kind="worker_started",
+            created_at=1,
+            worker_session_id="kanban-run:4",
+            worker_pid=404,
+            lease_seconds=300,
+            run_id=f"{managed.board}:4",
+        )
         service.flush_outbox = lambda: calls.append(("flush",))
         service.last_reconcile_error = None
 
@@ -2863,6 +2917,11 @@ class ServiceRecoveryTests(unittest.TestCase):
         service.store.ensure_run_control(self.run.run_key)
         service.store.set_run_exception(self.run.run_key, "pipeline skipped")
         service._history = lambda _: ([HistoryItem(managed, exception)], self.run)
+        service.reader = type(
+            "RecoveryReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: exception)},
+        )()
         calls: list[tuple] = []
         service.kanban = type(
             "RecoveryKanban",
@@ -2966,6 +3025,156 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["event"], "controller-failure")
 
+    def _watchdog_threshold_fixture(
+        self,
+        name: str,
+        *,
+        started_at: int,
+    ) -> tuple[ControllerService, TaskRecord, ManagedCard]:
+        task = task_record(
+            task_id=f"t_{name}",
+            body="worker body",
+            status="running",
+            assignee="coder",
+            idempotency_key=name,
+            tenant=self.run.run_key,
+            current_run_id=4,
+            worker_pid=404,
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=Stage.IMPLEMENT.value,
+            iteration=1,
+            idempotency_key=name,
+            parent_card_id="t_parent",
+            purpose="work",
+            created_at=started_at,
+        )
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / f"{name}.db")
+        service.store.save_run(self.run)
+        service.store.ensure_run_control(self.run.run_key)
+        service.store.add_managed_card(
+            board=managed.board,
+            card_id=managed.card_id,
+            run_key=managed.run_key,
+            stage=managed.stage,
+            iteration=managed.iteration,
+            idempotency_key=managed.idempotency_key,
+            parent_card_id=managed.parent_card_id,
+            purpose=managed.purpose,
+            created_at=managed.created_at,
+        )
+        service.store.register_card_attempt(
+            board=managed.board,
+            card_id=managed.card_id,
+            profile="coder",
+            dispatch_key=managed.idempotency_key,
+            worktree=self.run.workspace.worktree,
+            branch=self.run.workspace.branch,
+        )
+        service.store.record_card_runtime_event(
+            board=managed.board,
+            card_id=managed.card_id,
+            kind="worker_started",
+            created_at=started_at,
+            worker_session_id="kanban-run:4",
+            worker_pid=404,
+            lease_seconds=service.config.worker_progress_lease_seconds,
+            run_id=f"{managed.board}:4",
+        )
+        service.reader = type(
+            "ThresholdReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: task)},
+        )()
+        service._history = lambda _: ([HistoryItem(managed, task)], self.run)
+        return service, task, managed
+
+    def test_watchdog_never_probes_when_heartbeat_is_fresh(self) -> None:
+        now = int(time.time())
+        service, task, managed = self._watchdog_threshold_fixture(
+            "fresh_heartbeat",
+            started_at=now - 1900,
+        )
+        service.store.record_card_runtime_event(
+            board=managed.board,
+            card_id=managed.card_id,
+            kind="heartbeat",
+            created_at=now,
+            worker_session_id="kanban-run:4",
+            worker_pid=404,
+            lease_seconds=service.config.worker_progress_lease_seconds,
+            run_id=f"{managed.board}:4",
+        )
+        service.worker_recovery = type(
+            "ForbiddenRecovery",
+            (),
+            {
+                "observe": staticmethod(
+                    lambda identity, terminate_running: (_ for _ in ()).throw(
+                        AssertionError("fresh heartbeat must not probe")
+                    )
+                )
+            },
+        )()
+
+        service._enqueue_stale_worker_notices()
+
+        runtime = service.store.card_runtime(managed.board, task.id)
+        self.assertEqual(runtime["attempt_status"], "running")
+        self.assertEqual(runtime["redispatch_count"], 0)
+        self.assertIn("stuck_alive", service.store.pending_outbox()[0]["payload"])
+
+    def test_stale_heartbeat_with_fresh_progress_only_probes(self) -> None:
+        now = int(time.time())
+        service, task, managed = self._watchdog_threshold_fixture(
+            "fresh_progress",
+            started_at=now - 400,
+        )
+        service.store.record_card_runtime_event(
+            board=managed.board,
+            card_id=managed.card_id,
+            kind="progress",
+            created_at=now,
+            worker_session_id="kanban-run:4",
+            worker_pid=404,
+            lease_seconds=service.config.worker_progress_lease_seconds,
+            run_id=f"{managed.board}:4",
+        )
+        calls: list[bool] = []
+        service.worker_recovery = type(
+            "ProbeOnlyRecovery",
+            (),
+            {
+                "observe": staticmethod(
+                    lambda identity, terminate_running: (
+                        calls.append(terminate_running)
+                        or SupervisorObservation(
+                            "running",
+                            now,
+                            identity.worker_pid,
+                            process_count=1,
+                        )
+                    )
+                )
+            },
+        )()
+
+        service._enqueue_stale_worker_notices()
+
+        self.assertEqual(calls, [False])
+        runtime = service.store.card_runtime(managed.board, task.id)
+        self.assertEqual(runtime["attempt_status"], "running")
+        self.assertEqual(runtime["redispatch_count"], 0)
+        self.assertIn(
+            "liveness_unconfirmed",
+            service.store.pending_outbox()[0]["payload"],
+        )
+
     def test_watchdog_redispatches_only_after_confirmed_exit_and_identity_checks(
         self,
     ) -> None:
@@ -2976,6 +3185,8 @@ class ServiceRecoveryTests(unittest.TestCase):
             assignee="coder",
             idempotency_key="stale-work",
             tenant=self.run.run_key,
+            current_run_id=4,
+            worker_pid=999_999,
         )
         managed = ManagedCard(
             board=self.run.workspace.board,
@@ -2991,6 +3202,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         service = object.__new__(ControllerService)
         service.config = config(self.root)
         service.store = ControllerStore(self.root / "watchdog-controller.db")
+        service.store.save_run(self.run)
         service.store.ensure_run_control(self.run.run_key)
         service.store.add_managed_card(
             board=managed.board,
@@ -3016,9 +3228,10 @@ class ServiceRecoveryTests(unittest.TestCase):
             card_id=managed.card_id,
             kind="worker_started",
             created_at=1,
-            worker_session_id="session-stale",
+            worker_session_id="kanban-run:4",
             worker_pid=999_999,
             lease_seconds=300,
+            run_id=f"{managed.board}:4",
         )
         service.reader = type(
             "WatchdogReader",
@@ -3052,11 +3265,23 @@ class ServiceRecoveryTests(unittest.TestCase):
             (),
             {
                 "redispatch_stale_worker": staticmethod(
-                    lambda board, task_id, reason: redispatched.append(task_id)
+                    lambda board, task_id, reason, **kwargs: redispatched.append(
+                        task_id
+                    )
                 )
             },
         )()
-        service._worker_process_state = lambda worker_pid: "exited"
+        service.worker_recovery = type(
+            "ConfirmedExitRecovery",
+            (),
+            {
+                "observe": staticmethod(
+                    lambda identity, terminate_running: SupervisorObservation(
+                        "terminated", 10, identity.worker_pid
+                    )
+                )
+            },
+        )()
 
         service._enqueue_stale_worker_notices()
 

@@ -113,8 +113,13 @@ class ControllerConfig(BaseModel):
     health_stale_seconds: int = Field(default=120, ge=10)
     event_lag_warning_threshold: int = Field(default=100, ge=1)
     outbox_warning_threshold: int = Field(default=20, ge=1)
-    worker_progress_lease_seconds: int = Field(default=14400, ge=300)
+    worker_slow_warning_seconds: int = Field(default=900, ge=300)
+    worker_progress_lease_seconds: int = Field(default=1800, ge=300)
+    worker_heartbeat_stale_seconds: int = Field(default=300, ge=60)
     worker_redispatch_limit: int = Field(default=2, ge=0, le=10)
+    worker_supervisor_socket: Path = Path(
+        "/run/hollysys-controller/worker-supervisor.sock"
+    )
     merge_wait_retry_seconds: int = Field(default=30, ge=5)
     merge_blocker_timeout_seconds: int = Field(default=3600, ge=60)
     merge_draft_grace_seconds: int = Field(default=600, ge=60)
@@ -207,6 +212,10 @@ class ControllerConfig(BaseModel):
             )
         if self.outbox_backoff_initial_seconds > self.outbox_backoff_max_seconds:
             raise ValueError("outbox initial backoff cannot exceed maximum")
+        if self.worker_slow_warning_seconds > self.worker_progress_lease_seconds:
+            raise ValueError("worker slow warning cannot exceed progress lease")
+        if self.worker_heartbeat_stale_seconds > self.worker_progress_lease_seconds:
+            raise ValueError("worker heartbeat threshold cannot exceed progress lease")
         return self
 
     @staticmethod
@@ -262,6 +271,12 @@ class ControllerConfig(BaseModel):
                     os.environ.get(
                         "HOLLYSYS_CONTROLLER_GITLAB_TOKEN_FILE",
                         "/run/secrets/hollysys_controller_gitlab_token",
+                    )
+                ),
+                "worker_supervisor_socket": Path(
+                    os.environ.get(
+                        "HOLLYSYS_WORKER_SUPERVISOR_SOCKET",
+                        "/run/hollysys-controller/worker-supervisor.sock",
                     )
                 ),
             }
@@ -343,6 +358,14 @@ class ControllerConfig(BaseModel):
             ),
             "HOLLYSYS_WORKER_PROGRESS_LEASE_SECONDS": (
                 "worker_progress_lease_seconds",
+                int,
+            ),
+            "HOLLYSYS_WORKER_SLOW_WARNING_SECONDS": (
+                "worker_slow_warning_seconds",
+                int,
+            ),
+            "HOLLYSYS_WORKER_HEARTBEAT_STALE_SECONDS": (
+                "worker_heartbeat_stale_seconds",
                 int,
             ),
             "HOLLYSYS_WORKER_REDISPATCH_LIMIT": (

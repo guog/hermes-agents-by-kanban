@@ -79,6 +79,16 @@ class ConfigTests(unittest.TestCase):
             defaults["start_request_sync_timeout_seconds"].default,
             10.0,
         )
+        self.assertEqual(defaults["worker_slow_warning_seconds"].default, 900)
+        self.assertEqual(
+            defaults["worker_progress_lease_seconds"].default,
+            1800,
+        )
+        self.assertEqual(
+            defaults["worker_heartbeat_stale_seconds"].default,
+            300,
+        )
+        self.assertEqual(defaults["worker_redispatch_limit"].default, 2)
 
     def test_gitlab_endpoint_rejects_unsafe_or_mistyped_origins(self) -> None:
         valid = normalize_gitlab_endpoint(

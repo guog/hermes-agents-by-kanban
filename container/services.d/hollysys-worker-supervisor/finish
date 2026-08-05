@@ -1,0 +1,8 @@
+#!/command/with-contenv sh
+set -eu
+
+exit_code=${1:-1}
+if [ "$exit_code" -ne 0 ]; then
+  sleep 5
+fi
+exit 0

@@ -7,6 +7,9 @@ agent:
   reasoning_effort: xhigh
   max_turns: 500
   api_max_retries: 10
+delegation:
+  max_concurrent_children: 3
+  max_summary_chars: 8192
 tool_output:
   max_bytes: 12000
   max_lines: 400

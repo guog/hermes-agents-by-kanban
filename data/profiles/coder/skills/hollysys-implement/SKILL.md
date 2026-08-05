@@ -18,10 +18,15 @@ version: 4.0.0
    code gate repair 必须同时处理同一 checked head 的 tester 与 code-reviewer findings。
 3. 添加必要代码和测试，执行离线依赖模式下与改动相称的格式化、静态、单元、
    集成/契约检查；缺关键工具时报告 `tool_unavailable`，不得声称通过。
-4. 约定式 commit/push 当前唯一分支，立即核对本地/远端 head。关键自主决策写入幂等
-   MR 评论；没有则不发布空评论。Controller 在接受首次 IMPLEMENT completion 后将
-   MR 标记 ready，Agent 不得操作 draft/ready。
-5. 用 `completion-template` 生成 completion v8，只补充实际
+4. 严格按冻结 TASKS 的 `execution_wave` 分波实施。每波最多并行委派 3 个路径不重叠
+   的 child；child 仅在分配范围内研究或修改文件，不得修改父卡片，不得 commit 或 push。
+   父 Agent 汇总后完成定向验证，并为该波创建本地 Conventional Commit。中间波次
+   不 push；全部波次通过完整门禁后只 push 一次并核对本地/远端 head。
+5. 每波在 Controller 指定的 run scratch 中写入 manifest，至少记录 wave/task、child
+   摘要 SHA-256、commit/tree SHA、验证命令及结果；manifest 和完整 child 证据权限
+   必须为 `0600`。关键自主决策写入幂等 MR 评论；没有则不发布空评论。Controller
+   在接受首次 IMPLEMENT completion 后将 MR 标记 ready，Agent 不得操作 draft/ready。
+6. 用 `completion-template` 生成 completion v8，只补充实际
    `repository_evidence`、验证、决策和
    风险，不改 source/run/context/head_before。通过 `validate-completion` 后调用
    `kanban_complete`，成功后立即结束。

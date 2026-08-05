@@ -77,6 +77,56 @@ class ComposeContractTests(unittest.TestCase):
         )
         self.assertEqual(healthcheck["test"][-2:], ["--probe", "liveness"])
 
+    def test_worker_supervisor_is_image_bundled_and_shares_private_socket(
+        self,
+    ) -> None:
+        controller = self.compose["services"]["controller"]
+        hermes = self.compose["services"]["hermes"]
+        socket_path = "/run/hollysys-controller/worker-supervisor.sock"
+        self.assertEqual(
+            controller["environment"]["HOLLYSYS_WORKER_SUPERVISOR_SOCKET"],
+            socket_path,
+        )
+        self.assertEqual(
+            hermes["environment"]["HOLLYSYS_WORKER_SUPERVISOR_SOCKET"],
+            socket_path,
+        )
+        service_mount = (
+            "./container/services.d/hollysys-worker-supervisor:"
+            "/etc/services.d/hollysys-worker-supervisor:ro"
+        )
+        self.assertIn(service_mount, hermes["volumes"])
+        run_path = (
+            self.root
+            / "container"
+            / "services.d"
+            / "hollysys-worker-supervisor"
+            / "run"
+        )
+        self.assertEqual(run_path.stat().st_mode & 0o777, 0o555)
+        run_script = run_path.read_text(encoding="utf-8")
+        self.assertIn("install -d", run_script)
+        self.assertIn("-m 0750", run_script)
+        self.assertIn("id -u hermes", run_script)
+        self.assertIn("s6-setuidgid hermes", run_script)
+        self.assertIn("hollysys_controller.worker_supervisor", run_script)
+        dockerfile = (self.root / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(
+            "COPY container/services.d/hollysys-worker-supervisor",
+            dockerfile,
+        )
+
+    def test_worker_supervisor_has_an_isolated_container_gate(self) -> None:
+        script_path = self.root / "scripts" / "test-worker-supervisor-containers.sh"
+        self.assertEqual(script_path.stat().st_mode & 0o777, 0o555)
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn("set -eu", script)
+        self.assertIn("trap cleanup EXIT HUP INT TERM", script)
+        self.assertIn("--user hermes", script)
+        self.assertIn("readlink /proc/1/ns/pid", script)
+        self.assertIn("client.probe(identity)", script)
+        self.assertIn("client.terminate(identity)", script)
+
     def test_derived_image_pins_base_and_toolchain(self) -> None:
         dockerfile = (self.root / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
@@ -225,6 +275,14 @@ class ComposeContractTests(unittest.TestCase):
                 )
                 self.assertEqual(config["agent"]["max_turns"], 500)
                 self.assertEqual(config["agent"]["api_max_retries"], 10)
+
+        coder = yaml.safe_load(
+            (self.root / "data/profiles/coder/config.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(coder["delegation"]["max_concurrent_children"], 3)
+        self.assertEqual(coder["delegation"]["max_summary_chars"], 8192)
 
     def test_image_uses_derived_v4_image_for_linux_amd64(self) -> None:
         service = self.compose["services"]["hermes"]

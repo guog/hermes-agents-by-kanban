@@ -89,6 +89,12 @@ from .models import (
 from .notifier import LarkNotifier
 from .store import TERMINAL_RUN_STATES, ControllerStore, ManagedCard
 from .validators import validate_task_documents
+from .worker_recovery import (
+    SupervisorObservation,
+    UnixWorkerSupervisorClient,
+    WorkerIdentity,
+    WorkerRecoveryCoordinator,
+)
 from .workflow import (
     DOCUMENT_REVIEW_FOR_PRODUCER,
     PHASE_FOR_STAGE,
@@ -160,6 +166,7 @@ class ControllerService:
         kanban: KanbanCLI | None = None,
         gitlab: GitLabClient | None = None,
         notifier: LarkNotifier | None = None,
+        worker_recovery: WorkerRecoveryCoordinator | None = None,
     ):
         self.config = config
         config.state_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +175,9 @@ class ControllerService:
         self.kanban = kanban or KanbanCLI(config, self.reader)
         self.gitlab = gitlab or GitLabClient(config)
         self.notifier = notifier or LarkNotifier(config)
+        self.worker_recovery = worker_recovery or WorkerRecoveryCoordinator(
+            UnixWorkerSupervisorClient(config.worker_supervisor_socket)
+        )
         # Kept for compatibility with integrations that inspect this member.
         # No network operation is performed while holding it.
         self._lock = threading.RLock()
@@ -944,6 +954,15 @@ class ControllerService:
                 if hasattr(self.store, "attempts_for_run")
                 else []
             ),
+            "overlapping_attempts": [
+                item
+                for item in store_health.get("overlapping_attempts", [])
+                if any(
+                    card.board == item.get("board")
+                    and card.card_id == item.get("card_id")
+                    for card in self.store.cards_for_run(run_key)
+                )
+            ],
             "delivery_binding": (
                 binding.model_dump(mode="json")
                 if binding is not None
@@ -1058,6 +1077,7 @@ class ControllerService:
             "merge_wait": None,
             "worker_runtime": [],
             "attempt_timeline": [],
+            "overlapping_attempts": [],
             "delivery_binding": None,
             "reconcile": {
                 "pending": False,
@@ -1087,9 +1107,16 @@ class ControllerService:
             },
         }
 
-    def preflight(self, *, deep: bool = False) -> dict:
+    def preflight(
+        self,
+        *,
+        deep: bool = False,
+        require_supervisor: bool = False,
+    ) -> dict:
         if self.config.controller_mode != "preflight":
             raise ValueError("preflight_requires_controller_preflight_mode")
+        if require_supervisor and not deep:
+            raise ValueError("supervisor_preflight_requires_deep_mode")
         checks: dict[str, dict] = {}
         for name, command in {
             "hermes": self.config.hermes_command,
@@ -1162,6 +1189,14 @@ class ControllerService:
             ),
             "path": str(self.config.offline_cache_command),
         }
+        if require_supervisor:
+            readiness = self.worker_recovery.readiness()
+            checks["worker_supervisor"] = {
+                "ok": readiness.ready,
+                "state": "ready" if readiness.ready else "unavailable",
+                "error_code": readiness.error_code,
+                "observed_at": readiness.observed_at,
+            }
         profile_credentials = summarize_profile_preflight(
             self.config,
             deep=deep,
@@ -1169,6 +1204,10 @@ class ControllerService:
         credential_contract_digest = str(
             profile_credentials.pop("_credential_contract_digest")
         )
+        if require_supervisor:
+            credential_contract_digest = (
+                "worker-supervisor-v1:" + credential_contract_digest
+            )
         checks["profile_credentials"] = profile_credentials
         for profile_result in profile_credentials["profiles"]:
             self.store.record_profile_preflight(profile_result, deep=deep)
@@ -1238,11 +1277,18 @@ class ControllerService:
             raise ControllerFatalError(
                 "active_mode_requires_successful_deep_preflight"
             )
+        accepted_digest = str(accepted["credential_contract_digest"])
+        supervisor_prefix = "worker-supervisor-v1:"
+        if not accepted_digest.startswith(supervisor_prefix):
+            raise ControllerFatalError(
+                "active_mode_requires_worker_supervisor_preflight"
+            )
         current = summarize_profile_preflight(self.config, deep=False)
         current_digest = str(current.pop("_credential_contract_digest"))
         if (
             not current["ok"]
-            or current_digest != accepted["credential_contract_digest"]
+            or current_digest
+            != accepted_digest.removeprefix(supervisor_prefix)
         ):
             raise ControllerFatalError(
                 "profile_contract_changed_after_deep_preflight"
@@ -2199,12 +2245,13 @@ class ControllerService:
                 if (
                     item.managed.purpose == "exception"
                     and item.task.status in ACTIVE_STATUSES
-                ):
-                    self.kanban.abort_task(
+                    and not self._abort_managed_task(
                         run.workspace.board,
                         item.task.id,
                         "exception recovery authorized: " + request.reason[:500],
                     )
+                ):
+                    raise RunPolicyError("worker_recovery_pending")
             recovered = self.store.transition_run(
                 request.run_key,
                 expected_states={"exception"},
@@ -2526,11 +2573,12 @@ class ControllerService:
                         "non-merge terminal outcome",
                         "hollysys-controller",
                     )
-                    self.kanban.abort_task(
+                    if not self._abort_managed_task(
                         run.workspace.board,
                         item.task.id,
                         "preserved legacy exception as completed_with_findings",
-                    )
+                    ):
+                        raise RunPolicyError("worker_recovery_pending")
             self.store.transition_run(
                 run_key,
                 expected_states={"exception"},
@@ -2793,12 +2841,13 @@ class ControllerService:
                         if kind in {"gave_up", "spawn_auto_blocked"}
                     )
                     self._assert_reconcile_mutable(run_key)
-                    self.kanban.abort_task(
+                    if not self._abort_managed_task(
                         run.workspace.board,
                         item.task.id,
                         "worker redispatch budget exhausted: "
                         f"{failure_kind}",
-                    )
+                    ):
+                        raise RunPolicyError("worker_recovery_pending")
                     self._exception(
                         run,
                         item.task.id,
@@ -3687,11 +3736,27 @@ class ControllerService:
                 item.managed.purpose in {"root", "work", "exception"}
                 and item.task.status in ACTIVE_STATUSES
             ):
-                self.kanban.abort_task(
+                stopped = self._abort_managed_task(
                     run.workspace.board,
                     item.task.id,
                     f"run aborted by human: {reason}",
                 )
+                if not stopped:
+                    self._enqueue_progress(
+                        run,
+                        f"abort:worker-termination-pending:{item.task.id}",
+                        self._render_notification(
+                            run,
+                            icon="⚠️",
+                            title="废止正在等待 Worker 安全退出",
+                            fields=[
+                                ("任务 ID", inline_code(run_key)),
+                                ("Card", inline_code(item.task.id)),
+                                ("状态", inline_code("aborting")),
+                            ],
+                        ),
+                    )
+                    return
         binding = self.store.delivery_binding(run_key)
         mr = self.gitlab.abort_delivery(
             run,
@@ -4085,6 +4150,8 @@ class ControllerService:
             return
         worker_session_id = None
         worker_pid = None
+        runtime_metrics: dict[str, float] | None = None
+        progress_summary: dict | None = None
         if isinstance(event.payload, dict):
             candidate = event.payload.get("worker_session_id")
             if isinstance(candidate, str) and candidate.strip():
@@ -4092,6 +4159,30 @@ class ControllerService:
             pid_candidate = event.payload.get("worker_pid", event.payload.get("pid"))
             if isinstance(pid_candidate, int) and pid_candidate > 0:
                 worker_pid = pid_candidate
+            if event.kind == "progress":
+                raw_metrics = event.payload.get("metrics")
+                if isinstance(raw_metrics, dict):
+                    runtime_metrics = {
+                        key: float(value)
+                        for key in (
+                            "model_wait",
+                            "tool_execution",
+                            "delegation_wait",
+                            "retry_wait",
+                        )
+                        if isinstance(
+                            (value := raw_metrics.get(key)),
+                            (int, float),
+                        )
+                        and value >= 0
+                    }
+                progress_summary = {
+                    "tool_categories": event.payload.get("tool_categories"),
+                    "tool_count": event.payload.get("tool_count", 0),
+                    "elapsed_seconds": event.payload.get(
+                        "elapsed_seconds", 0
+                    ),
+                }
         if worker_session_id is None and event.run_id is not None:
             # Hermes v2026.7.30 identifies attempts by task_events.run_id but
             # does not emit worker_session_id in claimed/heartbeat/terminal
@@ -4113,6 +4204,8 @@ class ControllerService:
                 worker_session_id=worker_session_id,
                 worker_pid=worker_pid,
                 lease_seconds=self.config.worker_progress_lease_seconds,
+                runtime_metrics=runtime_metrics,
+                progress_summary=progress_summary,
             )
         started = event.kind in {"claimed", "started", "worker_started"}
         interrupted = event.kind in {
@@ -4210,6 +4303,129 @@ class ControllerService:
                 ),
             )
 
+    @staticmethod
+    def _runtime_attempt_run_id(runtime: dict) -> int | None:
+        session = str(runtime.get("worker_session_id") or "")
+        if not session.startswith("kanban-run:"):
+            return None
+        try:
+            run_id = int(session.split(":", 1)[1])
+        except ValueError:
+            return None
+        return run_id if run_id > 0 else None
+
+    def _worker_identity(
+        self,
+        runtime: dict,
+        task: TaskRecord,
+    ) -> WorkerIdentity | None:
+        run_id = self._runtime_attempt_run_id(runtime)
+        worker_pid = runtime.get("worker_pid")
+        if (
+            run_id is None
+            or not isinstance(worker_pid, int)
+            or worker_pid <= 1
+            or task.current_run_id != run_id
+            or task.worker_pid != worker_pid
+        ):
+            return None
+        return WorkerIdentity(
+            board=str(runtime["board"]),
+            card_id=str(runtime["card_id"]),
+            run_id=run_id,
+            worker_pid=worker_pid,
+        )
+
+    def _observe_worker(
+        self,
+        identity: WorkerIdentity,
+        *,
+        terminate_running: bool,
+    ) -> SupervisorObservation:
+        started = time.monotonic()
+        observation = self.worker_recovery.observe(
+            identity,
+            terminate_running=terminate_running,
+        )
+        attempt = self.store.current_attempt(identity.board, identity.card_id)
+        expected_attempt_run_id = f"{identity.board}:{identity.run_id}"
+        if (
+            attempt is not None
+            and str(attempt.get("run_id")) == expected_attempt_run_id
+        ):
+            self.store.record_supervisor_observation(
+                expected_attempt_run_id,
+                state=observation.state,
+                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                observed_at=observation.observed_at,
+                error_code=observation.error_code,
+            )
+        return observation
+
+    def _record_reclaimed_attempt(
+        self,
+        identity: WorkerIdentity,
+        *,
+        created_at: int | None = None,
+    ) -> None:
+        self.store.record_card_runtime_event(
+            board=identity.board,
+            card_id=identity.card_id,
+            kind="reclaimed",
+            created_at=created_at or int(time.time()),
+            run_id=f"{identity.board}:{identity.run_id}",
+            worker_session_id=f"kanban-run:{identity.run_id}",
+            worker_pid=identity.worker_pid,
+            lease_seconds=self.config.worker_progress_lease_seconds,
+        )
+
+    def _abort_managed_task(
+        self,
+        board: str,
+        card_id: str,
+        reason: str,
+    ) -> bool:
+        task = self.reader.task(board, card_id)
+        if task is None or task.status == "archived":
+            return True
+        if task.status != "running":
+            self.kanban.abort_task(board, card_id, reason)
+            return True
+        managed = self.store.managed_card(board, card_id)
+        if (
+            managed is not None
+            and managed.purpose == "root"
+            and task.worker_pid is None
+        ):
+            self.kanban.archive_controller_task(board, card_id)
+            return True
+        runtime = self.store.card_runtime(board, card_id)
+        identity = (
+            self._worker_identity(runtime, task) if runtime is not None else None
+        )
+        if identity is None:
+            return False
+        observation = self._observe_worker(identity, terminate_running=True)
+        if not observation.exit_confirmed:
+            return False
+        current_task = self.reader.task(board, card_id)
+        current_runtime = self.store.card_runtime(board, card_id)
+        if (
+            current_task is None
+            or current_runtime is None
+            or self._worker_identity(current_runtime, current_task) != identity
+        ):
+            return False
+        self.kanban.abort_task(
+            board,
+            card_id,
+            reason,
+            expected_run_id=identity.run_id,
+            expected_worker_pid=identity.worker_pid,
+        )
+        self._record_reclaimed_attempt(identity)
+        return True
+
     def _enqueue_stale_worker_notices(self) -> None:
         if not hasattr(self.store, "runtime_for_run"):
             return
@@ -4219,9 +4435,20 @@ class ControllerService:
             if control and control["state"] != "active":
                 continue
             for runtime in self.store.runtime_for_run(run_key):
-                deadline = runtime.get("deadline_at")
-                if deadline is None or int(deadline) >= now:
+                started_at = runtime.get("worker_started_at")
+                if started_at is None or runtime.get("finished_at") is not None:
                     continue
+                heartbeat_at = runtime.get("last_heartbeat_at") or started_at
+                progress_at = runtime.get("last_progress_event_at") or started_at
+                heartbeat_age = max(0, now - int(heartbeat_at))
+                progress_age = max(0, now - int(progress_at))
+                if (
+                    progress_age < self.config.worker_slow_warning_seconds
+                    and heartbeat_age
+                    <= self.config.worker_heartbeat_stale_seconds
+                ):
+                    continue
+                deadline = int(progress_at) + self.config.worker_progress_lease_seconds
                 try:
                     task = self.reader.task(
                         str(runtime["board"]),
@@ -4250,28 +4477,55 @@ class ControllerService:
                     Stage(str(runtime["stage"])),
                     accepted_completion=False,
                 )
-                process_state = self._worker_process_state(runtime.get("worker_pid"))
-                if process_state == "running":
-                    self.store.update_worker_watchdog(
-                        board=str(runtime["board"]),
-                        card_id=str(runtime["card_id"]),
-                        attempt_status="running_verified",
-                        lease_seconds=self.config.worker_progress_lease_seconds,
-                    )
-                    continue
-                if process_state != "exited":
+                identity = self._worker_identity(runtime, task)
+                if identity is None:
                     self._enqueue_worker_lease_notice(
                         run,
                         runtime,
                         deadline,
-                        "evidence_insufficient",
-                        "worker PID/session evidence is incomplete or inaccessible",
+                        "identity_mismatch",
+                        "worker run/session/PID evidence does not match",
+                        document_round=document_round,
+                    )
+                    continue
+                if heartbeat_age <= self.config.worker_heartbeat_stale_seconds:
+                    state = (
+                        "stuck_alive"
+                        if progress_age >= self.config.worker_progress_lease_seconds
+                        else "slow_alive"
+                    )
+                    self._enqueue_worker_lease_notice(
+                        run,
+                        runtime,
+                        deadline,
+                        state,
+                        (
+                            "worker heartbeat is fresh; continue observing "
+                            "without Supervisor probe or recovery"
+                        ),
+                        document_round=document_round,
+                    )
+                    continue
+                if progress_age < self.config.worker_progress_lease_seconds:
+                    observation = self._observe_worker(
+                        identity,
+                        terminate_running=False,
+                    )
+                    self._enqueue_worker_lease_notice(
+                        run,
+                        runtime,
+                        deadline,
+                        "liveness_unconfirmed",
+                        (
+                            "worker heartbeat is stale but progress remains "
+                            "inside the recovery lease; "
+                            f"supervisor={observation.state}"
+                        ),
                         document_round=document_round,
                     )
                     continue
                 if (
-                    not runtime.get("worker_session_id")
-                    or runtime.get("profile") != task.assignee
+                    runtime.get("profile") != task.assignee
                     or runtime.get("worktree") != run.workspace.worktree
                     or runtime.get("branch") != run.workspace.branch
                 ):
@@ -4380,38 +4634,6 @@ class ControllerService:
                     )
                     continue
                 redispatch_count = int(runtime.get("redispatch_count") or 0)
-                if redispatch_count >= self.config.worker_redispatch_limit:
-                    if not self._begin_reconcile(run_key):
-                        continue
-                    try:
-                        if not self._watchdog_target_is_current(
-                            run_key,
-                            runtime,
-                        ):
-                            continue
-                        self.kanban.abort_task(
-                            run.workspace.board,
-                            str(runtime["card_id"]),
-                            "worker redispatch limit exhausted after "
-                            "confirmed exit",
-                        )
-                        self._exception(
-                            run,
-                            str(runtime["card_id"]),
-                            "worker redispatch budget exhausted after "
-                            "confirmed exit; "
-                            f"stage={runtime['stage']}; "
-                            f"card={runtime['card_id']}; "
-                            f"attempt={runtime.get('attempt')}; "
-                            f"limit={self.config.worker_redispatch_limit}",
-                        )
-                    except DependencyContractError as exc:
-                        self._record_run_exception(run_key, exc)
-                    except DependencyError as exc:
-                        self._handle_dependency_error(run_key, exc)
-                    finally:
-                        self._finish_reconcile(run_key)
-                    continue
                 if not self._begin_reconcile(run_key):
                     continue
                 try:
@@ -4420,11 +4642,92 @@ class ControllerService:
                         runtime,
                     ):
                         continue
+                    observation = self._observe_worker(
+                        identity,
+                        terminate_running=True,
+                    )
+                    if not observation.exit_confirmed:
+                        self._enqueue_worker_lease_notice(
+                            run,
+                            runtime,
+                            deadline,
+                            "liveness_unconfirmed",
+                            (
+                                "Supervisor could not confirm worker exit; "
+                                f"state={observation.state}; "
+                                f"error={observation.error_code or 'none'}"
+                            ),
+                            document_round=document_round,
+                        )
+                        continue
+                    if not self._watchdog_target_is_current(run_key, runtime):
+                        self._enqueue_worker_lease_notice(
+                            run,
+                            runtime,
+                            deadline,
+                            "attempt_cas_changed",
+                            "attempt identity changed after Supervisor probe",
+                            document_round=document_round,
+                        )
+                        continue
+                    workspace_after = self.gitlab.local_workspace_state(run)
+                    mr_after = self._delivery_mr(run)
+                    if (
+                        not workspace_after.get("ok")
+                        or workspace_after.get("branch") != run.workspace.branch
+                        or str(workspace_after.get("head_sha") or "")
+                        != workspace_head
+                        or (
+                            mr is not None
+                            and (
+                                mr_after is None
+                                or int(mr_after.get("iid") or 0)
+                                != int(mr.get("iid") or 0)
+                                or str(mr_after.get("sha") or "")
+                                != str(mr.get("sha") or "")
+                            )
+                        )
+                        or (mr is None and mr_after is not None)
+                    ):
+                        self._enqueue_worker_lease_notice(
+                            run,
+                            runtime,
+                            deadline,
+                            "external_cas_changed",
+                            "worktree, branch, MR, or head changed after probe",
+                            document_round=document_round,
+                        )
+                        continue
+                    if redispatch_count >= self.config.worker_redispatch_limit:
+                        self.kanban.abort_task(
+                            run.workspace.board,
+                            str(runtime["card_id"]),
+                            "worker redispatch limit exhausted after "
+                            "Supervisor-confirmed exit",
+                            expected_run_id=identity.run_id,
+                            expected_worker_pid=identity.worker_pid,
+                        )
+                        self._record_reclaimed_attempt(identity)
+                        self._exception(
+                            run,
+                            str(runtime["card_id"]),
+                            "worker redispatch budget exhausted after "
+                            "Supervisor-confirmed exit; "
+                            f"stage={runtime['stage']}; "
+                            f"card={runtime['card_id']}; "
+                            f"attempt={runtime.get('attempt')}; "
+                            f"limit={self.config.worker_redispatch_limit}",
+                        )
+                        continue
                     self.kanban.redispatch_stale_worker(
                         run.workspace.board,
                         str(runtime["card_id"]),
-                        "worker progress lease expired and PID is no longer alive",
+                        "heartbeat and progress stale after "
+                        "Supervisor-confirmed exit",
+                        expected_run_id=identity.run_id,
+                        expected_worker_pid=identity.worker_pid,
                     )
+                    self._record_reclaimed_attempt(identity)
                     self.store.update_worker_watchdog(
                         board=str(runtime["board"]),
                         card_id=str(runtime["card_id"]),
@@ -4433,7 +4736,7 @@ class ControllerService:
                             self.config.worker_progress_lease_seconds,
                             300,
                         ),
-                        reason="confirmed_worker_exit",
+                        reason="exit_confirmed_redispatch",
                         increment_redispatch=True,
                     )
                     if (
@@ -4451,7 +4754,7 @@ class ControllerService:
                             self._render_notification(
                                 run,
                                 icon="⚠️",
-                                title="Agent 失联，已请求有限重派",
+                                title="Agent 退出已确认，已请求有限重派",
                                 fields=[
                                     ("任务 ID", inline_code(run_key)),
                                     (
@@ -4505,35 +4808,21 @@ class ControllerService:
         )
         if current is None:
             return False
-        return all(
+        identity = self._worker_identity(current, task)
+        observed_identity = self._worker_identity(observed, task)
+        return identity is not None and identity == observed_identity and all(
             current.get(field) == observed.get(field)
             for field in (
                 "attempt",
                 "worker_session_id",
                 "worker_pid",
                 "deadline_at",
+                "worktree",
+                "branch",
+                "mr_iid",
+                "head_sha",
             )
         )
-
-    @staticmethod
-    def _worker_process_state(worker_pid: object) -> str:
-        if not isinstance(worker_pid, int) or worker_pid <= 0:
-            return "unknown"
-        try:
-            os.kill(worker_pid, 0)
-        except ProcessLookupError:
-            return "exited"
-        except (PermissionError, OSError):
-            return "unknown"
-        proc_stat = Path(f"/proc/{worker_pid}/stat")
-        try:
-            raw = proc_stat.read_text(encoding="utf-8", errors="replace")
-            state = raw.rsplit(")", 1)[1].strip().split(maxsplit=1)[0]
-            if state == "Z":
-                return "exited"
-        except (OSError, IndexError):
-            pass
-        return "running"
 
     def _enqueue_worker_lease_notice(
         self,
@@ -5078,11 +5367,12 @@ class ControllerService:
             self._assert_reconcile_mutable(run.run_key)
         except ReconcileSuperseded:
             try:
-                self.kanban.abort_task(
+                if not self._abort_managed_task(
                     run.workspace.board,
                     task.id,
                     "run state changed before card publication",
-                )
+                ):
+                    LOG.warning("worker recovery pending for %s", task.id)
             except Exception:
                 LOG.exception(
                     "failed to cancel superseded card %s for run %s",
@@ -5104,11 +5394,12 @@ class ControllerService:
             return self._ensure_work_published(run, task)
         except ReconcileSuperseded:
             try:
-                self.kanban.abort_task(
+                if not self._abort_managed_task(
                     run.workspace.board,
                     task.id,
                     "run state changed during card publication",
-                )
+                ):
+                    LOG.warning("worker recovery pending for %s", task.id)
             except Exception:
                 LOG.exception(
                     "failed to cancel published stale card %s for run %s",
@@ -5872,12 +6163,16 @@ class ControllerService:
     ) -> TaskRecord:
         self._assert_reconcile_mutable(run.run_key)
         parent = self.reader.task(run.workspace.board, parent_card_id)
-        if parent is not None and parent.status in ACTIVE_STATUSES:
-            self.kanban.abort_task(
+        if (
+            parent is not None
+            and parent.status in ACTIVE_STATUSES
+            and not self._abort_managed_task(
                 run.workspace.board,
                 parent_card_id,
                 "Controller entered exception: " + reason[:400],
             )
+        ):
+            raise RunPolicyError("worker_recovery_pending")
         suffix = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:12]
         key = f"{run.run_key}:exception:{suffix}:work"
         task = self.kanban.create_exception(run, parent_card_id, reason, key)
@@ -5905,11 +6200,12 @@ class ControllerService:
             self._assert_reconcile_mutable(run.run_key)
         except ReconcileSuperseded:
             try:
-                self.kanban.abort_task(
+                if not self._abort_managed_task(
                     run.workspace.board,
                     task.id,
                     "run state changed while exception was being recorded",
-                )
+                ):
+                    LOG.warning("worker recovery pending for %s", task.id)
             except Exception:
                 LOG.exception(
                     "failed to cancel stale exception card %s for run %s",
@@ -5928,11 +6224,12 @@ class ControllerService:
                 "exception",
             }:
                 try:
-                    self.kanban.abort_task(
+                    if not self._abort_managed_task(
                         run.workspace.board,
                         task.id,
                         "run state superseded exception transition",
-                    )
+                    ):
+                        LOG.warning("worker recovery pending for %s", task.id)
                 except Exception:
                     LOG.exception(
                         "failed to cancel stale exception card %s for run %s",

@@ -22,6 +22,7 @@ services:
       HOLLYSYS_CONTROLLER_STATE_DIR: /var/lib/hollysys-controller
       HOLLYSYS_CONTROLLER_LOCK: /var/lib/hollysys-controller/controller.lock
       HOLLYSYS_CONTROLLER_SOCKET: /run/hollysys-controller/controller.sock
+      HOLLYSYS_WORKER_SUPERVISOR_SOCKET: /run/hollysys-controller/worker-supervisor.sock
       HOLLYSYS_CONTROLLER_GITLAB_TOKEN_FILE: /run/secrets/hollysys_controller_gitlab_token
       PATH: /run/hollysys/bin:/opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       PIP_CONFIG_FILE: /etc/pip.conf
@@ -75,6 +76,7 @@ services:
       HERMES_SCRATCH_DIR: /opt/data/scratch
       HERMES_WRITE_SAFE_ROOT: /opt/data:/workspace/projects
       HOLLYSYS_CONTROLLER_SOCKET: /run/hollysys-controller/controller.sock
+      HOLLYSYS_WORKER_SUPERVISOR_SOCKET: /run/hollysys-controller/worker-supervisor.sock
       HOLLYSYS_CONTROLLER_CONFIG: /opt/hollysys-controller/config.yaml
       PATH: /run/hollysys/bin:/opt/cli/bin:/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       PIP_CONFIG_FILE: /etc/pip.conf
@@ -93,6 +95,7 @@ services:
       - ./schemas:/opt/fleet/schemas:ro
       - ./container/sync-profile-skills.sh:/etc/cont-init.d/019-hollysys-profile-skills:ro
       - ./container/ensure-feishu.sh:/etc/cont-init.d/02-hollysys-feishu:ro
+      - ./container/services.d/hollysys-worker-supervisor:/etc/services.d/hollysys-worker-supervisor:ro
     healthcheck:
       test:
         - CMD

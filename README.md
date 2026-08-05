@@ -739,10 +739,13 @@ heartbeat/progress/deadline、worktree/branch/MR/head 和完成接受状态。he
 事件以 `task_events.run_id` 合成稳定 attempt identity，避免多个重试在健康页中坍缩为
 一个永不退出的 worker。Hermes 卡使用
 `HOLLYSYS_WORKER_REDISPATCH_LIMIT=2`；每次证据闭合后实际发出的 reclaim 立即计入预算，
-新 session 只增加 attempt，旧 session 晚到事件不会覆盖当前 attempt。超过进展租约后，
-Controller 依次核对 Kanban 状态、session/PID、
-Profile、worktree/branch 以及已存在时的 MR/head：进程仍在运行时续租；证据不足时只产生
-幂等告警；仅在 PID 已退出且其余身份事实一致时调用 Hermes `reclaim` 请求有限重派。
+新 session 只增加 attempt，旧 session 晚到事件不会覆盖当前 attempt。15 分钟无结构化
+进展只报 `slow_alive`，30 分钟且 heartbeat 正常只报 `stuck_alive`。只有 heartbeat 与
+progress 同时超时，Controller 才在完整核对 Kanban run/session/PID、Profile、
+worktree/branch/MR/head 后，通过 Hermes PID namespace 内的 Unix Socket Supervisor
+执行 probe/terminate；Socket、身份或进程证据不完整时只报 `liveness_unconfirmed`。
+Supervisor 确认该 attempt 的 Worker 与后代均退出后，Controller 再做完整 CAS，并调用
+带 `--expected-run-id/--expected-worker-pid` 的 `reclaim` 请求有限重派。
 重派达到 2 次或 Hermes 明确 `gave_up/spawn_auto_blocked` 后归档旧工作卡并进入持久异常。
 它不会仅按总运行时长杀死仍可能有真实进展的 Agent。
 
@@ -796,8 +799,11 @@ findings、决策和风险只发送简短中文摘要，超长原文以省略号
 一次性 token；在默认 10 分钟内，同一发送人必须在同一 chat/thread 发送新的
 `确认废止 <run_key> <token>` 消息。
 
-确认后 Controller 先持久化 `abort_requested`，阻止正常对账继续发卡，再对运行中受管
-卡调用 Hermes 官方 `reclaim` 停止 worker 并归档卡；随后向未合并交付 MR 写入唯一
+确认后 Controller 先持久化 `abort_requested`/`aborting`，阻止正常对账继续发卡，再经
+Hermes Supervisor 确认运行中 Worker 与后代真实退出，随后以 attempt CAS reclaim 并归档
+卡；reclaim 与 archive 在同一 Kanban 事务完成，不产生瞬时可重派窗口。尚未 claim 的
+卡也使用 unclaimed CAS 归档，若并发 claim 则保持 `aborting` 并转入 Supervisor 路径。
+终止失败时保持 `aborting`，不关闭交付或伪造成功。确认退出后再向未合并交付 MR 写入唯一
 `[hollysys-aborted:v4]` 审计评论并关闭 MR。branch、worktree、任务、run、评论和日志证据
 全部保留供人检查，不删除、不回滚。若 MR 已合并，则终态为
 `completed_before_abort`；若外部依赖中断，状态保持 `aborting` 并由后台对账重试。
@@ -873,7 +879,8 @@ blocked 卡的 `promote` 同样记录为 `promoted_manual`；Controller 只在�
   Agent Git wrapper 额外拒绝 Dispatcher push。
 - Memory/Skill 修改仍经过 Hermes 官方 write approval。
 - Hermes 补丁保证成功 `kanban_complete`/`kanban_block` 后停止同批后续业务工具和下一次
-  模型调用，并产生 `worker_exited` lifecycle 事件；还强制 Kanban worker 使用 `-Q`
+  模型调用；`worker_exited` 只由真实 `waitpid`/reap 路径产生，不再把 terminal 工具成功
+  当作进程退出。补丁还强制 Kanban worker 使用 `-Q`
   退出合同，将明确的临时 provider 失败映射为 `EX_TEMPFAIL` 冷却重试。Gateway 会把
   当前 `MessageEvent.message_id` 绑定到 session context，避免 Dispatcher 首次启动时拿到
   空消息 ID。`delegate_task` 子会话只返回盘点结果：其 Kanban 变更工具从 schema 中移除，
@@ -919,8 +926,10 @@ Controller 对 `PROJECTS_DIR` 可写。只有报告全部通过后才将
 模式改为 `active` 并全新重建容器。deep preflight 的成功结果和当前 Controller/Profile
 凭据契约以不可逆摘要绑定在同一份全新 Controller DB 中；active daemon 启动时强制核验，
 缺少 deep 结果、最后一次只做过 static preflight、凭据/allowed group/测试项目发生变化，
-或 root-owned Git wrapper 被替换时都会非零退出。任何 token 或准入项目轮换后必须先切回
-`preflight`、重新执行 `hollysysctl preflight --deep`，再恢复 `active`。摘要不出现在
+或 root-owned Git wrapper 被替换时都会非零退出。Hermes 容器和 Supervisor Socket 就绪后，
+必须再执行 `hollysysctl preflight --deep --require-supervisor`；active 启动只接受这次
+带 Supervisor 协议证明的深预检摘要。任何 token 或准入项目轮换后必须先切回
+`preflight`、重新执行上述深预检，再恢复 `active`。摘要不出现在
 health、日志或准入报告中。运行时：
 
 `hollysysctl preflight` 必须连接 Controller RPC，由已降权的 daemon 执行；不要在
@@ -952,6 +961,11 @@ uv run --no-project --with-requirements requirements-test.txt \
 docker compose config --quiet
 git diff --check
 ```
+
+派生镜像构建后还必须执行
+`scripts/test-worker-supervisor-containers.sh hollysys-hermes-agents:latest`；该门禁以临时
+Hermes/Controller 容器和临时卷验证独立 PID namespace、Socket probe 及完整进程树终止，
+不会加入或重建现有 Compose 项目。
 
 静态测试与 Compose 解析不是生产 E2E。发布门禁必须额外完成一次真实
 PRD→SPEC→PLAN→TASKS→implement→test→按条件 code-review→MR Ready/终态，并验证非法

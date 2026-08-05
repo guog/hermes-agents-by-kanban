@@ -1093,6 +1093,49 @@ class ControllerStore:
                 ),
             )
 
+    @staticmethod
+    def _supervisor_state(raw_summary: str | None) -> dict:
+        if raw_summary:
+            try:
+                decoded = json.loads(raw_summary)
+                if isinstance(decoded, dict):
+                    return decoded
+            except json.JSONDecodeError:
+                pass
+        return {"state": "unknown"}
+
+    @classmethod
+    def _decorate_attempt_runtime(
+        cls,
+        item: dict,
+        metrics: list[dict],
+        *,
+        now: int | None = None,
+    ) -> dict:
+        observed_at = int(time.time()) if now is None else now
+        heartbeat = item.get("last_heartbeat_at") or item.get("started_at")
+        progress = item.get("last_progress_at") or item.get("started_at")
+        item["heartbeat_age_seconds"] = (
+            max(0, observed_at - int(heartbeat))
+            if heartbeat is not None
+            else None
+        )
+        item["progress_age_seconds"] = (
+            max(0, observed_at - int(progress))
+            if progress is not None
+            else None
+        )
+        supervisor = next(
+            (
+                metric.get("summary")
+                for metric in metrics
+                if metric.get("metric") == "supervisor_probe"
+            ),
+            None,
+        )
+        item["supervisor_state"] = cls._supervisor_state(supervisor)
+        return item
+
     def attempts_for_run(self, run_key: str) -> list[dict]:
         with self.connect() as conn:
             attempts = conn.execute(
@@ -1117,10 +1160,17 @@ class ControllerStore:
             item = dict(row)
             by_run_id.setdefault(str(item.pop("run_id")), []).append(item)
         results = []
+        now = int(time.time())
         for row in attempts:
             item = dict(row)
             item["metrics"] = by_run_id.get(str(item["run_id"]), [])
-            results.append(item)
+            results.append(
+                self._decorate_attempt_runtime(
+                    item,
+                    item["metrics"],
+                    now=now,
+                )
+            )
         return results
 
     def add_managed_card(
@@ -1194,6 +1244,8 @@ class ControllerStore:
         worker_pid: int | None = None,
         lease_seconds: int,
         run_id: str | None = None,
+        runtime_metrics: dict[str, float] | None = None,
+        progress_summary: dict | None = None,
     ) -> None:
         started = kind in {"claimed", "started", "worker_started"}
         heartbeat = kind in {"heartbeat", "worker_heartbeat"}
@@ -1201,6 +1253,7 @@ class ControllerStore:
             "progress",
             "completed",
             "blocked",
+            "reclaimed",
             "crashed",
             "rate_limited",
             "timed_out",
@@ -1210,6 +1263,7 @@ class ControllerStore:
         terminal = kind in {
             "completed",
             "blocked",
+            "reclaimed",
             "crashed",
             "rate_limited",
             "timed_out",
@@ -1217,6 +1271,28 @@ class ControllerStore:
             "spawn_auto_blocked",
         }
         with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT * FROM card_runtime WHERE board=? AND card_id=?",
+                (board, card_id),
+            ).fetchone()
+            new_session = bool(
+                started
+                and previous is not None
+                and worker_session_id
+                and worker_session_id != previous["worker_session_id"]
+            )
+            preserve_finished_runtime = bool(
+                previous is not None
+                and previous["finished_at"] is not None
+                and not terminal
+                and not new_session
+            )
+            if preserve_finished_runtime and kind != "worker_exited":
+                # Supervisor-confirmed and formal terminal states are
+                # irreversible for an attempt. A heartbeat/progress event that
+                # was queued before termination may be polled afterwards, but
+                # it must not resurrect the reclaimed runtime.
+                return
             if run_id:
                 managed = conn.execute(
                     """
@@ -1271,12 +1347,18 @@ class ControllerStore:
                             created_at if started else None,
                             created_at if kind == "blocked" else None,
                             created_at if kind == "completed" else None,
-                            created_at if kind == "worker_exited" else None,
+                            (
+                                created_at
+                                if kind in {"worker_exited", "reclaimed"}
+                                else None
+                            ),
                             created_at if heartbeat else None,
                             created_at if progress else None,
                             (
                                 "exited"
                                 if kind == "worker_exited"
+                                else "reclaimed"
+                                if kind == "reclaimed"
                                 else "blocked"
                                 if kind == "blocked"
                                 else "completion_recorded"
@@ -1306,7 +1388,9 @@ class ControllerStore:
                                 completion_at, CASE WHEN ?='completed' THEN ? END
                             ),
                             exited_at=COALESCE(
-                                exited_at, CASE WHEN ?='worker_exited' THEN ? END
+                                exited_at,
+                                CASE WHEN ? IN ('worker_exited','reclaimed')
+                                     THEN ? END
                             ),
                             last_heartbeat_at=CASE
                                 WHEN ? THEN ? ELSE last_heartbeat_at
@@ -1315,7 +1399,9 @@ class ControllerStore:
                                 WHEN ? THEN ? ELSE last_progress_at
                             END,
                             status=CASE
-                                WHEN ?='worker_exited' THEN 'exited'
+                                WHEN ?='worker_exited' AND status!='reclaimed'
+                                    THEN 'exited'
+                                WHEN ?='reclaimed' THEN 'reclaimed'
                                 WHEN ?='blocked' THEN 'blocked'
                                 WHEN ?='completed' THEN 'completion_recorded'
                                 WHEN ? THEN ?
@@ -1345,6 +1431,7 @@ class ControllerStore:
                             kind,
                             kind,
                             kind,
+                            kind,
                             int(terminal),
                             kind,
                             int(terminal),
@@ -1353,10 +1440,97 @@ class ControllerStore:
                             run_id,
                         ),
                     )
-            previous = conn.execute(
-                "SELECT * FROM card_runtime WHERE board=? AND card_id=?",
-                (board, card_id),
-            ).fetchone()
+                if started:
+                    reclaimed = conn.execute(
+                        """
+                        SELECT run_id FROM card_attempts
+                        WHERE board=? AND card_id=? AND status='reclaimed'
+                          AND run_id != ?
+                        ORDER BY attempt DESC LIMIT 1
+                        """,
+                        (board, card_id, run_id),
+                    ).fetchone()
+                    if reclaimed is not None:
+                        conn.execute(
+                            """
+                            INSERT INTO attempt_metrics(
+                                run_id, metric, duration_ms, summary,
+                                recorded_at
+                            ) VALUES (?, 'redispatched_from_run_id', 0, ?, ?)
+                            ON CONFLICT(run_id, metric) DO UPDATE SET
+                                summary=excluded.summary,
+                                recorded_at=excluded.recorded_at
+                            """,
+                            (
+                                run_id,
+                                str(reclaimed["run_id"]),
+                                int(time.time()),
+                            ),
+                        )
+                if kind == "progress" and runtime_metrics:
+                    safe_summary = None
+                    if isinstance(progress_summary, dict):
+                        categories = progress_summary.get("tool_categories")
+                        safe_categories = {
+                            str(key)[:32]: int(value)
+                            for key, value in (
+                                categories.items()
+                                if isinstance(categories, dict)
+                                else ()
+                            )
+                            if isinstance(value, int) and value >= 0
+                        }
+                        safe_summary = json.dumps(
+                            {
+                                "tool_categories": safe_categories,
+                                "tool_count": max(
+                                    0,
+                                    int(progress_summary.get("tool_count", 0)),
+                                ),
+                                "elapsed_seconds": max(
+                                    0,
+                                    int(
+                                        progress_summary.get(
+                                            "elapsed_seconds", 0
+                                        )
+                                    ),
+                                ),
+                            },
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        )
+                    for metric in (
+                        "model_wait",
+                        "tool_execution",
+                        "delegation_wait",
+                        "retry_wait",
+                    ):
+                        value = runtime_metrics.get(metric)
+                        if not isinstance(value, (int, float)) or value < 0:
+                            continue
+                        conn.execute(
+                            """
+                            INSERT INTO attempt_metrics(
+                                run_id, metric, duration_ms, summary,
+                                recorded_at
+                            ) VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(run_id, metric) DO UPDATE SET
+                                duration_ms=excluded.duration_ms,
+                                summary=excluded.summary,
+                                recorded_at=excluded.recorded_at
+                            """,
+                            (
+                                run_id,
+                                metric,
+                                max(0, int(float(value) * 1000)),
+                                safe_summary,
+                                created_at,
+                            ),
+                        )
+            if preserve_finished_runtime:
+                # Preserve the formal card terminal state while still allowing
+                # a real waitpid event above to close the attempt timeline.
+                return
             if (
                 previous is not None
                 and previous["worker_session_id"]
@@ -1449,7 +1623,13 @@ class ControllerStore:
                     kind,
                     1,
                     0,
-                    "finished" if terminal else "running" if progress else "created",
+                    (
+                        "finished"
+                        if terminal
+                        else "running"
+                        if progress or heartbeat
+                        else "created"
+                    ),
                     created_at if terminal else None,
                     kind if terminal else None,
                     int(time.time()),
@@ -1536,7 +1716,44 @@ class ControllerStore:
                 "SELECT * FROM card_runtime WHERE board=? AND card_id=?",
                 (board, card_id),
             ).fetchone()
+            return dict(row) if row else None
+
+    def current_attempt(self, board: str, card_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM card_attempts
+                WHERE board=? AND card_id=?
+                ORDER BY attempt DESC LIMIT 1
+                """,
+                (board, card_id),
+            ).fetchone()
         return dict(row) if row else None
+
+    def record_supervisor_observation(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        duration_ms: int,
+        observed_at: int,
+        error_code: str | None = None,
+    ) -> None:
+        summary = json.dumps(
+            {
+                "state": state,
+                "observed_at": observed_at,
+                "error_code": error_code,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        self.record_attempt_metric(
+            run_id,
+            metric="supervisor_probe",
+            duration_ms=duration_ms,
+            summary=summary,
+        )
 
     def update_worker_watchdog(
         self,
@@ -1588,7 +1805,51 @@ class ControllerStore:
                 """,
                 (run_key,),
             ).fetchall()
-        return [dict(row) for row in rows]
+            supervisor_metrics = {
+                str(row["run_id"]): str(row["summary"] or "")
+                for row in conn.execute(
+                    """
+                    SELECT metrics.run_id, metrics.summary
+                    FROM attempt_metrics AS metrics
+                    JOIN card_attempts AS attempts
+                      ON attempts.run_id=metrics.run_id
+                    WHERE attempts.run_key=?
+                      AND metrics.metric='supervisor_probe'
+                    """,
+                    (run_key,),
+                )
+            }
+        now = int(time.time())
+        results = []
+        for row in rows:
+            item = dict(row)
+            heartbeat = item.get("last_heartbeat_at") or item.get(
+                "worker_started_at"
+            )
+            progress = item.get("last_progress_event_at") or item.get(
+                "worker_started_at"
+            )
+            item["heartbeat_age_seconds"] = (
+                max(0, now - int(heartbeat))
+                if heartbeat is not None
+                else None
+            )
+            item["progress_age_seconds"] = (
+                max(0, now - int(progress))
+                if progress is not None
+                else None
+            )
+            session = str(item.get("worker_session_id") or "")
+            attempt_run_id = (
+                f"{item['board']}:{session.split(':', 1)[1]}"
+                if session.startswith("kanban-run:")
+                else None
+            )
+            item["supervisor_state"] = self._supervisor_state(
+                supervisor_metrics.get(str(attempt_run_id or ""))
+            )
+            results.append(item)
+        return results
 
     def run_keys(self) -> list[str]:
         with self.connect() as conn:
@@ -2931,12 +3192,117 @@ class ControllerStore:
                     """
                 )
             ]
+            worker_runtime = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT runtime.*, cards.run_key, cards.stage,
+                           cards.iteration
+                    FROM card_runtime AS runtime
+                    JOIN managed_cards AS cards
+                      ON cards.board=runtime.board
+                     AND cards.card_id=runtime.card_id
+                    WHERE runtime.finished_at IS NULL
+                    ORDER BY runtime.updated_at DESC
+                    """
+                )
+            ]
+            overlapping_attempts = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT board, card_id, COUNT(*) AS attempt_count,
+                           GROUP_CONCAT(run_id) AS run_ids
+                    FROM card_attempts
+                    WHERE exited_at IS NULL
+                      AND status IN (
+                          'created', 'running', 'redispatch_requested',
+                          'completion_recorded'
+                      )
+                    GROUP BY board, card_id
+                    HAVING COUNT(*) > 1
+                    ORDER BY board, card_id
+                    """
+                )
+            ]
+            supervisor_metrics = {
+                str(row["run_id"]): str(row["summary"] or "")
+                for row in conn.execute(
+                    """
+                    SELECT run_id, summary FROM attempt_metrics
+                    WHERE metric='supervisor_probe'
+                    """
+                )
+            }
         now = int(time.time())
+        for item in recent_attempts:
+            heartbeat = item.get("last_heartbeat_at") or item.get("started_at")
+            progress = item.get("last_progress_at") or item.get("started_at")
+            item["heartbeat_age_seconds"] = (
+                max(0, now - int(heartbeat))
+                if heartbeat is not None
+                else None
+            )
+            item["progress_age_seconds"] = (
+                max(0, now - int(progress))
+                if progress is not None
+                else None
+            )
+            item["supervisor_state"] = self._supervisor_state(
+                supervisor_metrics.get(str(item["run_id"]))
+            )
         for item in merge_waits:
             item["waiting_seconds"] = max(
                 0,
                 now - int(item["first_seen_at"]),
             )
+        for item in worker_runtime:
+            heartbeat = item.get("last_heartbeat_at") or item.get(
+                "worker_started_at"
+            )
+            progress = item.get("last_progress_event_at") or item.get(
+                "worker_started_at"
+            )
+            item["heartbeat_age_seconds"] = (
+                max(0, now - int(heartbeat)) if heartbeat is not None else None
+            )
+            item["progress_age_seconds"] = (
+                max(0, now - int(progress)) if progress is not None else None
+            )
+            session = str(item.get("worker_session_id") or "")
+            attempt_run_id = None
+            if session.startswith("kanban-run:"):
+                attempt_run_id = f"{item['board']}:{session.split(':', 1)[1]}"
+            supervisor_state: dict = {"state": "unknown"}
+            raw_summary = supervisor_metrics.get(str(attempt_run_id or ""))
+            if raw_summary:
+                try:
+                    decoded = json.loads(raw_summary)
+                    if isinstance(decoded, dict):
+                        supervisor_state = decoded
+                except json.JSONDecodeError:
+                    pass
+            item["supervisor_state"] = supervisor_state
+        for item in stale_workers:
+            matching = next(
+                (
+                    runtime
+                    for runtime in worker_runtime
+                    if runtime["board"] == item["board"]
+                    and runtime["card_id"] == item["card_id"]
+                ),
+                None,
+            )
+            if matching is not None:
+                item["heartbeat_age_seconds"] = matching[
+                    "heartbeat_age_seconds"
+                ]
+                item["progress_age_seconds"] = matching[
+                    "progress_age_seconds"
+                ]
+                item["supervisor_state"] = matching["supervisor_state"]
+        for item in overlapping_attempts:
+            item["run_ids"] = str(item["run_ids"] or "").split(",")
         return {
             "schema_version": schema_version,
             "quick_check": "ok",
@@ -2964,6 +3330,8 @@ class ControllerStore:
             ),
             "reconcile_queue": reconcile_rows,
             "attempt_timeline": recent_attempts,
+            "worker_runtime": worker_runtime,
+            "overlapping_attempts": overlapping_attempts,
             "merge_waits": merge_waits,
             "stale_workers": stale_workers,
             "dependency_outages": self.open_dependency_outages(),

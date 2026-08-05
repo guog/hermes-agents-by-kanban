@@ -63,6 +63,9 @@ class ControllerDaemon:
                 return await asyncio.to_thread(
                     self.service.preflight,
                     deep=bool(request.params.get("deep", False)),
+                    require_supervisor=bool(
+                        request.params.get("require_supervisor", False)
+                    ),
                 )
             if request.method == "validate-completion":
                 return await asyncio.to_thread(

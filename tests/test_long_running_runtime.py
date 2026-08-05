@@ -241,6 +241,80 @@ class LongRunningStoreTests(unittest.TestCase):
         self.assertEqual(runtime["redispatch_count"], 1)
         self.assertEqual(runtime["attempt_status"], "running")
 
+    def test_late_heartbeat_cannot_resurrect_reclaimed_attempt(self) -> None:
+        self.store.register_card_attempt(
+            board="gitlab-p12",
+            card_id="t_reclaimed_heartbeat",
+            profile="coder",
+            dispatch_key="dispatch-reclaimed-heartbeat",
+            worktree="/workspace/run",
+            branch="feature/run",
+        )
+        for kind, created_at in (
+            ("claimed", 100),
+            ("reclaimed", 200),
+            ("heartbeat", 150),
+        ):
+            self.store.record_card_runtime_event(
+                board="gitlab-p12",
+                card_id="t_reclaimed_heartbeat",
+                kind=kind,
+                created_at=created_at,
+                worker_session_id="kanban-run:17",
+                worker_pid=170,
+                lease_seconds=300,
+            )
+
+        runtime = self.store.card_runtime(
+            "gitlab-p12",
+            "t_reclaimed_heartbeat",
+        )
+        assert runtime is not None
+        self.assertEqual(runtime["attempt_status"], "finished")
+        self.assertEqual(runtime["terminal_reason"], "reclaimed")
+        self.assertEqual(runtime["finished_at"], 200)
+        self.assertIsNone(runtime["last_heartbeat_at"])
+
+    def test_waitpid_closes_attempt_without_replacing_card_terminal_state(
+        self,
+    ) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.save_run(run_record(self.root))
+        self.store.add_managed_card(
+            board="gitlab-p12",
+            card_id="t_waitpid",
+            run_key=run_key,
+            stage="code",
+            iteration=1,
+            idempotency_key="dispatch-waitpid",
+            parent_card_id=None,
+        )
+        for kind, created_at in (
+            ("claimed", 100),
+            ("completed", 200),
+            ("worker_exited", 210),
+        ):
+            self.store.record_card_runtime_event(
+                board="gitlab-p12",
+                card_id="t_waitpid",
+                kind=kind,
+                created_at=created_at,
+                worker_session_id="kanban-run:18",
+                worker_pid=180,
+                lease_seconds=300,
+                run_id="gitlab-p12:18",
+            )
+
+        runtime = self.store.card_runtime("gitlab-p12", "t_waitpid")
+        assert runtime is not None
+        self.assertEqual(runtime["attempt_status"], "finished")
+        self.assertEqual(runtime["terminal_reason"], "completed")
+        self.assertEqual(runtime["finished_at"], 200)
+        attempt = self.store.attempts_for_run(run_key)[0]
+        self.assertEqual(attempt["status"], "exited")
+        self.assertEqual(attempt["exited_at"], 210)
+        self.assertEqual(attempt["terminal_reason"], "completed")
+
     def test_dependency_tempfail_attempt_does_not_consume_redispatch_budget(
         self,
     ) -> None:
@@ -347,6 +421,129 @@ class LongRunningStoreTests(unittest.TestCase):
             timeline["t_terminal_2"]["terminal_reason"],
             "gave_up",
         )
+
+    def test_progress_metrics_and_health_fields_use_existing_attempt_tables(
+        self,
+    ) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.save_run(run_record(self.root))
+        self.store.add_managed_card(
+            board="gitlab-p12",
+            card_id="t_metrics",
+            run_key=run_key,
+            stage="code",
+            iteration=1,
+            idempotency_key="dispatch-metrics",
+            parent_card_id=None,
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_metrics",
+            kind="claimed",
+            created_at=int(time.time()) - 10,
+            worker_session_id="kanban-run:12",
+            worker_pid=212,
+            lease_seconds=1800,
+            run_id="gitlab-p12:12",
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_metrics",
+            kind="progress",
+            created_at=int(time.time()) - 2,
+            worker_session_id="kanban-run:12",
+            worker_pid=212,
+            lease_seconds=1800,
+            run_id="gitlab-p12:12",
+            runtime_metrics={
+                "model_wait": 3.5,
+                "tool_execution": 1.25,
+                "delegation_wait": 2.0,
+                "retry_wait": 0.5,
+            },
+            progress_summary={
+                "tool_categories": {"read": 2},
+                "tool_count": 2,
+                "elapsed_seconds": 7,
+            },
+        )
+        self.store.record_supervisor_observation(
+            "gitlab-p12:12",
+            state="running",
+            duration_ms=4,
+            observed_at=int(time.time()) - 1,
+        )
+
+        attempts = self.store.attempts_for_run(run_key)
+        self.assertEqual(len(attempts), 1)
+        metrics = {item["metric"]: item for item in attempts[0]["metrics"]}
+        self.assertEqual(metrics["model_wait"]["duration_ms"], 3500)
+        self.assertEqual(metrics["tool_execution"]["duration_ms"], 1250)
+        self.assertNotIn("password", str(metrics).lower())
+        self.assertIn("heartbeat_age_seconds", attempts[0])
+        self.assertIn("progress_age_seconds", attempts[0])
+        self.assertEqual(attempts[0]["supervisor_state"]["state"], "running")
+
+        health = self.store.health()
+        timeline = next(
+            item
+            for item in health["attempt_timeline"]
+            if item["card_id"] == "t_metrics"
+        )
+        self.assertIn("heartbeat_age_seconds", timeline)
+        self.assertIn("progress_age_seconds", timeline)
+        self.assertEqual(timeline["supervisor_state"]["state"], "running")
+
+    def test_reclaimed_attempt_links_the_next_attempt_without_schema_change(
+        self,
+    ) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.save_run(run_record(self.root))
+        self.store.add_managed_card(
+            board="gitlab-p12",
+            card_id="t_reclaimed",
+            run_key=run_key,
+            stage="code",
+            iteration=1,
+            idempotency_key="dispatch-reclaimed",
+            parent_card_id=None,
+        )
+        for kind, event_at in (
+            ("claimed", 100),
+            ("reclaimed", 200),
+            ("worker_exited", 210),
+        ):
+            self.store.record_card_runtime_event(
+                board="gitlab-p12",
+                card_id="t_reclaimed",
+                kind=kind,
+                created_at=event_at,
+                worker_session_id="kanban-run:20",
+                worker_pid=220,
+                lease_seconds=1800,
+                run_id="gitlab-p12:20",
+            )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_reclaimed",
+            kind="claimed",
+            created_at=300,
+            worker_session_id="kanban-run:21",
+            worker_pid=221,
+            lease_seconds=1800,
+            run_id="gitlab-p12:21",
+        )
+
+        attempts = self.store.attempts_for_run(run_key)
+        self.assertEqual(attempts[0]["status"], "reclaimed")
+        self.assertEqual(attempts[0]["terminal_reason"], "reclaimed")
+        self.assertEqual(attempts[0]["exited_at"], 200)
+        link = next(
+            metric
+            for metric in attempts[1]["metrics"]
+            if metric["metric"] == "redispatched_from_run_id"
+        )
+        self.assertEqual(link["summary"], "gitlab-p12:20")
 
     def test_abort_can_take_over_exception_and_is_restart_idempotent(self) -> None:
         run_key = "hollysys-abcdefghijklmnopqrst"
@@ -643,6 +840,16 @@ class LongRunningServiceTests(unittest.TestCase):
             ok=True,
             deep=True,
             credential_contract_digest="accepted",
+        )
+        with self.assertRaisesRegex(
+            ControllerFatalError,
+            "requires_worker_supervisor_preflight",
+        ):
+            service.assert_activation_preflight()
+        store.record_deployment_preflight(
+            ok=True,
+            deep=True,
+            credential_contract_digest="worker-supervisor-v1:accepted",
         )
         with patch(
             "hollysys_controller.service.summarize_profile_preflight",

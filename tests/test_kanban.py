@@ -168,8 +168,8 @@ class KanbanReaderTests(unittest.TestCase):
         self.assertIn("promote", second_command)
         self.assertIn("t_triage", second_command)
 
-    def test_abort_running_task_reclaims_then_archives(self) -> None:
-        statuses = iter(["running", "ready", "archived"])
+    def test_abort_running_task_reclaims_and_archives_atomically(self) -> None:
+        statuses = iter(["running", "archived"])
 
         def current_task(board: str, task_id: str) -> TaskRecord:
             return TaskRecord(
@@ -193,6 +193,58 @@ class KanbanReaderTests(unittest.TestCase):
                 parents=["t_root"],
                 comments=[],
                 event_kinds=[],
+                worker_pid=404,
+            )
+
+        reader = type("AbortReader", (), {"task": staticmethod(current_task)})()
+        cli = KanbanCLI(config(self.root), reader)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            return_value=completed,
+        ) as run:
+            cli.abort_task(
+                "gitlab-p12",
+                "t_work",
+                "human abort",
+                expected_run_id=4,
+                expected_worker_pid=404,
+            )
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn("reclaim", commands[0])
+        self.assertIn("t_work", commands[0])
+        self.assertIn("--expected-run-id", commands[0])
+        self.assertIn("--expected-worker-pid", commands[0])
+        self.assertIn("--archive", commands[0])
+        self.assertEqual(len(commands), 1)
+
+    def test_abort_ready_task_archives_only_while_unclaimed(self) -> None:
+        statuses = iter(["ready", "ready", "archived"])
+
+        def current_task(board: str, task_id: str) -> TaskRecord:
+            return TaskRecord(
+                id=task_id,
+                title="work",
+                body="body",
+                assignee="coder",
+                status=next(statuses),
+                created_by="hollysys-controller",
+                created_at=1,
+                completed_at=None,
+                idempotency_key="key",
+                tenant="run",
+                workspace_path="/worktree",
+                branch_name="feature/run",
+                skills=[],
+                current_run_id=None,
+                latest_summary=None,
+                latest_metadata=None,
+                latest_outcome=None,
+                parents=["t_root"],
+                comments=[],
+                event_kinds=[],
+                worker_pid=None,
             )
 
         reader = type("AbortReader", (), {"task": staticmethod(current_task)})()
@@ -204,11 +256,9 @@ class KanbanReaderTests(unittest.TestCase):
         ) as run:
             cli.abort_task("gitlab-p12", "t_work", "human abort")
 
-        commands = [call.args[0] for call in run.call_args_list]
-        self.assertIn("reclaim", commands[0])
-        self.assertIn("t_work", commands[0])
-        self.assertIn("archive", commands[1])
-        self.assertIn("t_work", commands[1])
+        command = run.call_args.args[0]
+        self.assertIn("archive", command)
+        self.assertIn("--expected-unclaimed", command)
 
     def test_redispatch_stale_worker_reclaims_without_archiving(self) -> None:
         statuses = iter(["running", "ready"])
@@ -235,6 +285,7 @@ class KanbanReaderTests(unittest.TestCase):
                 parents=["t_root"],
                 comments=[],
                 event_kinds=[],
+                worker_pid=404,
             )
 
         reader = type("RedispatchReader", (), {"task": staticmethod(current_task)})()
@@ -248,13 +299,15 @@ class KanbanReaderTests(unittest.TestCase):
                 "gitlab-p12",
                 "t_work",
                 "confirmed exit",
+                expected_run_id=4,
+                expected_worker_pid=404,
             )
 
         self.assertEqual(result.status, "ready")
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(len(commands), 1)
         self.assertIn("reclaim", commands[0])
-        self.assertNotIn("archive", commands[0])
+        self.assertNotIn("--archive", commands[0])
 
     def test_cli_timeout_is_a_transient_kanban_failure(self) -> None:
         cli = KanbanCLI(config(self.root), self.reader)

@@ -1,0 +1,12 @@
+#!/command/with-contenv sh
+set -eu
+
+supervisor_dir=/run/hollysys-controller
+install -d \
+  -o "$(id -u hermes)" \
+  -g "$(id -g hermes)" \
+  -m 0750 \
+  "$supervisor_dir"
+
+exec s6-setuidgid hermes \
+  /opt/hermes/.venv/bin/python -m hollysys_controller.worker_supervisor

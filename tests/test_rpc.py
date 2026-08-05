@@ -210,6 +210,17 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
             {"ok": True, "mode": "deep"},
         )
 
+    def test_supervisor_preflight_is_an_explicit_deep_gate(self) -> None:
+        args = build_parser().parse_args(
+            ["preflight", "--deep", "--require-supervisor"]
+        )
+        method, params = params_for(args)
+        self.assertEqual(method, "preflight")
+        self.assertEqual(
+            params,
+            {"deep": True, "require_supervisor": True},
+        )
+
     def test_validate_completion_reads_json_before_rpc(self) -> None:
         metadata = Path(self.temp.name) / "completion.json"
         metadata.write_text('{"outcome":"pass"}', encoding="utf-8")

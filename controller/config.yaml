@@ -13,7 +13,9 @@ dependency_circuit_failure_threshold: 5
 health_stale_seconds: 120
 event_lag_warning_threshold: 100
 outbox_warning_threshold: 20
-worker_progress_lease_seconds: 14400
+worker_slow_warning_seconds: 900
+worker_progress_lease_seconds: 1800
+worker_heartbeat_stale_seconds: 300
 worker_redispatch_limit: 2
 merge_wait_retry_seconds: 30
 merge_blocker_timeout_seconds: 3600
