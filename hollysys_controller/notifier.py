@@ -82,6 +82,16 @@ class LarkNotifier:
                         error_code="bot_not_in_chat",
                     ),
                 )
+            if isinstance(error, dict) and error.get("code") == 99992354:
+                raise DependencyContractError(
+                    "feishu_origin_message_not_found",
+                    context=ErrorContext(
+                        dependency="feishu",
+                        endpoint="messages-reply",
+                        status_code=400,
+                        error_code="origin_message_not_found",
+                    ),
+                )
             raise CommandError(command, result.returncode, result.stderr)
         try:
             payload = json.loads(result.stdout)

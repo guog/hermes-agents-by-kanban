@@ -105,6 +105,44 @@ class LarkNotifierTests(unittest.TestCase):
             str(raised.exception),
         )
 
+    def test_missing_origin_message_is_a_sanitized_contract_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notifier = LarkNotifier(config(Path(tmp)))
+
+            def rejected(command, **kwargs):
+                del kwargs
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr=(
+                        '{"ok":false,"error":{"code":99992354,'
+                        '"message":"these ids not existed"}}'
+                    ),
+                )
+
+            with patch(
+                "hollysys_controller.notifier.subprocess.run",
+                rejected,
+            ), self.assertRaisesRegex(
+                DependencyContractError,
+                "feishu_origin_message_not_found",
+            ) as raised:
+                notifier.send(
+                    "run:exception",
+                    origin(),
+                    "sensitive notification content",
+                )
+
+        self.assertEqual(
+            raised.exception.context.error_code,
+            "origin_message_not_found",
+        )
+        self.assertNotIn(
+            "sensitive notification content",
+            str(raised.exception),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
