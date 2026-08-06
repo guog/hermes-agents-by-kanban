@@ -1453,6 +1453,21 @@ class ControllerStore:
                     if reclaimed is not None:
                         conn.execute(
                             """
+                            UPDATE card_attempts
+                            SET redispatched_from_run_id=COALESCE(
+                                    redispatched_from_run_id, ?
+                                ),
+                                updated_at=?
+                            WHERE run_id=?
+                            """,
+                            (
+                                str(reclaimed["run_id"]),
+                                int(time.time()),
+                                run_id,
+                            ),
+                        )
+                        conn.execute(
+                            """
                             INSERT INTO attempt_metrics(
                                 run_id, metric, duration_ms, summary,
                                 recorded_at
@@ -1560,12 +1575,6 @@ class ControllerStore:
                 and worker_session_id
                 and worker_session_id != previous["worker_session_id"]
             )
-            count_new_attempt_as_redispatch = bool(
-                new_attempt
-                and previous is not None
-                and previous["attempt_status"] != "redispatch_requested"
-                and previous["terminal_reason"] != "rate_limited"
-            )
             conn.execute(
                 """
                 INSERT INTO card_runtime(
@@ -1635,7 +1644,7 @@ class ControllerStore:
                     int(time.time()),
                     int(new_attempt),
                     int(new_attempt),
-                    int(count_new_attempt_as_redispatch),
+                    0,
                 ),
             )
 
@@ -1768,12 +1777,59 @@ class ControllerStore:
         now = int(time.time())
         deadline = now + lease_seconds if lease_seconds is not None else None
         with self.connect() as conn:
+            redispatch_count: int | None = None
+            if increment_redispatch:
+                current = conn.execute(
+                    """
+                    SELECT run_id FROM card_attempts
+                    WHERE board=? AND card_id=?
+                    ORDER BY attempt DESC LIMIT 1
+                    """,
+                    (board, card_id),
+                ).fetchone()
+                if current is not None:
+                    conn.execute(
+                        """
+                        UPDATE card_attempts
+                        SET recovery_reason=COALESCE(recovery_reason, ?),
+                            updated_at=?
+                        WHERE run_id=?
+                        """,
+                        (
+                            (reason or "redispatch_requested")[:1000],
+                            now,
+                            str(current["run_id"]),
+                        ),
+                    )
+                    redispatch_count = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*) FROM card_attempts
+                            WHERE board=? AND card_id=?
+                              AND recovery_reason IS NOT NULL
+                            """,
+                            (board, card_id),
+                        ).fetchone()[0]
+                    )
+                else:
+                    # Compatibility for synthetic/tests events without a
+                    # durable Hermes run id. Production attempts always take
+                    # the authoritative card_attempts path above.
+                    runtime_row = conn.execute(
+                        """
+                        SELECT redispatch_count FROM card_runtime
+                        WHERE board=? AND card_id=?
+                        """,
+                        (board, card_id),
+                    ).fetchone()
+                    if runtime_row is not None:
+                        redispatch_count = int(runtime_row[0]) + 1
             changed = conn.execute(
                 """
                 UPDATE card_runtime
                 SET attempt_status=?,
                     deadline_at=COALESCE(?, deadline_at),
-                    redispatch_count=redispatch_count+?,
+                    redispatch_count=COALESCE(?, redispatch_count),
                     terminal_reason=COALESCE(?, terminal_reason),
                     updated_at=?
                 WHERE board=? AND card_id=?
@@ -1781,7 +1837,7 @@ class ControllerStore:
                 (
                     attempt_status,
                     deadline,
-                    int(increment_redispatch),
+                    redispatch_count,
                     reason[:1000] if reason else None,
                     now,
                     board,

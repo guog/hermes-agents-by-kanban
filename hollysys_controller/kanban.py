@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,9 +18,10 @@ from .errors import (
     DependencyTransientError,
     ErrorContext,
 )
-from .models import CardRecord, RunRecord
+from .models import CardRecord, ExceptionCardRecord, RunRecord
 
 CARD_MARKER = "[hollysys-controller-card:v4]"
+EXCEPTION_MARKER = "[hollysys-controller-exception:v4]"
 RUN_MARKER = "[hollysys-controller-run:v4]"
 
 
@@ -98,6 +100,17 @@ def render_card_body(card: CardRecord) -> str:
         "`kanban_block`；Controller outbox 负责原渠道通知。不得创建、链接或推进 "
         "其他正式卡片。environment/destructive_approval 阻塞还必须写明 "
         "`gate_phase`、冻结 `requirement_ids` 和 `contract_refs`。\n\n"
+        f"```json\n{payload}\n```\n"
+    )
+
+
+def render_exception_body(record: ExceptionCardRecord) -> str:
+    payload = json.dumps(
+        record.model_dump(mode="json"), ensure_ascii=False, indent=2
+    )
+    return (
+        f"{EXCEPTION_MARKER}\n\n"
+        "该卡由 Dispatcher 作为异常入口处理；不得直接推进门禁或合并。\n\n"
         f"```json\n{payload}\n```\n"
     )
 
@@ -673,6 +686,48 @@ class KanbanCLI:
             )
         return refreshed
 
+    def quarantine_provider_tempfail(
+        self,
+        board: str,
+        task_id: str,
+        reason: str,
+        *,
+        expected_run_id: int,
+        expected_worker_pid: int,
+    ) -> TaskRecord:
+        """Reclaim a confirmed exit-75 attempt but retain the cooldown block."""
+        task = self.reader.task(board, task_id)
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+        if task.status == "running":
+            if (
+                task.current_run_id != expected_run_id
+                or task.worker_pid != expected_worker_pid
+            ):
+                raise ValueError("stale_attempt")
+            self._run(
+                [
+                    "reclaim",
+                    task_id,
+                    "--reason",
+                    reason[:500],
+                    "--expected-run-id",
+                    str(expected_run_id),
+                    "--expected-worker-pid",
+                    str(expected_worker_pid),
+                ],
+                board=board,
+            )
+        refreshed = self.reader.task(board, task_id)
+        if refreshed is None:
+            raise RuntimeError(f"reclaimed task {task_id} disappeared")
+        if refreshed.status != "blocked":
+            raise RuntimeError(
+                f"provider tempfail card {task_id} did not enter cooldown block: "
+                f"{refreshed.status}"
+            )
+        return refreshed
+
     def prepare_human_block_for_completion(
         self, board: str, task_id: str
     ) -> None:
@@ -771,12 +826,17 @@ class KanbanCLI:
         existing = self.reader.task_by_idempotency(board, key)
         if existing:
             return existing
-        body = (
-            "[hollysys-controller-exception:v4]\n\n"
-            f"run_key: {run.run_key}\n\n"
-            f"reason: {reason[:1000]}\n\n"
-            "该卡由 Dispatcher 作为异常入口处理；不得直接推进门禁或合并。"
+        record = ExceptionCardRecord(
+            run=run,
+            parent_card_id=parent_card_id,
+            idempotency_key=key,
+            reason=reason[:1000],
+            scratch_dir=(
+                f"/opt/data/scratch/{run.run_generation}/"
+                f"{hashlib.sha256(key.encode()).hexdigest()[:20]}"
+            ),
         )
+        body = render_exception_body(record)
         payload = self._run(
             [
                 "create",

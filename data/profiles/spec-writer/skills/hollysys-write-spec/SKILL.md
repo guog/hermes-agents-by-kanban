@@ -9,6 +9,8 @@ version: 4.0.0
 - GitLab 操作只使用锁定的 `glab`；本地检查、commit 和 push 使用受控 `git`。
 - 只操作 Controller 给出的 worktree、分支和 Delivery。不得 clone、创建/选择分支、
   创建/选择/切换 MR，或修改 PRD。
+- `card-context.run.artifact_scope` 是唯一文档边界；只能修改当前阶段匹配的当前 PRD
+  工件。其他 PRD 的 SPEC/PLAN/TASKS 永远只读，发现问题仅作观察并要求另开 run。
 - 业务歧义按安全与数据完整性、明确验收、具体规则、仓库兼容性、最小可逆范围决策，
   写入 SPEC 与 MR 描述。只有权限、凭据、能力缺失、不安全重试或破坏性授权才能
   使用 `[human-block:v1]` 和 `kanban_block`。

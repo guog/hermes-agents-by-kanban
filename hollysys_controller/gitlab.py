@@ -27,6 +27,7 @@ from .errors import (
 )
 from .models import (
     ArtifactBaseline,
+    ArtifactScope,
     CompletionMetadata,
     DeliveryBinding,
     FeishuOrigin,
@@ -520,6 +521,10 @@ class GitLabClient:
                 prd_blob_sha=requested_blob,
                 prd_blob_url=prd_blob_url,
                 prd_mr_url=prd_mr_url,
+            ),
+            artifact_scope=ArtifactScope.from_prd_path(
+                prd_path,
+                self.config.artifact_relative_patterns,
             ),
             workspace=WorkspaceFacts(
                 board=f"gitlab-p{project_id}",
@@ -1438,10 +1443,11 @@ class GitLabClient:
             raise ValueError(
                 f"{metadata.stage} artifact commit is not on the delivery branch"
             )
+        patterns = run.artifact_scope.patterns_for(stage_for_patterns)
         actual_paths = self.artifact_paths(
             run.project.project_id,
             metadata.artifact_commit_sha,
-            self.config.artifact_patterns.get(stage_for_patterns.value, []),
+            patterns,
         )
         if sorted(metadata.artifact_paths) != actual_paths:
             raise ValueError(
@@ -1454,6 +1460,44 @@ class GitLabClient:
         )
         if digest != metadata.artifact_digest:
             raise ValueError(f"{metadata.stage} artifact digest mismatch")
+        changed_paths = self.changed_paths(
+            run.project.project_id,
+            metadata.head_before_sha,
+            metadata.artifact_commit_sha,
+        )
+        if metadata.stage in {
+            Stage.SPEC_WRITE,
+            Stage.PLAN_WRITE,
+            Stage.TASKS_WRITE,
+        }:
+            outside_phase = [
+                path
+                for path in changed_paths
+                if not run.artifact_scope.phase_contains(metadata.stage, path)
+            ]
+            if outside_phase:
+                raise ValueError(
+                    f"{metadata.stage} changed paths outside current PRD scope: "
+                    + ", ".join(sorted(outside_phase))
+                )
+        elif changed_paths:
+            raise ValueError(f"{metadata.stage} reviewer changed repository head")
+        run_changed_paths = self.changed_paths(
+            run.project.project_id,
+            run.workspace.repository_base_sha,
+            metadata.artifact_commit_sha,
+        )
+        cross_scope = [
+            path
+            for path in run_changed_paths
+            if path.startswith("docs/prds/")
+            and not run.artifact_scope.run_allows_document_path(path)
+        ]
+        if cross_scope:
+            raise ValueError(
+                "delivery changed documents outside current PRD scope: "
+                + ", ".join(sorted(cross_scope))
+            )
         if metadata.mode == WorkMode.FINALIZATION:
             self.validate_forced_advance(run, metadata)
 
@@ -1564,6 +1608,49 @@ class GitLabClient:
             raise ValueError("configured artifact patterns matched no files")
         return paths
 
+    def changed_paths(
+        self,
+        project_id: int,
+        from_ref: str,
+        to_ref: str,
+    ) -> list[str]:
+        if from_ref == to_ref:
+            return []
+        endpoint = (
+            f"{self._project_endpoint(project_id)}/repository/compare"
+            f"?from={quote(from_ref, safe='')}&to={quote(to_ref, safe='')}"
+            "&straight=true"
+        )
+        result = self._require_object(self.api(endpoint), endpoint)
+        if result.get("compare_timeout") or result.get("overflow"):
+            raise DependencyContractError(
+                "GitLab compare response is incomplete",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="repository/compare",
+                    error_code="incomplete_compare_response",
+                ),
+            )
+        diffs = result.get("diffs")
+        if not isinstance(diffs, list):
+            raise DependencyContractError(
+                "GitLab compare response lacks diffs",
+                context=ErrorContext(
+                    dependency="gitlab",
+                    endpoint="repository/compare",
+                    error_code="invalid_compare_response",
+                ),
+            )
+        paths: set[str] = set()
+        for diff in diffs:
+            if not isinstance(diff, dict):
+                continue
+            for key in ("old_path", "new_path"):
+                path = str(diff.get(key) or "")
+                if path:
+                    paths.add(path)
+        return sorted(paths)
+
     def artifact_digest(self, project_id: int, ref: str, paths: list[str]) -> str:
         lines = []
         for path in sorted(paths):
@@ -1589,7 +1676,7 @@ class GitLabClient:
         }.get(metadata.stage)
         if pattern_stage is None:
             return
-        patterns = self.config.artifact_patterns.get(pattern_stage.value, [])
+        patterns = run.artifact_scope.patterns_for(pattern_stage)
         current_paths = self.artifact_paths(
             run.project.project_id,
             ref,
@@ -1629,7 +1716,7 @@ class GitLabClient:
         current_paths = self.artifact_paths(
             run.project.project_id,
             ref,
-            self.config.artifact_patterns.get(pattern_stage.value, []),
+            run.artifact_scope.patterns_for(pattern_stage),
         )
         if current_paths != sorted(baseline.artifact_paths):
             raise ValueError(

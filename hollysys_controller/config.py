@@ -99,7 +99,7 @@ class ControllerConfig(BaseModel):
     preflight_command_timeout_seconds: int = Field(default=120, ge=2, le=120)
     stage_assignees: dict[Stage, str]
     stage_skills: dict[Stage, list[str]]
-    artifact_patterns: dict[str, list[str]]
+    artifact_relative_patterns: dict[str, list[str]]
     reviewer_identities: dict[str, list[str]]
     document_review_limit: int = Field(default=3, ge=1)
     code_modification_limit: int = Field(default=5, ge=1)
@@ -117,6 +117,7 @@ class ControllerConfig(BaseModel):
     worker_progress_lease_seconds: int = Field(default=1800, ge=300)
     worker_heartbeat_stale_seconds: int = Field(default=300, ge=60)
     worker_redispatch_limit: int = Field(default=2, ge=0, le=10)
+    provider_tempfail_cooldown_seconds: int = Field(default=300, ge=30, le=3600)
     worker_supervisor_socket: Path = Path(
         "/run/hollysys-controller/worker-supervisor.sock"
     )
@@ -185,12 +186,20 @@ class ControllerConfig(BaseModel):
                 Stage.PLAN_REVIEW.value,
                 Stage.TASKS_REVIEW.value,
             }
-            if not self.artifact_patterns.get(stage)
+            if not self.artifact_relative_patterns.get(stage)
         }
         if missing_patterns:
             raise ValueError(
-                "artifact_patterns missing: " + ", ".join(sorted(missing_patterns))
+                "artifact_relative_patterns missing: "
+                + ", ".join(sorted(missing_patterns))
             )
+        for patterns in self.artifact_relative_patterns.values():
+            for pattern in patterns:
+                path = Path(pattern)
+                if path.is_absolute() or ".." in path.parts:
+                    raise ValueError(
+                        "artifact_relative_patterns must stay below the PRD scope"
+                    )
         missing_identities = {
             stage
             for stage in {

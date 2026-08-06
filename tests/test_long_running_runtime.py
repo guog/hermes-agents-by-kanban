@@ -241,6 +241,64 @@ class LongRunningStoreTests(unittest.TestCase):
         self.assertEqual(runtime["redispatch_count"], 1)
         self.assertEqual(runtime["attempt_status"], "running")
 
+    def test_reclaimed_event_does_not_double_count_redispatch(self) -> None:
+        run_key = "hollysys-abcdefghijklmnopqrst"
+        self.store.save_run(run_record(self.root))
+        self.store.add_managed_card(
+            board="gitlab-p12",
+            card_id="t_redispatch_once",
+            run_key=run_key,
+            stage="plan-write",
+            iteration=1,
+            idempotency_key="dispatch-redispatch-once",
+            parent_card_id=None,
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_redispatch_once",
+            kind="claimed",
+            created_at=100,
+            worker_session_id="kanban-run:10",
+            worker_pid=101,
+            lease_seconds=300,
+            run_id="gitlab-p12:10",
+        )
+        self.store.update_worker_watchdog(
+            board="gitlab-p12",
+            card_id="t_redispatch_once",
+            attempt_status="redispatch_requested",
+            lease_seconds=300,
+            reason="confirmed_worker_exit",
+            increment_redispatch=True,
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_redispatch_once",
+            kind="reclaimed",
+            created_at=200,
+            worker_session_id="kanban-run:10",
+            worker_pid=101,
+            lease_seconds=300,
+            run_id="gitlab-p12:10",
+        )
+        self.store.record_card_runtime_event(
+            board="gitlab-p12",
+            card_id="t_redispatch_once",
+            kind="claimed",
+            created_at=220,
+            worker_session_id="kanban-run:11",
+            worker_pid=202,
+            lease_seconds=300,
+            run_id="gitlab-p12:11",
+        )
+
+        runtime = self.store.card_runtime("gitlab-p12", "t_redispatch_once")
+        assert runtime is not None
+        self.assertEqual(runtime["attempt"], 2)
+        self.assertEqual(runtime["redispatch_count"], 1)
+        attempts = self.store.attempts_for_run(run_key)
+        self.assertEqual(attempts[1]["redispatched_from_run_id"], "gitlab-p12:10")
+
     def test_late_heartbeat_cannot_resurrect_reclaimed_attempt(self) -> None:
         self.store.register_card_attempt(
             board="gitlab-p12",

@@ -573,6 +573,14 @@ frontmatter `name` 和 SOUL 引用一致。Controller 创建后会从 Kanban DB 
 
 producer 必须从对应模板生成工件；reviewer 只把实质性缺项作为问题，不因纯排版差异阻塞交付。
 
+每个 run 还会把源 `docs/prds/<prd>.md` 映射为持久化的单一
+`artifact_scope`：SPEC、PLAN、TASKS 只能来自其同名目录
+`docs/prds/<prd>/`。Controller 同时比较 writer 的 `head_before_sha → artifact head`
+和整个 run 的 `repository_base_sha → current head`：writer 只能改当前阶段工件，reviewer
+不能产生新 diff，源 PRD 与其他 PRD 的文档必须保持原 blob。其他 PRD 的问题只能作为
+另开 run 的观察，不能进入当前 repair；即使 Agent 把跨 PRD 文件写进 completion，门禁也会
+失败关闭。
+
 上游模板：[SPEC](https://github.com/github/spec-kit/blob/4d3a4281bc63bd2af9f2515bb1036fc38da1294e/templates/spec-template.md)、[PLAN](https://github.com/github/spec-kit/blob/4d3a4281bc63bd2af9f2515bb1036fc38da1294e/templates/plan-template.md)、[TASKS](https://github.com/github/spec-kit/blob/4d3a4281bc63bd2af9f2515bb1036fc38da1294e/templates/tasks-template.md)。
 
 ### 6.2 启动协议
@@ -942,7 +950,9 @@ Controller 容器内另起本地 `ControllerService`，否则 Profile HOME 中�
   `request_status=running` 的只读初始化快照，后台继续同一个幂等请求；客户端不会因
   120 秒终端超时重复创建任务；
 - 运维与 Dispatcher 调用 `health --probe readiness`，查看最近对账、Kanban/GitLab、
-  outbox、merge wait、stale worker、逐 Profile 准入结果和持久 dependency outage；
+  outbox、merge wait、stale worker、逐 Profile 准入结果、`model_provider` 冷却状态和持久
+  dependency outage；真实 waitpid 上报的 provider `EX_TEMPFAIL`（exit 75）会立即进入
+  不消耗 redispatch budget 的持久冷却，冷却结束后才释放同一卡片重试；
 - 静态和深度预检逐 Profile 校验阶段必需的 `hollysys-*` Skill 以及共享 `glab`
   Skill，并将文件摘要绑定到 active 启动契约；缺失、符号链接或预检后变更都会
   fail closed；

@@ -3416,6 +3416,100 @@ class ServiceRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(len(service.store.pending_outbox()), 2)
 
+    def test_exit_75_enters_idempotent_provider_cooldown_without_redispatch(self) -> None:
+        task = task_record(
+            task_id="t_provider_tempfail",
+            body="body",
+            status="running",
+            assignee="planner",
+            current_run_id=8,
+            worker_pid=750,
+        )
+        managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=task.id,
+            run_key=self.run.run_key,
+            stage=Stage.PLAN_WRITE.value,
+            iteration=1,
+            idempotency_key="provider-tempfail",
+            parent_card_id="t_parent",
+            purpose="work",
+            created_at=1,
+        )
+        service = object.__new__(ControllerService)
+        service.config = config(self.root).model_copy(
+            update={
+                "provider_tempfail_cooldown_seconds": 60,
+                "notification_level": NotificationLevel.STANDARD,
+            }
+        )
+        service.store = ControllerStore(self.root / "provider-tempfail.db")
+        service.store.save_run(self.run)
+        service.store.add_managed_card(
+            board=managed.board,
+            card_id=managed.card_id,
+            run_key=managed.run_key,
+            stage=managed.stage,
+            iteration=managed.iteration,
+            idempotency_key=managed.idempotency_key,
+            parent_card_id=managed.parent_card_id,
+            purpose=managed.purpose,
+            created_at=managed.created_at,
+        )
+        service.reader = type(
+            "ProviderReader",
+            (),
+            {"task": staticmethod(lambda board, card_id: task)},
+        )()
+        quarantines = []
+        service.kanban = type(
+            "ProviderKanban",
+            (),
+            {
+                "quarantine_provider_tempfail": staticmethod(
+                    lambda board, card_id, reason, **kwargs: (
+                        quarantines.append((board, card_id, kwargs))
+                        or type("Blocked", (), {"status": "blocked"})()
+                    )
+                )
+            },
+        )()
+        service._record_agent_lifecycle_event(
+            managed,
+            EventRecord(
+                id=1,
+                task_id=task.id,
+                run_id=8,
+                kind="claimed",
+                payload={"pid": 750},
+                created_at=100,
+            ),
+        )
+        exit_event = EventRecord(
+            id=2,
+            task_id=task.id,
+            run_id=8,
+            kind="worker_exited",
+            payload={"pid": 750, "exit_kind": "exited", "exit_code": 75},
+            created_at=110,
+        )
+
+        service._record_agent_lifecycle_event(managed, exit_event)
+        service._record_agent_lifecycle_event(managed, exit_event)
+
+        self.assertEqual(len(quarantines), 1)
+        runtime = service.store.card_runtime(managed.board, managed.card_id)
+        assert runtime is not None
+        self.assertEqual(runtime["attempt_status"], "provider_cooldown")
+        self.assertEqual(runtime["redispatch_count"], 0)
+        attempt = service.store.attempts_for_run(self.run.run_key)[0]
+        worker_exit = next(
+            metric
+            for metric in attempt["metrics"]
+            if metric["metric"] == "worker_exit"
+        )
+        self.assertIn('"exit_code":75', worker_exit["summary"])
+
     def test_minimal_level_only_keeps_explicit_human_action_progress(
         self,
     ) -> None:

@@ -48,23 +48,17 @@ stage_skills:
   test: [hollysys-test, glab]
   code-review: [hollysys-review-code, glab]
 
-# These patterns define the complete artifact set whose path/blob digest is
-# checked at each document gate. Override them for repositories with another
-# Hollysys layout; they are matched against the full tree at artifact commit.
-artifact_patterns:
+# These paths are relative to the immutable source PRD's sibling directory.
+# For docs/prds/prd-example.md, every pattern is rooted below
+# docs/prds/prd-example/. A run can never read or write another PRD's artifacts.
+artifact_relative_patterns:
   spec-review:
-    - "docs/prds/*/specs/spec-*.md"
-    - "specs/**/*.md"
-    - "docs/specs/**/*.md"
+    - "specs/spec-*.md"
   plan-review:
-    - "docs/prds/*/plans/plan-*.md"
-    - "plans/**/*.md"
-    - "docs/plans/**/*.md"
+    - "plans/plan-*.md"
   tasks-review:
-    - "docs/prds/*/tasks/task-*.md"
-    - "tasks/**/*.md"
-    - "docs/tasks/**/*.md"
-    - "**/tasks.md"
+    - "tasks/task-*.md"
+    - "tasks/tasks-*.md"
 
 # Set these through HOLLYSYS_*_IDENTITIES in .env. Values may be GitLab username,
 # numeric user id, or display name. Empty means the corresponding gate fails.

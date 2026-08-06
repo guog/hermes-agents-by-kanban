@@ -40,6 +40,45 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(next_stage(Stage.IMPLEMENT), Stage.TEST)
 
+    def test_all_nine_successful_stages_reach_completed_ready(self) -> None:
+        paired_test = None
+        for index, stage in enumerate(SEQUENCE):
+            overrides = {}
+            if stage in {
+                Stage.SPEC_WRITE,
+                Stage.SPEC_REVIEW,
+                Stage.PLAN_WRITE,
+                Stage.PLAN_REVIEW,
+                Stage.TASKS_WRITE,
+                Stage.TASKS_REVIEW,
+            }:
+                overrides.update(
+                    artifact_paths=[f"docs/prds/example/{stage.value}.md"],
+                    artifact_digest="b" * 64,
+                    artifact_commit_sha="c" * 40,
+                )
+                if stage in {
+                    Stage.SPEC_REVIEW,
+                    Stage.PLAN_REVIEW,
+                    Stage.TASKS_REVIEW,
+                }:
+                    overrides["baseline_disposition"] = "reviewed"
+            metadata = completion(self.root, stage, **overrides)
+            route = route_completion(
+                metadata,
+                review_attempts_by_stage={},
+                config=self.config,
+                paired_test=paired_test,
+            )
+            if stage == Stage.TEST:
+                paired_test = metadata
+            if index < len(SEQUENCE) - 1:
+                self.assertEqual(route.next_stage, SEQUENCE[index + 1])
+                self.assertIsNone(route.terminal_state)
+            else:
+                self.assertEqual(route.terminal_state, "completed_ready")
+                self.assertFalse(route.merge)
+
     def test_review_fail_returns_to_producer(self) -> None:
         metadata = completion(
             self.root,

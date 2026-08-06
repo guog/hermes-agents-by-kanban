@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -225,6 +226,19 @@ class ControllerService:
         if resolved_root not in resolved.parents:
             raise RunPolicyError("unsafe_card_scratch_dir")
         return current
+
+    def _prepare_exception_scratch_dir(self, run: RunRecord, key: str) -> Path:
+        record = type(
+            "ExceptionScratch",
+            (),
+            {
+                "scratch_dir": (
+                    f"/opt/data/scratch/{run.run_generation}/"
+                    f"{hashlib.sha256(key.encode()).hexdigest()[:20]}"
+                )
+            },
+        )()
+        return self._prepare_card_scratch_dir(record)
 
     def start(self, raw: dict) -> dict:
         if getattr(self.config, "controller_mode", "active") != "active":
@@ -1758,7 +1772,7 @@ class ControllerService:
             raise ValueError("artifact validation requires a bound delivery MR")
         head_sha = str(mr["sha"])
         fetch_started = time.monotonic()
-        patterns = self.config.artifact_patterns.get(pattern_stage.value, [])
+        patterns = run.artifact_scope.patterns_for(pattern_stage)
         try:
             paths = self.gitlab.artifact_paths(
                 run.project.project_id,
@@ -2496,6 +2510,7 @@ class ControllerService:
                 self.last_reconcile_at = int(time.time())
                 self.flush_outbox()
                 return
+            self._release_provider_cooldowns()
             self._enqueue_stale_worker_notices()
             for run_key in self.store.active_reconcile_run_keys():
                 self.store.enqueue_reconcile(
@@ -4207,6 +4222,19 @@ class ControllerService:
                 runtime_metrics=runtime_metrics,
                 progress_summary=progress_summary,
             )
+        if (
+            event.kind == "worker_exited"
+            and isinstance(event.payload, dict)
+            and event.payload.get("exit_kind") == "exited"
+            and event.payload.get("exit_code") == 75
+            and event.run_id is not None
+            and worker_pid is not None
+        ):
+            self._record_provider_tempfail_exit(
+                managed,
+                event,
+                worker_pid=worker_pid,
+            )
         started = event.kind in {"claimed", "started", "worker_started"}
         interrupted = event.kind in {
             "blocked",
@@ -4302,6 +4330,83 @@ class ControllerService:
                     ],
                 ),
             )
+
+    def _record_provider_tempfail_exit(
+        self,
+        managed: ManagedCard,
+        event: EventRecord,
+        *,
+        worker_pid: int,
+    ) -> None:
+        if event.run_id is None:
+            return
+        attempt_run_id = f"{managed.board}:{event.run_id}"
+        self.store.record_attempt_metric(
+            attempt_run_id,
+            metric="worker_exit",
+            duration_ms=0,
+            summary=json.dumps(
+                {"exit_kind": "exited", "exit_code": 75},
+                separators=(",", ":"),
+            ),
+        )
+        task = self.reader.task(managed.board, managed.card_id)
+        if (
+            task is None
+            or task.status != "running"
+            or task.current_run_id != event.run_id
+            or task.worker_pid != worker_pid
+        ):
+            return
+        run = self.store.run_record(managed.run_key)
+        if run is None:
+            raise ControllerFatalError(f"unknown_run:{managed.run_key}")
+        operation_key = (
+            f"{run.run_key}:provider-tempfail:{managed.card_id}:"
+            f"{event.run_id}:{worker_pid}"
+        )
+        payload = {
+            "run_key": run.run_key,
+            "board": managed.board,
+            "card_id": managed.card_id,
+            "attempt_run_id": event.run_id,
+            "worker_pid": worker_pid,
+            "exit_code": 75,
+        }
+
+        def quarantine() -> dict:
+            refreshed = self.kanban.quarantine_provider_tempfail(
+                managed.board,
+                managed.card_id,
+                "model provider temporary failure (worker exit 75)",
+                expected_run_id=event.run_id,
+                expected_worker_pid=worker_pid,
+            )
+            self.store.record_card_runtime_event(
+                board=managed.board,
+                card_id=managed.card_id,
+                kind="rate_limited",
+                created_at=event.created_at,
+                run_id=attempt_run_id,
+                worker_session_id=f"kanban-run:{event.run_id}",
+                worker_pid=worker_pid,
+                lease_seconds=self.config.provider_tempfail_cooldown_seconds,
+            )
+            self.store.update_worker_watchdog(
+                board=managed.board,
+                card_id=managed.card_id,
+                attempt_status="provider_cooldown",
+                lease_seconds=self.config.provider_tempfail_cooldown_seconds,
+                reason="provider_tempfail_exit_75",
+            )
+            return {"status": refreshed.status, "attempt_run_id": event.run_id}
+
+        self._operation(
+            operation_key,
+            "provider-tempfail-quarantine",
+            payload,
+            quarantine,
+        )
 
     @staticmethod
     def _runtime_attempt_run_id(runtime: dict) -> int | None:
@@ -4788,6 +4893,62 @@ class ControllerService:
                 finally:
                     self._finish_reconcile(run_key)
 
+    def _release_provider_cooldowns(self) -> None:
+        now = int(time.time())
+        for run_key in self.store.run_keys():
+            control = self.store.run_control(run_key)
+            if control is None or control["state"] != "active":
+                continue
+            for runtime in self.store.runtime_for_run(run_key):
+                if (
+                    runtime.get("attempt_status") != "provider_cooldown"
+                    or int(runtime.get("deadline_at") or 0) > now
+                ):
+                    continue
+                board = str(runtime["board"])
+                card_id = str(runtime["card_id"])
+                session = str(runtime.get("worker_session_id") or "unknown")
+                key = f"{run_key}:provider-tempfail-release:{card_id}:{session}"
+
+                def release(
+                    release_board: str = board,
+                    release_card_id: str = card_id,
+                ) -> dict:
+                    task = self.reader.task(release_board, release_card_id)
+                    if task is None:
+                        raise ValueError(f"unknown task {release_card_id}")
+                    if task.status == "blocked":
+                        self.kanban.release(release_board, release_card_id)
+                        task = self.reader.task(release_board, release_card_id)
+                    if task is None or task.status not in {
+                        "todo",
+                        "ready",
+                        "running",
+                    }:
+                        raise ValueError(
+                            f"provider cooldown card is not retryable: "
+                            f"{task.status if task else 'missing'}"
+                        )
+                    self.store.update_worker_watchdog(
+                        board=release_board,
+                        card_id=release_card_id,
+                        attempt_status="provider_retry_ready",
+                        reason="provider_tempfail_cooldown_elapsed",
+                    )
+                    return {"status": task.status}
+
+                self._operation(
+                    key,
+                    "provider-tempfail-release",
+                    {
+                        "run_key": run_key,
+                        "board": board,
+                        "card_id": card_id,
+                        "worker_session_id": session,
+                    },
+                    release,
+                )
+
     def _watchdog_target_is_current(
         self,
         run_key: str,
@@ -5117,12 +5278,28 @@ class ControllerService:
                 "kanban_ok": kanban_ok,
             }
         )
+        provider_cooldowns = [
+            {
+                "run_key": run_key,
+                "card_id": str(runtime["card_id"]),
+                "retry_at": runtime.get("deadline_at"),
+            }
+            for run_key in self.store.run_keys()
+            for runtime in self.store.runtime_for_run(run_key)
+            if runtime.get("attempt_status") == "provider_cooldown"
+        ]
+        data["model_provider"] = {
+            "ok": not provider_cooldowns,
+            "status": "available" if not provider_cooldowns else "cooldown",
+            "cooldowns": provider_cooldowns,
+        }
         readiness_ok = (
             self.last_reconcile_error is None
             and reconcile_fresh
             and kanban_ok
             and data["outbox_pending"] < self.config.outbox_warning_threshold
             and not data["dependency_outages"]
+            and data["model_provider"]["ok"]
         )
         try:
             data["gitlab"] = self.gitlab.health()
@@ -5913,6 +6090,31 @@ class ControllerService:
         metadata: CompletionMetadata,
     ) -> None:
         self._validate_completion_identity(run, item, metadata)
+        if (
+            metadata.stage
+            in {Stage.SPEC_REVIEW, Stage.PLAN_REVIEW, Stage.TASKS_REVIEW}
+            and metadata.outcome == Outcome.FAIL
+        ):
+            outside_scope: set[str] = set()
+            for issue in metadata.issues:
+                for match in re.findall(
+                    r"docs/prds/[A-Za-z0-9._/-]+",
+                    issue,
+                ):
+                    path = match.rstrip(".,;:)]}")
+                    if (
+                        path != run.source.prd_path
+                        and not path.startswith(
+                            f"{run.artifact_scope.root_path}/"
+                        )
+                    ):
+                        outside_scope.add(path)
+            if outside_scope:
+                raise ValueError(
+                    "review findings reference documents outside current PRD "
+                    "scope; report them as observations in a separate run: "
+                    + ", ".join(sorted(outside_scope))
+                )
         binding = self.store.delivery_binding(run.run_key)
         if binding is None:
             return
@@ -6175,6 +6377,7 @@ class ControllerService:
             raise RunPolicyError("worker_recovery_pending")
         suffix = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:12]
         key = f"{run.run_key}:exception:{suffix}:work"
+        self._prepare_exception_scratch_dir(run, key)
         task = self.kanban.create_exception(run, parent_card_id, reason, key)
         if (
             task.created_by != "hollysys-controller"

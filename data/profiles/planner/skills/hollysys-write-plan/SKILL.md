@@ -12,6 +12,8 @@ version: 4.0.0
   复用或局部改造现有 MES，不创建平行架构。
 - 本任务由父 Agent 完成，不调用 `delegate_task`。先限定与 SPEC 直接相关的真实目录，
   再做精确搜索；单轮最多读取 20 个目标文件，不做全仓库扫描或重复审查。
+- `card-context.run.artifact_scope` 是唯一 PLAN 写入边界。不得把其他 PRD 的 PLAN 加入
+  `artifact_paths`、repair 或 commit；跨 PRD 问题必须另开 run。
 
 1. 使用 `hollysysctl card-context --card-id "$HERMES_KANBAN_TASK"` 获取并保存受信 v4
    上下文；验证 expected head、context digest、Delivery 和 frozen baseline。

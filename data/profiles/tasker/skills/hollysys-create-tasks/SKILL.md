@@ -8,6 +8,8 @@ version: 4.0.0
 
 - 只操作 Controller 指定 worktree、branch 和绑定 MR；不得创建/选择分支、MR、Issue
   或 GitLab Task。GitLab 操作只用锁定的 `glab`。
+- `card-context.run.artifact_scope` 是唯一 TASKS 写入边界；其他 PRD 的工件只读，不能
+  纳入 `artifact_paths`、repair 或 commit，跨 PRD 问题必须另开 run。
 
 1. 通过 `hollysysctl card-context --card-id "$HERMES_KANBAN_TASK"` 获取受信 v4 上下文，
    保存到其 `scratch_dir`，核对 head/context/Delivery/frozen baseline。

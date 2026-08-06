@@ -10,6 +10,8 @@ version: 4.0.0
   创建/选择 MR。GitLab 操作只用锁定的 `glab`。
 - 本任务由父 Agent 完成，不调用 `delegate_task`，也不做全仓库扫描。先按 SPEC 和
   PLAN 引用定位真实模块，单轮最多读取 20 个目标文件。
+- 只审查 `card-context.run.artifact_scope` 中当前 PRD 的 PLAN。其他 PRD PLAN 不得进入
+  `artifact_paths` 或 findings；偶然发现的问题只作另开 run 的观察，不得要求本 run 修复。
 
 1. 通过 `hollysysctl card-context --card-id "$HERMES_KANBAN_TASK"` 获取受信 v4 上下文，
    保存到其 `scratch_dir`。

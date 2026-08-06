@@ -19,7 +19,7 @@ from hollysys_controller.errors import (
     MergeBlocked,
 )
 from hollysys_controller.gitlab import CheckedHeadConflict, GitLabClient
-from hollysys_controller.models import Stage
+from hollysys_controller.models import ArtifactScope, Stage
 from tests.helpers import completion, config, run_record, write_profile_env
 
 
@@ -46,6 +46,8 @@ class FakeGitLab(GitLabClient):
         self.refs = [{"type": "branch", "name": "feature/example-aaaaaaaa"}]
         self.artifact_path_result = ["docs/specs/feature/spec.md"]
         self.artifact_digest_result = "b" * 64
+        self.artifact_patterns_seen = []
+        self.changed_paths_result = []
         self.api_calls = []
 
     def delivery_mr(self, run, mr_iid=None):
@@ -113,10 +115,14 @@ class FakeGitLab(GitLabClient):
         raise AssertionError(f"unexpected API endpoint {endpoint}")
 
     def artifact_paths(self, project_id, ref, patterns):
+        self.artifact_patterns_seen.append(list(patterns))
         return list(self.artifact_path_result)
 
     def artifact_digest(self, project_id, ref, paths):
         return self.artifact_digest_result
+
+    def changed_paths(self, project_id, from_ref, to_ref):
+        return list(self.changed_paths_result)
 
 
 class GitLabGateTests(unittest.TestCase):
@@ -182,6 +188,48 @@ class GitLabGateTests(unittest.TestCase):
                 ),
             }
         ]
+
+    def test_artifact_scope_is_derived_from_the_single_source_prd(self) -> None:
+        scope = ArtifactScope.from_prd_path(
+            "docs/prds/prd-capacity-management.md"
+        )
+        self.assertEqual(scope.root_path, "docs/prds/prd-capacity-management")
+        self.assertEqual(
+            scope.patterns_for(Stage.PLAN_REVIEW),
+            ["docs/prds/prd-capacity-management/plans/plan-*.md"],
+        )
+
+    def test_plan_gate_rejects_changes_to_another_prd(self) -> None:
+        scope = ArtifactScope.from_prd_path(
+            "docs/prds/prd-capacity-management.md"
+        )
+        run = self.run.model_copy(update={"artifact_scope": scope})
+        current_plan = (
+            "docs/prds/prd-capacity-management/plans/"
+            "plan-capacity-management.md"
+        )
+        self.client.artifact_path_result = [current_plan]
+        self.client.changed_paths_result = [
+            current_plan,
+            "docs/prds/prd-order-priority/plans/plan-order-priority.md",
+        ]
+        metadata = completion(
+            self.root,
+            Stage.PLAN_WRITE,
+            artifact_paths=[current_plan],
+            artifact_commit_sha="c" * 40,
+            artifact_digest=self.client.artifact_digest_result,
+            head_before_sha=run.workspace.repository_base_sha,
+            head_sha="c" * 40,
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside current PRD scope"):
+            self.client.validate_artifact_completion(run, metadata)
+
+        self.assertEqual(
+            self.client.artifact_patterns_seen,
+            [["docs/prds/prd-capacity-management/plans/plan-*.md"]],
+        )
         self.client.validate_gate(self.run, self.test_meta)
         self.client.notes[0]["author"]["username"] = "wrong-user"
         with self.assertRaisesRegex(ValueError, "allowed GitLab identity"):

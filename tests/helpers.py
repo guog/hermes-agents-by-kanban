@@ -5,6 +5,7 @@ from pathlib import Path
 
 from hollysys_controller.config import ControllerConfig
 from hollysys_controller.models import (
+    ArtifactScope,
     CompletionMetadata,
     FeishuOrigin,
     ProjectFacts,
@@ -40,10 +41,10 @@ def config(tmp_path: Path) -> ControllerConfig:
             Stage.CODE_REVIEW: "code-reviewer",
         },
         stage_skills={stage: [f"skill-{stage.value}", "glab"] for stage in Stage},
-        artifact_patterns={
-            "spec-review": ["docs/specs/**/*.md"],
-            "plan-review": ["docs/plans/**/*.md"],
-            "tasks-review": ["docs/tasks/**/*.md"],
+        artifact_relative_patterns={
+            "spec-review": ["specs/spec-*.md"],
+            "plan-review": ["plans/plan-*.md"],
+            "tasks-review": ["tasks/task-*.md"],
         },
         reviewer_identities={
             "spec-review": ["spec-reviewer"],
@@ -124,6 +125,7 @@ def run_record(tmp_path: Path) -> RunRecord:
                 "https://green-git.hollysys.net/group/project/-/merge_requests/1"
             ),
         ),
+        artifact_scope=ArtifactScope.from_prd_path("docs/prds/example.md"),
         workspace=WorkspaceFacts(
             board="gitlab-p12",
             checkout=str(tmp_path / "projects" / "p12-project"),

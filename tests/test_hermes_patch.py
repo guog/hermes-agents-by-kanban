@@ -669,6 +669,43 @@ class HermesPatchTests(unittest.TestCase):
         ):
             namespace["build_env"](task, {})
 
+    def test_controller_exception_worker_receives_safe_attempt_scratch(self) -> None:
+        source = (
+            "    if task.tenant:\n"
+            '        env["HERMES_TENANT"] = task.tenant\n'
+            '    env["HERMES_KANBAN_TASK"] = task.id\n'
+        )
+        patched = self.patch.patch_worker_run_scratch(source)
+        namespace = {"json": json, "os": os}
+        exec(  # noqa: S102 - generated runtime patch is tested in isolation
+            "def build_env(task, env):\n" + patched + "    return env\n",
+            namespace,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            scratch_root = Path(directory) / "scratch"
+            scratch = scratch_root / "exception"
+            scratch.mkdir(parents=True)
+            payload = json.dumps({"scratch_dir": str(scratch)})
+            task = SimpleNamespace(
+                tenant="run",
+                created_by="hollysys-controller",
+                body=(
+                    "[hollysys-controller-exception:v4]\n\n"
+                    f"```json\n{payload}\n```\n"
+                ),
+                id="t_exception",
+            )
+            with patch.dict(
+                os.environ,
+                {"HERMES_SCRATCH_DIR": str(scratch_root)},
+            ):
+                env = namespace["build_env"](task, {})
+
+        self.assertEqual(
+            env["HERMES_RUN_SCRATCH_DIR"],
+            os.path.realpath(scratch),
+        )
+
     def test_named_profile_prompt_uses_active_and_default_roots(self) -> None:
         source = (
             "    else:\n"

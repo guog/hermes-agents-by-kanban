@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -127,6 +128,84 @@ class WorkspaceFacts(StrictModel):
     repository_base_sha: Annotated[str, Field(pattern=SHA_PATTERN)]
 
 
+class ArtifactScope(StrictModel):
+    """Immutable, single-PRD document boundary for one delivery run."""
+
+    source_prd_path: str
+    root_path: str
+    spec_patterns: list[str] = Field(min_length=1)
+    plan_patterns: list[str] = Field(min_length=1)
+    tasks_patterns: list[str] = Field(min_length=1)
+
+    @classmethod
+    def from_prd_path(
+        cls,
+        prd_path: str,
+        relative_patterns: dict[str, list[str]] | None = None,
+    ) -> ArtifactScope:
+        path = PurePosixPath(prd_path)
+        if (
+            path.is_absolute()
+            or path.suffix.lower() != ".md"
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or len(path.parts) < 2
+        ):
+            raise ValueError("PRD path cannot define a canonical artifact scope")
+        root = str(path.with_suffix(""))
+        configured = relative_patterns or {
+            Stage.SPEC_REVIEW.value: ["specs/spec-*.md"],
+            Stage.PLAN_REVIEW.value: ["plans/plan-*.md"],
+            Stage.TASKS_REVIEW.value: ["tasks/task-*.md", "tasks/tasks-*.md"],
+        }
+
+        def scoped(stage: Stage) -> list[str]:
+            patterns = configured.get(stage.value, [])
+            if not patterns:
+                raise ValueError(f"artifact scope lacks {stage.value} patterns")
+            result = []
+            for pattern in patterns:
+                candidate = PurePosixPath(pattern)
+                if (
+                    candidate.is_absolute()
+                    or any(part in {"", ".", ".."} for part in candidate.parts)
+                ):
+                    raise ValueError("artifact scope pattern must be relative")
+                result.append(f"{root}/{pattern}")
+            return result
+
+        return cls(
+            source_prd_path=prd_path,
+            root_path=root,
+            spec_patterns=scoped(Stage.SPEC_REVIEW),
+            plan_patterns=scoped(Stage.PLAN_REVIEW),
+            tasks_patterns=scoped(Stage.TASKS_REVIEW),
+        )
+
+    def patterns_for(self, stage: Stage) -> list[str]:
+        phase = {
+            Stage.SPEC_WRITE: self.spec_patterns,
+            Stage.SPEC_REVIEW: self.spec_patterns,
+            Stage.PLAN_WRITE: self.plan_patterns,
+            Stage.PLAN_REVIEW: self.plan_patterns,
+            Stage.TASKS_WRITE: self.tasks_patterns,
+            Stage.TASKS_REVIEW: self.tasks_patterns,
+        }.get(stage)
+        if phase is None:
+            raise ValueError(f"{stage.value} has no document artifact scope")
+        return list(phase)
+
+    def phase_contains(self, stage: Stage, path: str) -> bool:
+        return any(
+            fnmatch.fnmatchcase(path, pattern)
+            for pattern in self.patterns_for(stage)
+        )
+
+    def run_allows_document_path(self, path: str) -> bool:
+        if path == self.source_prd_path:
+            return False
+        return path.startswith(f"{self.root_path}/")
+
+
 class RunRecord(StrictModel):
     protocol_version: Literal["hollysys-controller/v4"] = "hollysys-controller/v4"
     kind: Literal["run-init"] = "run-init"
@@ -137,6 +216,7 @@ class RunRecord(StrictModel):
     provenance: Literal["fresh_v4"] = "fresh_v4"
     project: ProjectFacts
     source: SourceFacts
+    artifact_scope: ArtifactScope
     workspace: WorkspaceFacts
     origin: FeishuOrigin
 
@@ -144,6 +224,8 @@ class RunRecord(StrictModel):
     def validate_started_at(self) -> RunRecord:
         if self.started_at.tzinfo is None:
             raise ValueError("started_at must include a timezone")
+        if self.artifact_scope.source_prd_path != self.source.prd_path:
+            raise ValueError("artifact scope must be derived from the source PRD")
         return self
 
 
@@ -260,6 +342,31 @@ class CardRecord(StrictModel):
 
     @model_validator(mode="after")
     def validate_scratch_dir(self) -> CardRecord:
+        path = PurePosixPath(self.scratch_dir)
+        root = PurePosixPath("/opt/data/scratch")
+        if (
+            not path.is_absolute()
+            or path == root
+            or path.parts[: len(root.parts)] != root.parts
+            or ".." in path.parts
+        ):
+            raise ValueError(
+                "scratch_dir must be a child of /opt/data/scratch"
+            )
+        return self
+
+
+class ExceptionCardRecord(StrictModel):
+    protocol_version: Literal["hollysys-controller/v4"] = "hollysys-controller/v4"
+    kind: Literal["exception"] = "exception"
+    run: RunRecord
+    parent_card_id: Annotated[str, Field(pattern=CARD_ID_PATTERN)]
+    idempotency_key: str
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+    scratch_dir: str
+
+    @model_validator(mode="after")
+    def validate_scratch_dir(self) -> ExceptionCardRecord:
         path = PurePosixPath(self.scratch_dir)
         root = PurePosixPath("/opt/data/scratch")
         if (

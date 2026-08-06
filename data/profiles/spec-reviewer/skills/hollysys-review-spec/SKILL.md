@@ -12,6 +12,8 @@ version: 4.0.0
   才能 `kanban_block`；业务缺陷使用 completion `fail`。
 - 本任务由父 Agent 完成，不调用 `delegate_task`，也不做全仓库扫描；先按 PRD/SPEC
   引用定位真实模块，单轮最多读取 20 个目标文件。
+- 只审查 `card-context.run.artifact_scope` 返回的当前 PRD SPEC。其他 PRD 工件不进入
+  `artifact_paths` 或 findings；若偶然发现问题，只能作为另开 run 的观察，不能要求修复。
 
 1. 执行 `hollysysctl card-context --card-id "$HERMES_KANBAN_TASK"`，保存到响应给出的
    `scratch_dir`。验证 protocol v4、stage、iteration、context digest、expected head、
