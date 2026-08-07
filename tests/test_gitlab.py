@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -667,6 +668,99 @@ class GitLabGateTests(unittest.TestCase):
                     self.run.workspace.repository_base_sha,
                 )
 
+    def test_incomplete_clone_checkout_is_repaired_before_worktree_creation(
+        self,
+    ) -> None:
+        write_profile_env(self.client.config, token="controller-token")
+        checkout = Path(self.run.workspace.checkout)
+        checkout.parent.mkdir(parents=True)
+        subprocess.run(
+            [self.client.config.system_git_command, "init", str(checkout)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        def git(*args: str, input_text: str | None = None) -> str:
+            return subprocess.run(
+                [
+                    self.client.config.system_git_command,
+                    "-C",
+                    str(checkout),
+                    *args,
+                ],
+                check=True,
+                capture_output=True,
+                input=input_text,
+                text=True,
+            ).stdout.strip()
+
+        blob_sha = git("hash-object", "-w", "--stdin", input_text="content\n")
+        tree_sha = git(
+            "mktree",
+            input_text=f"100644 blob {blob_sha}\tREADME.md\n",
+        )
+        base_sha = git(
+            "-c",
+            "user.name=Controller Test",
+            "-c",
+            "user.email=controller@example.com",
+            "commit-tree",
+            tree_sha,
+            "-m",
+            "base",
+        )
+        git(
+            "remote",
+            "add",
+            "origin",
+            "https://green-git.hollysys.net/group/project.git",
+        )
+        (checkout / ".git" / "HEAD").write_text(
+            "ref: refs/heads/.invalid\n",
+            encoding="utf-8",
+        )
+        run = self.run.model_copy(
+            update={
+                "workspace": self.run.workspace.model_copy(
+                    update={"repository_base_sha": base_sha}
+                )
+            }
+        )
+
+        self.client.ensure_workspace(run, base_sha)
+
+        self.assertEqual(git("rev-parse", "--verify", "HEAD^{commit}"), base_sha)
+        self.assertEqual(
+            git("symbolic-ref", "--short", "HEAD"),
+            run.workspace.target_branch,
+        )
+        self.assertEqual(
+            (checkout / "README.md").read_text(encoding="utf-8"),
+            "content\n",
+        )
+        worktree = Path(run.workspace.worktree)
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(
+            (worktree / "README.md").read_text(encoding="utf-8"),
+            "content\n",
+        )
+        self.assertEqual(
+            subprocess.run(
+                [
+                    self.client.config.system_git_command,
+                    "-C",
+                    str(worktree),
+                    "branch",
+                    "--show-current",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            run.workspace.branch,
+        )
+
     def test_existing_worktree_must_belong_to_validated_checkout(self) -> None:
         checkout = Path(self.run.workspace.checkout)
         worktree = Path(self.run.workspace.worktree)
@@ -681,6 +775,8 @@ class GitLabGateTests(unittest.TestCase):
                 )
             elif args[:2] == ["cat-file", "-e"]:
                 stdout = ""
+            elif args == ["rev-parse", "--verify", "HEAD^{commit}"]:
+                stdout = f"{self.run.workspace.repository_base_sha}\n"
             elif args == ["branch", "--show-current"]:
                 stdout = f"{self.run.workspace.branch}\n"
             elif args == ["rev-parse", "--git-common-dir"]:
@@ -696,6 +792,40 @@ class GitLabGateTests(unittest.TestCase):
                 self.run,
                 self.run.workspace.repository_base_sha,
             )
+
+    def test_incomplete_checkout_with_non_git_content_fails_closed(self) -> None:
+        checkout = Path(self.run.workspace.checkout)
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "untracked.txt").write_text("preserve me\n", encoding="utf-8")
+        calls: list[list[str]] = []
+
+        def git_result(cwd, args, tolerate=False):
+            calls.append(args)
+            if args == ["remote", "get-url", "origin"]:
+                return CompletedProcess(
+                    ["git", *args],
+                    0,
+                    "https://green-git.hollysys.net/group/project.git\n",
+                    "",
+                )
+            if args[:2] == ["cat-file", "-e"]:
+                return CompletedProcess(["git", *args], 0, "", "")
+            if args == ["rev-parse", "--verify", "HEAD^{commit}"]:
+                return CompletedProcess(["git", *args], 1, "", "invalid HEAD")
+            self.fail(f"unexpected git invocation: {args}")
+
+        self.client._git = git_result
+
+        with self.assertRaisesRegex(ValueError, "non-Git content"):
+            self.client.ensure_workspace(
+                self.run,
+                self.run.workspace.repository_base_sha,
+            )
+        self.assertEqual(
+            (checkout / "untracked.txt").read_text(encoding="utf-8"),
+            "preserve me\n",
+        )
+        self.assertFalse(any(args[0] == "update-ref" for args in calls))
 
     def test_api_command_timeout_is_a_transient_dependency_error(self) -> None:
         write_profile_env(self.client.config, token="controller-token")

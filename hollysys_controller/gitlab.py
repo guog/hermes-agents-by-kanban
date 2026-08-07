@@ -595,6 +595,15 @@ class GitLabClient:
             != 0
         ):
             self._git(checkout, ["fetch", "origin", base_sha])
+        if (
+            self._git(
+                checkout,
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+                tolerate=True,
+            ).returncode
+            != 0
+        ):
+            self._repair_incomplete_checkout(checkout, run, base_sha)
         if worktree.exists():
             actual = self._git(worktree, ["branch", "--show-current"]).stdout.strip()
             if actual != run.workspace.branch:
@@ -639,6 +648,44 @@ class GitLabClient:
                     base_sha,
                 ],
             )
+
+    def _repair_incomplete_checkout(
+        self,
+        checkout: Path,
+        run: RunRecord,
+        base_sha: str,
+    ) -> None:
+        """Finish a clone interrupted after Git created its repository metadata."""
+        git_dir = checkout / ".git"
+        if git_dir.is_symlink() or not git_dir.is_dir():
+            raise ValueError("incomplete checkout has invalid Git metadata")
+        if any(path.name != ".git" for path in checkout.iterdir()):
+            raise ValueError("incomplete checkout contains non-Git content")
+        local_refs = self._git(checkout, ["show-ref", "--heads"], tolerate=True)
+        linked_worktrees = git_dir / "worktrees"
+        if (
+            local_refs.returncode not in {0, 1}
+            or local_refs.stdout.strip()
+            or (
+                linked_worktrees.is_dir()
+                and any(linked_worktrees.iterdir())
+            )
+        ):
+            raise ValueError("incomplete checkout has existing refs or worktrees")
+
+        target_ref = f"refs/heads/{run.workspace.target_branch}"
+        self._git(checkout, ["symbolic-ref", "HEAD", target_ref])
+        self._git(checkout, ["update-ref", target_ref, base_sha])
+        self._git(checkout, ["reset", "--hard", base_sha])
+        if (
+            self._git(
+                checkout,
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+                tolerate=True,
+            ).returncode
+            != 0
+        ):
+            raise ControllerFatalError("incomplete_checkout_repair_failed")
 
     def create_delivery_branch(self, run: RunRecord) -> dict:
         project = self._project_endpoint(run.project.project_id)
