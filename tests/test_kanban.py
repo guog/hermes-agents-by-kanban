@@ -181,6 +181,99 @@ class KanbanReaderTests(unittest.TestCase):
         retry_index = command.index("--max-retries")
         self.assertEqual(command[retry_index + 1], "3")
 
+    def test_release_accepts_worker_claim_after_promote_reports_failure(self) -> None:
+        statuses = iter(["blocked", "running"])
+
+        def current_task(board: str, task_id: str) -> TaskRecord:
+            return TaskRecord(
+                id=task_id,
+                title="review",
+                body="body",
+                assignee="spec-reviewer",
+                status=next(statuses),
+                created_by="hollysys-controller",
+                created_at=1,
+                completed_at=None,
+                idempotency_key="run:spec-review:2:normal:work",
+                tenant="run",
+                workspace_path="/worktree",
+                branch_name="feature/run",
+                skills=["hollysys-review-spec"],
+                current_run_id=None,
+                latest_summary=None,
+                latest_metadata=None,
+                latest_outcome=None,
+                parents=["t_spec"],
+                comments=[],
+                event_kinds=[],
+            )
+
+        reader = type(
+            "ConcurrentPromotionReader",
+            (),
+            {"task": staticmethod(current_task)},
+        )()
+        cli = KanbanCLI(config(self.root), reader)
+        lost_race = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            (
+                "cannot promote t_review: task t_review is 'running'; "
+                "promote only applies to 'todo' or 'blocked'"
+            ),
+        )
+
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            return_value=lost_race,
+        ) as run_command:
+            cli.release("gitlab-p21", "t_review")
+
+        self.assertEqual(run_command.call_count, 1)
+
+    def test_release_preserves_promote_failure_when_card_remains_blocked(self) -> None:
+        blocked = TaskRecord(
+            id="t_review",
+            title="review",
+            body="body",
+            assignee="spec-reviewer",
+            status="blocked",
+            created_by="hollysys-controller",
+            created_at=1,
+            completed_at=None,
+            idempotency_key="run:spec-review:2:normal:work",
+            tenant="run",
+            workspace_path="/worktree",
+            branch_name="feature/run",
+            skills=["hollysys-review-spec"],
+            current_run_id=None,
+            latest_summary=None,
+            latest_metadata=None,
+            latest_outcome=None,
+            parents=["t_spec"],
+            comments=[],
+            event_kinds=[],
+        )
+        reader = type(
+            "BlockedPromotionReader",
+            (),
+            {"task": staticmethod(lambda board, task_id: blocked)},
+        )()
+        cli = KanbanCLI(config(self.root), reader)
+        failed = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            "cannot promote t_review: task remains blocked",
+        )
+
+        with patch(
+            "hollysys_controller.kanban.subprocess.run",
+            return_value=failed,
+        ), self.assertRaises(DependencyContractError):
+            cli.release("gitlab-p21", "t_review")
+
     def test_prepares_triage_for_completion_with_hermes_transitions(self) -> None:
         states = iter(["triage", "todo", "ready"])
 

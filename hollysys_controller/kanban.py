@@ -15,6 +15,7 @@ from .config import ControllerConfig
 from .errors import (
     ControllerFatalError,
     DependencyContractError,
+    DependencyError,
     DependencyTransientError,
     ErrorContext,
 )
@@ -566,14 +567,25 @@ class KanbanCLI:
         return task
 
     def release(self, board: str, task_id: str) -> None:
+        released_statuses = {"todo", "ready", "running", "done"}
         task = self.reader.task(board, task_id)
         if task is None:
             raise RuntimeError(f"unknown task {task_id}")
-        if task.status in {"ready", "running", "done", "todo"}:
+        if task.status in released_statuses:
             return
-        self._run(["promote", task_id], board=board)
+        try:
+            self._run(["promote", task_id], board=board)
+        except DependencyError:
+            # Hermes can promote the card successfully and immediately let a
+            # Worker claim it before the promote command verifies its own
+            # postcondition. Reconcile the durable task state before treating
+            # that command-level race as a failed external mutation.
+            released = self.reader.task(board, task_id)
+            if released is not None and released.status in released_statuses:
+                return
+            raise
         released = self.reader.task(board, task_id)
-        if released is None or released.status not in {"ready", "running", "todo"}:
+        if released is None or released.status not in released_statuses:
             raise RuntimeError(f"card {task_id} did not leave controller hold")
 
     def abort_task(
