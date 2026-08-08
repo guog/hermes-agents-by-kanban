@@ -2221,7 +2221,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         ]
         service = object.__new__(ControllerService)
         service.config = config(self.root)
-        service._validate_completion_context = lambda *args: None
+        service._validate_completion_context = lambda *args, **kwargs: None
 
         service._validate_finalization_context(
             history, history[-1], final_metadata
@@ -2244,6 +2244,150 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(
             baselines[-1].residual_risk,
             ["client behavior remains ambiguous"],
+        )
+
+    def test_frozen_baselines_survive_later_delivery_head_changes(self) -> None:
+        root_task = task_record(
+            task_id="t_root",
+            body=render_run_body(self.run),
+            status="done",
+            idempotency_key=f"{self.run.run_key}:run-init",
+            tenant=self.run.run_key,
+        )
+        root_managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=root_task.id,
+            run_key=self.run.run_key,
+            stage="run-init",
+            iteration=0,
+            idempotency_key=f"{self.run.run_key}:run-init",
+            parent_card_id=None,
+            purpose="root",
+            created_at=1,
+        )
+        history = [HistoryItem(root_managed, root_task)]
+        parent_id = root_task.id
+        cfg = config(self.root)
+        phase_reviews = (
+            (
+                Stage.SPEC_REVIEW,
+                "t_spec_review",
+                "docs/prds/example/specs/spec-example.md",
+                "1" * 40,
+                "a" * 64,
+            ),
+            (
+                Stage.PLAN_REVIEW,
+                "t_plan_review",
+                "docs/prds/example/plans/plan-example.md",
+                "2" * 40,
+                "b" * 64,
+            ),
+            (
+                Stage.TASKS_REVIEW,
+                "t_tasks_review",
+                "docs/prds/example/tasks/task-example.md",
+                "3" * 40,
+                "c" * 64,
+            ),
+        )
+        for index, (stage, task_id, path, head_sha, digest) in enumerate(
+            phase_reviews,
+            start=1,
+        ):
+            card = CardRecord(
+                run=self.run,
+                stage=stage,
+                iteration=1,
+                idempotency_key=(
+                    f"{self.run.run_key}:{stage.value}:1:normal:work"
+                ),
+                parent_card_id=parent_id,
+                assignee=cfg.stage_assignees[stage],
+                skills=cfg.stage_skills[stage],
+                context_digest=f"{index}" * 64,
+                expected_head_sha=head_sha,
+                scratch_dir=f"/opt/data/scratch/test-{stage.value}",
+            )
+            metadata = completion(
+                self.root,
+                stage,
+                context_digest=card.context_digest,
+                kanban_card_id=task_id,
+                head_before_sha=head_sha,
+                head_sha=head_sha,
+                artifact_paths=[path],
+                artifact_commit_sha=head_sha,
+                artifact_digest=digest,
+                baseline_disposition="reviewed",
+            )
+            task = task_record(
+                task_id=task_id,
+                body=render_card_body(card),
+                status="done",
+                assignee=card.assignee,
+                idempotency_key=card.idempotency_key,
+                tenant=self.run.run_key,
+                skills=card.skills,
+                parents=[parent_id],
+                latest_metadata=metadata.model_dump(mode="json"),
+            )
+            managed = ManagedCard(
+                board=self.run.workspace.board,
+                card_id=task.id,
+                run_key=self.run.run_key,
+                stage=stage.value,
+                iteration=1,
+                idempotency_key=card.idempotency_key,
+                parent_card_id=parent_id,
+                purpose="work",
+                created_at=index + 1,
+            )
+            history.append(HistoryItem(managed, task))
+            parent_id = task.id
+
+        current_head = "4" * 40
+        service = object.__new__(ControllerService)
+        service.config = cfg
+        service.gitlab = type(
+            "AdvancedDeliveryHead",
+            (),
+            {
+                "delivery_mr": staticmethod(
+                    lambda run, mr_iid=None: {
+                        "iid": 2,
+                        "web_url": (
+                            "https://gitlab.example.com/group/project/"
+                            "-/merge_requests/2"
+                        ),
+                        "sha": current_head,
+                    }
+                )
+            },
+        )()
+        attach_test_store(service, self.root, self.run, delivery=True)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "completion head is not the bound current MR head",
+        ):
+            service._validate_completion_context(
+                self.run,
+                history[1],
+                CompletionMetadata.model_validate(
+                    history[1].task.latest_metadata
+                ),
+            )
+
+        baselines = service._frozen_baselines(history, self.run)
+
+        self.assertEqual(
+            [baseline.phase for baseline in baselines],
+            ["prd", "spec", "plan", "tasks"],
+        )
+        self.assertEqual(
+            baselines[-1].artifact_commit_sha,
+            "3" * 40,
         )
 
     def test_status_reports_phase_reviews_freezes_decisions_and_gates(self) -> None:
@@ -2952,6 +3096,131 @@ class ServiceRecoveryTests(unittest.TestCase):
             [
                 ("archive", self.run.workspace.board, exception.id),
             ],
+        )
+
+    def test_exception_recovery_reissues_archived_work_card(self) -> None:
+        card = CardRecord(
+            run=self.run,
+            stage=Stage.CODE_REVIEW,
+            iteration=2,
+            idempotency_key=(
+                f"{self.run.run_key}:code-review:2:normal:work"
+            ),
+            parent_card_id="t_test",
+            assignee="code-reviewer",
+            skills=["skill-code-review", "glab"],
+            context_digest="e" * 64,
+            expected_head_sha="d" * 40,
+            scratch_dir="/opt/data/scratch/test-code-review",
+        )
+        archived = task_record(
+            task_id="t_archived_review",
+            body=render_card_body(card),
+            status="archived",
+            assignee=card.assignee,
+            idempotency_key=card.idempotency_key,
+            tenant=self.run.run_key,
+            skills=card.skills,
+            parents=[card.parent_card_id],
+            latest_outcome="blocked",
+        )
+        archived_managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=archived.id,
+            run_key=self.run.run_key,
+            stage=card.stage.value,
+            iteration=card.iteration,
+            idempotency_key=card.idempotency_key,
+            parent_card_id=card.parent_card_id,
+            purpose="work",
+            created_at=1,
+        )
+        exception = task_record(
+            task_id="t_exception",
+            body="exception evidence",
+            status="done",
+            assignee="dispatcher",
+            idempotency_key="exception-key",
+            tenant=self.run.run_key,
+            skills=["hollysys-dispatch-kanban"],
+            parents=[archived.id],
+        )
+        exception_managed = ManagedCard(
+            board=self.run.workspace.board,
+            card_id=exception.id,
+            run_key=self.run.run_key,
+            stage="exception",
+            iteration=1,
+            idempotency_key="exception-key",
+            parent_card_id=archived.id,
+            purpose="exception",
+            created_at=2,
+        )
+        retry = task_record(
+            task_id="t_reissued_review",
+            body=render_card_body(
+                card.model_copy(
+                    update={
+                        "iteration": 3,
+                        "idempotency_key": (
+                            f"{self.run.run_key}:code-review:3:normal:work"
+                        ),
+                        "parent_card_id": archived.id,
+                        "resumed_from_card_id": archived.id,
+                    }
+                )
+            ),
+            status="ready",
+            assignee=card.assignee,
+            tenant=self.run.run_key,
+        )
+        service = object.__new__(ControllerService)
+        service.config = config(self.root)
+        service.store = ControllerStore(self.root / "reissue-controller.db")
+        service.store.ensure_run_control(self.run.run_key)
+        service.store.set_run_exception(
+            self.run.run_key,
+            "blocked card has no valid human block contract",
+        )
+        service._history = lambda _: (
+            [
+                HistoryItem(archived_managed, archived),
+                HistoryItem(exception_managed, exception),
+            ],
+            self.run,
+        )
+        calls: list[tuple] = []
+
+        def create_work(run, stage, parent_card_id, **kwargs):
+            calls.append((stage, parent_card_id, kwargs))
+            return retry
+
+        service._create_work = create_work
+
+        recovered = service.recover(
+            {
+                "run_key": self.run.run_key,
+                "message_id": "om_recover_archived",
+                "sender": self.run.origin.initiator_open_id,
+                "chat_id": self.run.origin.chat_id,
+                "thread_id": self.run.origin.thread_id,
+                "reason": "controller baseline reconstruction fixed",
+            }
+        )
+
+        self.assertEqual(recovered["state"], "active")
+        self.assertEqual(recovered["continuation"], "work-reissued")
+        self.assertEqual(recovered["stage"], Stage.CODE_REVIEW.value)
+        self.assertEqual(recovered["active_card"], retry.id)
+        self.assertEqual(len(calls), 1)
+        stage, parent_card_id, kwargs = calls[0]
+        self.assertEqual(stage, Stage.CODE_REVIEW)
+        self.assertEqual(parent_card_id, archived.id)
+        self.assertEqual(kwargs["mode"], WorkMode.NORMAL)
+        self.assertEqual(kwargs["resumed_from"], archived.id)
+        self.assertEqual(
+            kwargs["resume_answer"],
+            "controller baseline reconstruction fixed",
         )
 
     def test_pre_root_exception_is_visible_and_human_recoverable(self) -> None:

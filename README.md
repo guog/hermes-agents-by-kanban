@@ -818,7 +818,10 @@ Hermes Supervisor 确认运行中 Worker 与后代真实退出，随后以 attem
 
 `exception` 不会自动恢复。根因修复并验证后，只有原发起人或管理员可通过新的飞书消息
 调用 `hollysysctl recover`；Controller 归档活动异常卡，以 `state_version` CAS 恢复
-`active` 并从同一 run/worktree/MR 重新对账。不能直接改 SQLite 或人工创建下一卡。
+`active` 并从同一 run/worktree/MR 重新对账。若异常来源工作卡已归档且不存在其他活动
+Worker，Controller 会使用当前受信上下文重新派发同阶段 attempt，并返回
+`continuation=work-reissued`；不得留下 `active` 但无工作卡的空转状态。不能直接改
+SQLite 或人工创建下一卡。
 
 #### Blocked 的原渠道人类闭环
 

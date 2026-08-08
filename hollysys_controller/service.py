@@ -2274,6 +2274,8 @@ class ControllerService:
                 expected_version=int(control["state_version"]),
             )
             resumed_initialization = None
+            reissued_work = None
+            reissued_stage = None
             if initialization_pending:
                 try:
                     resumed_initialization = self._initialize_run(
@@ -2287,6 +2289,45 @@ class ControllerService:
                     )
                     self._enqueue_controller_failure(request.run_key, exc)
                     raise
+            else:
+                active_work = [
+                    item
+                    for item in history
+                    if item.managed.purpose == "work"
+                    and item.task.status in ACTIVE_STATUSES
+                ]
+                work = [
+                    item
+                    for item in history
+                    if item.managed.purpose == "work"
+                ]
+                if (
+                    not active_work
+                    and work
+                    and work[-1].task.status != "done"
+                ):
+                    previous_work = work[-1]
+                    try:
+                        previous_record = parse_card_body(
+                            previous_work.task.body
+                        )
+                        reissued_stage = Stage(previous_work.managed.stage)
+                        reissued_work = self._create_work(
+                            run,
+                            reissued_stage,
+                            previous_work.task.id,
+                            mode=previous_record.mode,
+                            repair_context=previous_record.repair_context,
+                            resume_answer=request.reason,
+                            resumed_from=previous_work.task.id,
+                        )
+                    except Exception as exc:
+                        self.store.set_run_exception(
+                            request.run_key,
+                            self._error_text(exc),
+                        )
+                        self._enqueue_controller_failure(request.run_key, exc)
+                        raise
             self.store.enqueue(
                 (
                     f"{request.run_key}:exception-recovered:"
@@ -2318,7 +2359,11 @@ class ControllerService:
                 "continuation": (
                     "initialization-resumed"
                     if resumed_initialization is not None
-                    else "pending-reconcile"
+                    else (
+                        "work-reissued"
+                        if reissued_work is not None
+                        else "pending-reconcile"
+                    )
                 ),
             }
             if resumed_initialization is not None:
@@ -2326,6 +2371,14 @@ class ControllerService:
                     {
                         "stage": resumed_initialization["stage"],
                         "active_card": resumed_initialization["active_card"],
+                    }
+                )
+            elif reissued_work is not None:
+                assert reissued_stage is not None
+                response.update(
+                    {
+                        "stage": reissued_stage.value,
+                        "active_card": reissued_work.id,
                     }
                 )
             self.store.finish_request(key, response)
@@ -5827,7 +5880,16 @@ class ControllerService:
                     metadata = validate_persisted_completion_metadata(
                         item.task.latest_metadata
                     )
-                    self._validate_completion_context(run, item, metadata)
+                    # A reviewed baseline is an immutable historical fact.
+                    # Later producer pushes advance the delivery MR head; the
+                    # baseline itself is checked at the new head separately by
+                    # _frozen_violation before another card is created.
+                    self._validate_completion_context(
+                        run,
+                        item,
+                        metadata,
+                        require_current_head=False,
+                    )
                 except (ValidationError, ValueError, TypeError):
                     continue
                 reviewed = (
@@ -6088,6 +6150,8 @@ class ControllerService:
         run: RunRecord,
         item: HistoryItem,
         metadata: CompletionMetadata,
+        *,
+        require_current_head: bool = True,
     ) -> None:
         self._validate_completion_identity(run, item, metadata)
         if (
@@ -6120,7 +6184,8 @@ class ControllerService:
             return
         mr = self.gitlab.validate_delivery_binding(run, binding)
         if (
-            metadata.head_sha is not None
+            require_current_head
+            and metadata.head_sha is not None
             and metadata.head_sha != str(mr.get("sha") or "")
         ):
             raise ValueError("completion head is not the bound current MR head")

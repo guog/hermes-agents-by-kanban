@@ -223,8 +223,10 @@ hollysysctl recover \
 ```
 
 Controller 会归档活动异常卡、以 state-version CAS 将 `exception` 恢复为 `active`，
-并从原 run/worktree/MR 重新对账。非异常态、身份不匹配或未说明已验证修复时不得调用；
-不能用 `resolve`、人工建卡或直接改 SQLite 代替。
+并从原 run/worktree/MR 重新对账。若异常来源工作卡已归档且没有其他活动 Worker，响应
+必须为 `continuation=work-reissued`，同时包含重新派发的同阶段 `stage` 和
+`active_card`；不得接受 `active` 但没有工作卡的恢复结果。非异常态、身份不匹配或未
+说明已验证修复时不得调用；不能用 `resolve`、人工建卡或直接改 SQLite 代替。
 
 ## 健康与异常
 
