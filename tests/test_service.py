@@ -3396,7 +3396,52 @@ class ServiceRecoveryTests(unittest.TestCase):
         runtime = service.store.card_runtime(managed.board, task.id)
         self.assertEqual(runtime["attempt_status"], "running")
         self.assertEqual(runtime["redispatch_count"], 0)
-        self.assertIn("stuck_alive", service.store.pending_outbox()[0]["payload"])
+        payload = service.store.pending_outbox()[0]["payload"]
+        self.assertIn("stuck_alive", payload)
+        self.assertIn("Agent 长时间无新进展，但心跳仍正常", payload)
+        self.assertIn("已连续 30分00秒没有收到新的结构化进展", payload)
+        self.assertIn("暂时无需手动重派", payload)
+        self.assertNotIn("Agent 超过进展租约", payload)
+
+    def test_slow_alive_notice_says_no_human_action_is_needed(self) -> None:
+        now = int(time.time())
+        service, _task, managed = self._watchdog_threshold_fixture(
+            "slow_alive",
+            started_at=now - 901,
+        )
+        service.store.record_card_runtime_event(
+            board=managed.board,
+            card_id=managed.card_id,
+            kind="heartbeat",
+            created_at=now,
+            worker_session_id="kanban-run:4",
+            worker_pid=404,
+            lease_seconds=service.config.worker_progress_lease_seconds,
+            run_id=f"{managed.board}:4",
+        )
+        service.worker_recovery = type(
+            "ForbiddenRecovery",
+            (),
+            {
+                "observe": staticmethod(
+                    lambda identity, terminate_running: (_ for _ in ()).throw(
+                        AssertionError("fresh heartbeat must not probe")
+                    )
+                )
+            },
+        )()
+
+        service._enqueue_stale_worker_notices()
+
+        payload = service.store.pending_outbox()[0]["payload"]
+        self.assertIn("slow_alive", payload)
+        self.assertIn("Agent 进展较慢，但仍在运行", payload)
+        self.assertIn("已连续 15分00秒没有收到新的结构化进展", payload)
+        self.assertIn("无需立即处理", payload)
+        self.assertIn("Controller 会继续观察", payload)
+        self.assertIn("诊断码", payload)
+        self.assertNotIn("错误码", payload)
+        self.assertNotIn("Agent 超过进展租约", payload)
 
     def test_stale_heartbeat_with_fresh_progress_only_probes(self) -> None:
         now = int(time.time())
@@ -3439,10 +3484,11 @@ class ServiceRecoveryTests(unittest.TestCase):
         runtime = service.store.card_runtime(managed.board, task.id)
         self.assertEqual(runtime["attempt_status"], "running")
         self.assertEqual(runtime["redispatch_count"], 0)
-        self.assertIn(
-            "liveness_unconfirmed",
-            service.store.pending_outbox()[0]["payload"],
-        )
+        payload = service.store.pending_outbox()[0]["payload"]
+        self.assertIn("liveness_unconfirmed", payload)
+        self.assertIn("Agent 心跳暂时异常，系统未贸然重派", payload)
+        self.assertIn("无需手动重派", payload)
+        self.assertNotIn("Agent 超过进展租约", payload)
 
     def test_watchdog_redispatches_only_after_confirmed_exit_and_identity_checks(
         self,

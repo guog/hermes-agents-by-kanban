@@ -748,8 +748,10 @@ heartbeat/progress/deadline、worktree/branch/MR/head 和完成接受状态。he
 一个永不退出的 worker。Hermes 卡使用
 `HOLLYSYS_WORKER_REDISPATCH_LIMIT=2`；每次证据闭合后实际发出的 reclaim 立即计入预算，
 新 session 只增加 attempt，旧 session 晚到事件不会覆盖当前 attempt。15 分钟无结构化
-进展只报 `slow_alive`，30 分钟且 heartbeat 正常只报 `stuck_alive`。只有 heartbeat 与
-progress 同时超时，Controller 才在完整核对 Kanban run/session/PID、Profile、
+进展只报 `slow_alive`，并明确提示“仍在运行、无需立即处理”；30 分钟且 heartbeat
+正常只报 `stuck_alive`，提示“长时间无新进展、暂不重派”。`liveness_unconfirmed`
+则明确说明证据尚未闭合、人类无需手动重派。只有 heartbeat 与 progress 同时超时，
+Controller 才在完整核对 Kanban run/session/PID、Profile、
 worktree/branch/MR/head 后，通过 Hermes PID namespace 内的 Unix Socket Supervisor
 执行 probe/terminate；Socket、身份或进程证据不完整时只报 `liveness_unconfirmed`。
 Supervisor 确认该 attempt 的 Worker 与后代均退出后，Controller 再做完整 CAS，并调用

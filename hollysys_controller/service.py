@@ -5050,6 +5050,56 @@ class ControllerService:
     ) -> None:
         if self.config.notification_level != NotificationLevel.VERBOSE:
             return
+        if error_code == "slow_alive":
+            icon = "⏳"
+            title = "Agent 进展较慢，但仍在运行"
+            current_status = (
+                "心跳正常；已连续 "
+                f"{format_duration(self.config.worker_slow_warning_seconds)}"
+                "没有收到新的结构化进展"
+            )
+            system_action = "继续观察；未终止、未重派，避免重复执行"
+            human_action = "无需立即处理；Controller 会继续观察"
+            judgment = (
+                "心跳仍在持续更新，说明 Agent 进程在线。"
+                "慢进展不等于任务失败。"
+            )
+        elif error_code == "stuck_alive":
+            icon = "⚠️"
+            title = "Agent 长时间无新进展，但心跳仍正常"
+            current_status = (
+                "心跳正常；已连续 "
+                f"{format_duration(self.config.worker_progress_lease_seconds)}"
+                "没有收到新的结构化进展"
+            )
+            system_action = "保持当前 Worker；未终止、未重派，避免重复执行"
+            human_action = (
+                "暂时无需手动重派；若持续收到提醒，可查看 Card 与 Session"
+            )
+            judgment = (
+                "Agent 已超过进展租约，但心跳仍正常。"
+                "只有心跳和进展都超时后，Controller 才会核验是否需要重派。"
+            )
+        elif error_code == "liveness_unconfirmed":
+            icon = "⚠️"
+            title = "Agent 心跳暂时异常，系统未贸然重派"
+            current_status = "心跳或退出证据暂不完整，尚不能安全确认 Agent 已退出"
+            system_action = "保持当前 Worker；继续核对 Supervisor 和后续事件"
+            human_action = "无需手动重派；若后续进入异常状态，再按新通知处理"
+            judgment = (
+                "证据不足时重派可能产生两个 Agent 并行操作同一任务，"
+                "因此 Controller 选择失败关闭。"
+            )
+        else:
+            icon = "⚠️"
+            title = "Agent 状态证据不完整，系统未自动重派"
+            current_status = "Worker、worktree 或 MR/head 证据尚未完成一致性核对"
+            system_action = "未终止、未重派，等待证据闭合"
+            human_action = "请等待后续通知；若持续重复出现，再查看 Card 与证据"
+            judgment = (
+                "Controller 只有在身份、进程和代码状态均可验证时，"
+                "才会执行自动恢复。"
+            )
         self.store.enqueue(
             (
                 f"{run.run_key}:worker-lease:{runtime['card_id']}:"
@@ -5061,8 +5111,8 @@ class ControllerService:
                 run.origin,
                 self._render_notification(
                     run,
-                    icon="⚠️",
-                    title="Agent 超过进展租约，暂未自动重派",
+                    icon=icon,
+                    title=title,
                     fields=[
                         ("任务 ID", inline_code(run.run_key)),
                         ("阶段", format_stage(runtime["stage"])),
@@ -5072,6 +5122,9 @@ class ControllerService:
                                 runtime.get("attempt") or 1
                             ),
                         ),
+                        ("当前状态", current_status),
+                        ("系统处理", system_action),
+                        ("人类操作", human_action),
                         ("Card", inline_code(runtime["card_id"])),
                         (
                             "Session",
@@ -5083,12 +5136,12 @@ class ControllerService:
                             "PID",
                             inline_code(runtime.get("worker_pid") or "unknown"),
                         ),
-                        ("错误码", inline_code(error_code)),
-                        ("处理", "证据不足，Controller 未终止或重派该 Agent"),
+                        ("诊断码", inline_code(error_code)),
                     ],
                     sections=[
+                        ("系统判断", [judgment]),
                         (
-                            "判断依据",
+                            "技术依据",
                             [escape_markdown(explanation, limit=700)],
                         )
                     ],
